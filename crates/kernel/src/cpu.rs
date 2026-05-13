@@ -6,14 +6,18 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use crate::arch::{Arch, Hal, MAX_CPUS};
 use crate::proc::Proc;
 
-#[repr(align(64))] // dodge false sharing across harts
+#[repr(align(64))]
 pub struct Cpu {
     pub hartid: AtomicUsize,
     pub noff: AtomicUsize,
     pub intena: AtomicBool,
-    /// Process currently running on this hart, or null. Set before
-    /// returning to user mode; read in trap-from-user dispatch.
+    /// Proc currently running on this hart in user mode (set just before
+    /// returning to user). Read by the trap handler to identify the
+    /// trapping proc.
     pub current_proc: AtomicPtr<Proc>,
+    /// One-shot slot set by `UserMode::poll`. The executor pops this
+    /// after each `poll` to decide whether to noreturn into user mode.
+    pub user_target: AtomicPtr<Proc>,
 }
 
 impl Cpu {
@@ -23,6 +27,7 @@ impl Cpu {
             noff: AtomicUsize::new(0),
             intena: AtomicBool::new(false),
             current_proc: AtomicPtr::new(null_mut()),
+            user_target: AtomicPtr::new(null_mut()),
         }
     }
 }
@@ -67,7 +72,20 @@ pub fn current_proc() -> Option<&'static Proc> {
     if p.is_null() {
         None
     } else {
-        // Safety: the proc is heap-allocated and lives forever once spawned.
+        // Safety: caller responsible — procs live forever in Phase 4b/5a.
         Some(unsafe { &*p })
+    }
+}
+
+pub fn set_user_target(p: *const Proc) {
+    current().user_target.store(p as *mut _, Ordering::Release);
+}
+
+pub fn take_user_target() -> Option<*const Proc> {
+    let p = current().user_target.swap(null_mut(), Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        Some(p as *const Proc)
     }
 }

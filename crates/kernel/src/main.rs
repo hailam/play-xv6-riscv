@@ -6,6 +6,7 @@ extern crate alloc;
 mod arch;
 mod console;
 mod cpu;
+mod executor;
 mod heap;
 mod kalloc;
 mod proc;
@@ -19,7 +20,7 @@ mod vm;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use alloc::boxed::Box;
+use alloc::sync::Arc;
 
 use crate::arch::{Arch, Hal};
 use crate::proc::Proc;
@@ -57,10 +58,11 @@ pub extern "C" fn kmain() -> ! {
     println!("hart {} up, paging on", id);
 
     if id == 0 {
-        println!("spawning init proc ({} bytes of initcode)", INITCODE.len());
-        let init: &'static Proc = Box::leak(Box::new(Proc::new_initcode(INITCODE)));
-        let code = usertrap::run_user(init);
-        println!("init returned: {code}");
+        println!("spawning init proc ({} bytes)", INITCODE.len());
+        let init = Arc::new(Proc::new_initcode(INITCODE));
+        proc::spawn_proc_main(init);
+        unsafe { Arch::intr_on() };
+        executor::run();
     }
 
     unsafe { Arch::intr_on() };
