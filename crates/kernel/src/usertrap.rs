@@ -33,9 +33,6 @@ fn kernel_stack_top(hartid: usize) -> usize {
     base + (hartid + 1) * STACK_PER_HART
 }
 
-/// Entry point from `trampoline.S::uservec`. Reads the trap cause,
-/// stuffs it into the proc's `pending_trap` slot, wakes the proc's
-/// task, then drops into the executor loop (never returns).
 #[no_mangle]
 pub extern "C" fn rust_usertrap() -> ! {
     unsafe { write_stvec(kernelvec as *const () as usize) };
@@ -54,6 +51,9 @@ pub extern "C" fn rust_usertrap() -> ! {
         let code = scause & !SCAUSE_INTERRUPT;
         match code {
             SCAUSE_TIMER => {
+                crate::trap::TICKS
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                crate::time::drain_expired();
                 hal_riscv64::arm_timer();
                 TrapEvent::Timer
             }
@@ -74,11 +74,6 @@ pub extern "C" fn rust_usertrap() -> ! {
     executor::run()
 }
 
-/// Switch back to user mode running `proc`. Never returns.
-///
-/// Safety: the caller (executor) must guarantee `proc` is the
-/// scheduled-next proc and that interrupts are off until after
-/// trapframe + CSRs are configured.
 pub fn return_to_user(proc: &Proc) -> ! {
     let hartid = Arch::hartid();
 

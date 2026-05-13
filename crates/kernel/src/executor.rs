@@ -69,6 +69,12 @@ pub fn wake(id: TaskId) {
 }
 
 pub fn run() -> ! {
+    // We enter `run` at the top of a kernel stack with no locks held —
+    // either from kmain (where intr_on was already called) or from
+    // `rust_usertrap` (where the hardware cleared sstatus.SIE on trap
+    // entry). Force interrupts on so a wfi here can be woken by the
+    // timer.
+    unsafe { Arch::intr_on() };
     loop {
         let tid = EXECUTOR.ready.lock().pop_front();
         let Some(tid) = tid else {

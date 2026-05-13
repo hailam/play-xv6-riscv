@@ -12,10 +12,12 @@ mod kalloc;
 mod proc;
 mod sync;
 mod syscall;
+mod time;
 mod trap;
 mod uapi;
 mod usertrap;
 mod vm;
+mod wait;
 
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};

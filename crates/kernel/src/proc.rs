@@ -1,11 +1,8 @@
 //! Process abstraction.
-//!
-//! Phase 4b model: each running user program is an async `Task` whose
-//! `Future` is `proc_main`. The future loops `UserMode::run(...).await`
-//! to enter user mode and dispatch the next trap event.
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
@@ -19,6 +16,7 @@ use crate::executor;
 use crate::kalloc::KFRAMES;
 use crate::sync::SpinLock;
 use crate::syscall;
+use crate::wait::WakerCell;
 
 #[cfg(target_arch = "riscv64")]
 use hal_riscv64::{
@@ -50,6 +48,13 @@ pub struct Proc {
     pub size: AtomicUsize,
     pub task_id: AtomicU32,
     pub pending_trap: SpinLock<Option<TrapEvent>>,
+    /// Weak-ref to parent so `sys_exit` can notify `sys_wait`.
+    pub parent: SpinLock<Option<Weak<Proc>>>,
+    /// Live (non-reaped) children. `sys_wait` drains zombies.
+    pub children: SpinLock<Vec<Arc<Proc>>>,
+    /// Waker the parent is parked on in `sys_wait`. Woken by child's
+    /// `sys_exit`.
+    pub wait_waker: WakerCell,
 }
 
 impl Proc {
@@ -79,20 +84,9 @@ impl Proc {
         tf.epc = 0;
         tf.sp = PGSIZE as u64;
 
-        Self {
-            pid: next_pid(),
-            state: AtomicI32::new(ProcState::Runnable as i32),
-            exit_code: AtomicI32::new(0),
-            pagetable: pt,
-            trapframe_pa: tf_pa,
-            size: AtomicUsize::new(PGSIZE),
-            task_id: AtomicU32::new(0),
-            pending_trap: SpinLock::new(None),
-        }
+        Self::with_layout(pt, tf_pa, PGSIZE)
     }
 
-    /// Fork: clone parent's user vm into a child. Caller spawns the
-    /// resulting `Proc` as a task. Returns `None` on OOM.
     pub fn fork_from(parent: &Arc<Proc>) -> Option<Self> {
         let size = parent.size.load(Ordering::Relaxed);
 
@@ -103,7 +97,6 @@ impl Proc {
         pt.map(TRAPFRAME, tf_pa, PGSIZE, PtePerm::RW, &KFRAMES)
             .ok()?;
 
-        // Copy user pages.
         let mut va = 0;
         while va < size {
             let (parent_pa, perm) = parent.pagetable.translate(va)?;
@@ -119,28 +112,31 @@ impl Proc {
             va += PGSIZE;
         }
 
-        // Copy trapframe; child's a0 = 0 so fork returns 0 in child.
         let parent_tf = parent.trapframe();
         let child_tf = unsafe { &mut *(tf_pa as *mut TrapFrame) };
         *child_tf = *parent_tf;
         child_tf.a0 = 0;
 
-        Some(Self {
+        Some(Self::with_layout(pt, tf_pa, size))
+    }
+
+    fn with_layout(pt: <Arch as Hal>::PageTable, trapframe_pa: usize, size: usize) -> Self {
+        Self {
             pid: next_pid(),
             state: AtomicI32::new(ProcState::Runnable as i32),
             exit_code: AtomicI32::new(0),
             pagetable: pt,
-            trapframe_pa: tf_pa,
+            trapframe_pa,
             size: AtomicUsize::new(size),
             task_id: AtomicU32::new(0),
             pending_trap: SpinLock::new(None),
-        })
+            parent: SpinLock::new(None),
+            children: SpinLock::new(Vec::new()),
+            wait_waker: WakerCell::new(),
+        }
     }
 
     pub fn trapframe(&self) -> &mut TrapFrame {
-        // Safety: trapframe_pa identifies a frame this proc exclusively
-        // owns, identity-mapped in kernel space, mutated only by the
-        // current-CPU task in Phase 4b/5a.
         unsafe { &mut *(self.trapframe_pa as *mut TrapFrame) }
     }
 
@@ -164,10 +160,6 @@ fn next_pid() -> usize {
     NEXT.fetch_add(1, Ordering::Relaxed) as usize
 }
 
-// =============================================================================
-// proc_main async fn — the task body for any user proc.
-// =============================================================================
-
 pub fn spawn_proc_main(proc: Arc<Proc>) -> executor::TaskId {
     executor::spawn(proc, |p| Box::pin(proc_main(p)))
 }
@@ -180,21 +172,13 @@ async fn proc_main(proc: Arc<Proc>) {
                 let ret = syscall::dispatch(&proc, nr).await;
                 proc.trapframe().a0 = ret as u64;
                 if proc.is_zombie() {
-                    // Sys_exit ran — park forever so the task is never polled again.
                     core::future::pending::<()>().await;
                 }
             }
-            TrapEvent::Timer | TrapEvent::Devintr => {
-                // Cooperative: just loop back to user.
-            }
+            TrapEvent::Timer | TrapEvent::Devintr => {}
         }
     }
 }
-
-// =============================================================================
-// UserMode future — the only place that signals "executor should
-// return-to-user after this poll".
-// =============================================================================
 
 pub struct UserMode<'a> {
     proc: &'a Proc,
