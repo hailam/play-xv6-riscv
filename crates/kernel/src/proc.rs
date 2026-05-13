@@ -17,6 +17,7 @@ use crate::file::File;
 use crate::kalloc::KFRAMES;
 use crate::sync::SpinLock;
 use crate::syscall;
+use crate::user_vm::{self, STACK_VA_BASE};
 use crate::wait::WakerCell;
 
 #[cfg(target_arch = "riscv64")]
@@ -59,37 +60,25 @@ pub struct Proc {
 }
 
 impl Proc {
-    pub fn new_initcode(initcode: &[u8]) -> Self {
-        assert!(initcode.len() < PGSIZE, "initcode must fit in one page");
-
+    pub fn new_initcode(initcode_elf: &[u8]) -> Self {
         let tf_pa = KFRAMES.alloc_zeroed().expect("kalloc TRAPFRAME");
-        let mut pt = <Arch as Hal>::PageTable::new(&KFRAMES).expect("pagetable root");
-
-        pt.map(TRAMPOLINE, trampoline_pa(), PGSIZE, PtePerm::RX, &KFRAMES)
-            .expect("map TRAMPOLINE");
-        pt.map(TRAPFRAME, tf_pa, PGSIZE, PtePerm::RW, &KFRAMES)
-            .expect("map TRAPFRAME");
-
-        let upage_pa = KFRAMES.alloc_zeroed().expect("kalloc initcode page");
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                initcode.as_ptr(),
-                upage_pa as *mut u8,
-                initcode.len(),
-            );
-        }
-        pt.map(0, upage_pa, PGSIZE, PtePerm::URWX, &KFRAMES)
-            .expect("map user");
+        let image = user_vm::build_image_from_elf(initcode_elf, tf_pa)
+            .expect("build initcode image");
+        // Empty argv for the first proc.
+        let (sp_va, argv_array_va) =
+            user_vm::place_argv_on_stack(image.stack_pa, &[]);
 
         let tf = unsafe { &mut *(tf_pa as *mut TrapFrame) };
-        tf.epc = 0;
-        tf.sp = PGSIZE as u64;
+        tf.epc = image.entry as u64;
+        tf.sp = sp_va as u64;
+        tf.a0 = 0;
+        tf.a1 = argv_array_va as u64;
 
-        Self::with_layout(pt, tf_pa, PGSIZE, default_files())
+        Self::with_layout(image.pagetable, tf_pa, image.code_end, default_files())
     }
 
     pub fn fork_from(parent: &Arc<Proc>) -> Option<Self> {
-        let size = parent.size.load(Ordering::Relaxed);
+        let code_end = parent.size.load(Ordering::Relaxed);
 
         let tf_pa = KFRAMES.alloc_zeroed()?;
         let mut pt = <Arch as Hal>::PageTable::new(&KFRAMES).ok()?;
@@ -99,8 +88,10 @@ impl Proc {
             .ok()?;
 
         let parent_pt = parent.pagetable.lock();
+
+        // Code/data pages.
         let mut va = 0;
-        while va < size {
+        while va < code_end {
             let (parent_pa, perm) = parent_pt.translate(va)?;
             let child_pa = KFRAMES.alloc_zeroed()?;
             unsafe {
@@ -113,6 +104,20 @@ impl Proc {
             pt.map(va, child_pa, PGSIZE, perm, &KFRAMES).ok()?;
             va += PGSIZE;
         }
+
+        // Stack page (fixed VA just below TRAPFRAME).
+        let (parent_stack_pa, stack_perm) = parent_pt.translate(STACK_VA_BASE)?;
+        let child_stack_pa = KFRAMES.alloc_zeroed()?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                parent_stack_pa as *const u8,
+                child_stack_pa as *mut u8,
+                PGSIZE,
+            );
+        }
+        pt.map(STACK_VA_BASE, child_stack_pa, PGSIZE, stack_perm, &KFRAMES)
+            .ok()?;
+
         drop(parent_pt);
 
         let parent_tf = parent.trapframe();
@@ -120,10 +125,6 @@ impl Proc {
         *child_tf = *parent_tf;
         child_tf.a0 = 0;
 
-        // Clone parent's fd table — but give each child fd its own
-        // `Arc<File>`. `File::Clone` bumps pipe reader/writer counts so
-        // child's eventual close decrements them independently of the
-        // parent's lifetime.
         let child_files: Vec<Option<Arc<File>>> = parent
             .files
             .lock()
@@ -131,7 +132,7 @@ impl Proc {
             .map(|f| f.as_ref().map(|a| Arc::new((**a).clone())))
             .collect();
 
-        Some(Self::with_layout(pt, tf_pa, size, child_files))
+        Some(Self::with_layout(pt, tf_pa, code_end, child_files))
     }
 
     fn with_layout(

@@ -14,7 +14,6 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
-    // Compile ulib once; link into every C user binary.
     let ulib_obj = compile_to_obj(&out_dir, "ulib", Lang::Asm);
 
     let programs: &[(&str, &str, Lang, bool)] = &[
@@ -68,7 +67,7 @@ fn build_user_program(
 ) -> PathBuf {
     let obj = compile_to_obj(out_dir, name, lang);
     let elf = out_dir.join(format!("{name}.elf"));
-    let bin = out_dir.join(format!("{name}.bin"));
+    let stripped = out_dir.join(format!("{name}-stripped.elf"));
 
     let mut ld_args = vec![
         "-T".to_string(),
@@ -84,12 +83,15 @@ fn build_user_program(
     let ld_args_ref: Vec<&str> = ld_args.iter().map(|s| s.as_str()).collect();
     run("riscv64-elf-ld", &ld_args_ref);
 
+    // Strip everything that isn't needed at runtime; the kernel ELF
+    // loader only reads the program header table and segment data.
     run("riscv64-elf-objcopy", &[
-        "-O", "binary",
+        "--strip-all",
         elf.to_str().unwrap(),
-        bin.to_str().unwrap(),
+        stripped.to_str().unwrap(),
     ]);
-    bin
+
+    stripped
 }
 
 fn run(prog: &str, args: &[&str]) {
