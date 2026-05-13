@@ -120,12 +120,15 @@ impl Proc {
         *child_tf = *parent_tf;
         child_tf.a0 = 0;
 
-        // Clone parent's fd table.
+        // Clone parent's fd table — but give each child fd its own
+        // `Arc<File>`. `File::Clone` bumps pipe reader/writer counts so
+        // child's eventual close decrements them independently of the
+        // parent's lifetime.
         let child_files: Vec<Option<Arc<File>>> = parent
             .files
             .lock()
             .iter()
-            .map(|f| f.clone())
+            .map(|f| f.as_ref().map(|a| Arc::new((**a).clone())))
             .collect();
 
         Some(Self::with_layout(pt, tf_pa, size, child_files))

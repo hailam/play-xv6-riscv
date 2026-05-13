@@ -14,7 +14,8 @@ use crate::file::{File, PipeInner};
 use crate::kalloc::KFRAMES;
 use crate::proc::{Proc, ProcState};
 use crate::uapi::{
-    SYS_CLOSE, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_PIPE, SYS_READ, SYS_SLEEP, SYS_WAIT, SYS_WRITE,
+    SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_PIPE, SYS_READ, SYS_SLEEP, SYS_WAIT,
+    SYS_WRITE,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -61,6 +62,10 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let fd = proc.trapframe().a0 as i32;
             sys_close(proc, fd).await
         }
+        SYS_DUP => {
+            let fd = proc.trapframe().a0 as i32;
+            sys_dup(proc, fd).await
+        }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
             -1
@@ -76,11 +81,18 @@ async fn sys_fork(parent: &Arc<Proc>) -> i64 {
     let child_arc = Arc::new(child);
     *child_arc.parent.lock() = Some(Arc::downgrade(parent));
     parent.children.lock().push(child_arc.clone());
+    // Pipe reader/writer counts are bumped inside `Proc::fork_from`'s
+    // file table clone via `File::Clone`.
     crate::proc::spawn_proc_main(child_arc);
     child_pid
 }
 
 async fn sys_exit(proc: &Arc<Proc>, code: i32) -> i64 {
+    // Drop all fds so pipe end counts decrement now (rather than
+    // waiting for the Proc itself to be reclaimed, which never happens
+    // in Phase 5x).
+    proc.files.lock().clear();
+
     proc.exit_code.store(code, Ordering::Relaxed);
     proc.state.store(ProcState::Zombie as i32, Ordering::Release);
     let parent_weak = proc.parent.lock().clone();
@@ -234,7 +246,6 @@ async fn sys_pipe(proc: &Arc<Proc>, pipefd_va: usize) -> i64 {
         return -1;
     };
 
-    // Write rfd, wfd back to user `pipefd[2]` (2 i32s = 8 bytes).
     for (i, fd) in [rfd, wfd].iter().enumerate() {
         let va = pipefd_va + i * 4;
         let Some(kva) = proc.translate_user(va) else {
@@ -247,6 +258,16 @@ async fn sys_pipe(proc: &Arc<Proc>, pipefd_va: usize) -> i64 {
 
 async fn sys_close(proc: &Arc<Proc>, fd: i32) -> i64 {
     proc.close_fd(fd)
+}
+
+async fn sys_dup(proc: &Arc<Proc>, fd: i32) -> i64 {
+    let Some(file) = proc.get_file(fd) else {
+        return -1;
+    };
+    // Give the new fd its own `Arc<File>` so its close drops
+    // independently. `File::Clone` bumps pipe counts.
+    let new_file = Arc::new((*file).clone());
+    proc.alloc_fd(new_file).map(|f| f as i64).unwrap_or(-1)
 }
 
 async fn pipe_write(
@@ -300,17 +321,21 @@ async fn pipe_read(
 ) -> i64 {
     let mut n: usize = 0;
     while n < len {
-        let b = PipeReadByte { pipe: pipe.clone() }.await;
-        let Some(kva) = proc.translate_user(buf_va + n) else {
-            return -1;
-        };
-        unsafe { *(kva as *mut u8) = b };
-        n += 1;
-        // Drain whatever is available without blocking again — but if
-        // the ring is empty, that's enough; let the caller call us
-        // again for more bytes.
-        if pipe.buf.lock().is_empty() {
-            break;
+        match (PipeReadByte { pipe: pipe.clone() }).await {
+            Some(b) => {
+                let Some(kva) = proc.translate_user(buf_va + n) else {
+                    return -1;
+                };
+                unsafe { *(kva as *mut u8) = b };
+                n += 1;
+                // Drain whatever's left without re-blocking; if nothing
+                // is left, the next `await` would block, so just return
+                // what we have.
+                if pipe.buf.lock().is_empty() {
+                    break;
+                }
+            }
+            None => break, // EOF: writers all closed and buf empty.
         }
     }
     n as i64
@@ -321,14 +346,18 @@ struct PipeReadByte {
 }
 
 impl Future for PipeReadByte {
-    type Output = u8;
+    type Output = Option<u8>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u8> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<u8>> {
+        // Register first, then check — closes the wake-lost race.
         self.pipe.read_waker.register(cx.waker());
         let popped = self.pipe.buf.lock().pop_front();
         if let Some(b) = popped {
             self.pipe.write_waker.wake();
-            return Poll::Ready(b);
+            return Poll::Ready(Some(b));
+        }
+        if self.pipe.writers.load(Ordering::Acquire) == 0 {
+            return Poll::Ready(None);
         }
         Poll::Pending
     }
@@ -372,7 +401,7 @@ fn build_user_pagetable(
     bin: &[u8],
     trapframe_pa: usize,
 ) -> Result<<Arch as Hal>::PageTable, ()> {
-    assert!(bin.len() < PGSIZE, "exec: binary too big for Phase 5e");
+    assert!(bin.len() < PGSIZE, "exec: binary too big for Phase 5f");
     let mut pt = <Arch as Hal>::PageTable::new(&KFRAMES).map_err(|_| ())?;
     pt.map(TRAMPOLINE, trampoline_pa(), PGSIZE, PtePerm::RX, &KFRAMES)
         .map_err(|_| ())?;
