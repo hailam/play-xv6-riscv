@@ -1,0 +1,16 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+
+[dependencies]
+hal = { path = "../hal" }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+hal-riscv64 = { path = "../hal-riscv64" }

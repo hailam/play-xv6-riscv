@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/hal", "crates/hal-riscv64", "crates/kernel"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+publish = false
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+debug = true
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+debug = true
