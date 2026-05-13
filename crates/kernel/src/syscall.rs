@@ -51,8 +51,10 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             sys_sleep(proc, ticks).await
         }
         SYS_EXEC => {
-            let path_va = proc.trapframe().a0 as usize;
-            sys_exec(proc, path_va).await
+            let tf = proc.trapframe();
+            let path_va = tf.a0 as usize;
+            let argv_va = tf.a1 as usize;
+            sys_exec(proc, path_va, argv_va).await
         }
         SYS_PIPE => {
             let pipefd_va = proc.trapframe().a0 as usize;
@@ -365,23 +367,105 @@ impl Future for PipeReadByte {
 
 // ---------- sys_exec --------------------------------------------------------
 
-async fn sys_exec(proc: &Arc<Proc>, path_va: usize) -> i64 {
+async fn sys_exec(proc: &Arc<Proc>, path_va: usize, argv_va: usize) -> i64 {
     let Some(path) = read_user_cstring(proc, path_va, 64) else {
+        return -1;
+    };
+    let Some(argv) = read_user_argv(proc, argv_va, MAX_ARGS, MAX_ARG_LEN) else {
         return -1;
     };
     let Some(bin) = crate::embed::find(&path) else {
         crate::println!("exec: no such program: {}", path);
         return -1;
     };
-    let Ok(new_pt) = build_user_pagetable(bin, proc.trapframe_pa) else {
+    let Ok((new_pt, upage_pa)) = build_user_pagetable(bin, proc.trapframe_pa) else {
         return -1;
     };
+
+    let (sp_va, argv_array_va) = place_argv_on_user_page(upage_pa, &argv);
+    let argc = argv.len() as i64;
+
     proc.replace_image(new_pt, PGSIZE);
     let tf = proc.trapframe();
     *tf = TrapFrame::default();
     tf.epc = 0;
-    tf.sp = PGSIZE as u64;
-    0
+    tf.sp = sp_va as u64;
+    tf.a1 = argv_array_va as u64;
+    // `proc_main` writes our return value into `tf.a0`, which becomes
+    // the new image's `a0` (i.e., `argc`) when sret to user mode.
+    argc
+}
+
+const MAX_ARGS: usize = 16;
+const MAX_ARG_LEN: usize = 128;
+
+fn read_user_argv(
+    proc: &Proc,
+    argv_va: usize,
+    max_args: usize,
+    max_len: usize,
+) -> Option<alloc::vec::Vec<String>> {
+    if argv_va == 0 {
+        return Some(alloc::vec::Vec::new());
+    }
+    let mut argv = alloc::vec::Vec::new();
+    for i in 0..max_args {
+        let kva = proc.translate_user(argv_va + i * 8)?;
+        let ptr = unsafe { core::ptr::read_unaligned(kva as *const u64) } as usize;
+        if ptr == 0 {
+            return Some(argv);
+        }
+        let arg = read_user_cstring(proc, ptr, max_len)?;
+        argv.push(arg);
+    }
+    None
+}
+
+/// Pushes argc / argv[] / strings near the top of the new user page.
+/// Returns `(initial_sp_va, argv_array_va)`.
+fn place_argv_on_user_page(upage_pa: usize, argv: &[String]) -> (usize, usize) {
+    let argc = argv.len();
+    let strings_bytes: usize = argv.iter().map(|s| s.len() + 1).sum();
+    let strings_aligned = (strings_bytes + 7) & !7;
+    let argv_bytes = 8 * (argc + 1);
+    let total = 8 + argv_bytes + strings_aligned;
+    assert!(total < PGSIZE, "argv layout overflows the user page");
+
+    let sp_va = PGSIZE - total;
+    let argv_array_va = sp_va + 8;
+    let strings_start_va = sp_va + 8 + argv_bytes;
+
+    // argc
+    unsafe {
+        core::ptr::write_unaligned((upage_pa + sp_va) as *mut u64, argc as u64);
+    }
+
+    // strings + argv pointers
+    let mut str_off = strings_start_va;
+    for (i, s) in argv.iter().enumerate() {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                s.as_ptr(),
+                (upage_pa + str_off) as *mut u8,
+                s.len(),
+            );
+            *((upage_pa + str_off + s.len()) as *mut u8) = 0;
+            core::ptr::write_unaligned(
+                (upage_pa + argv_array_va + i * 8) as *mut u64,
+                str_off as u64,
+            );
+        }
+        str_off += s.len() + 1;
+    }
+    // argv[argc] = NULL
+    unsafe {
+        core::ptr::write_unaligned(
+            (upage_pa + argv_array_va + argc * 8) as *mut u64,
+            0,
+        );
+    }
+
+    (sp_va, argv_array_va)
 }
 
 fn read_user_cstring(proc: &Proc, va: usize, max: usize) -> Option<String> {
@@ -400,8 +484,8 @@ fn read_user_cstring(proc: &Proc, va: usize, max: usize) -> Option<String> {
 fn build_user_pagetable(
     bin: &[u8],
     trapframe_pa: usize,
-) -> Result<<Arch as Hal>::PageTable, ()> {
-    assert!(bin.len() < PGSIZE, "exec: binary too big for Phase 5f");
+) -> Result<(<Arch as Hal>::PageTable, usize), ()> {
+    assert!(bin.len() < PGSIZE, "exec: binary too big for Phase 5g");
     let mut pt = <Arch as Hal>::PageTable::new(&KFRAMES).map_err(|_| ())?;
     pt.map(TRAMPOLINE, trampoline_pa(), PGSIZE, PtePerm::RX, &KFRAMES)
         .map_err(|_| ())?;
@@ -413,5 +497,5 @@ fn build_user_pagetable(
     }
     pt.map(0, upage_pa, PGSIZE, PtePerm::URWX, &KFRAMES)
         .map_err(|_| ())?;
-    Ok(pt)
+    Ok((pt, upage_pa))
 }

@@ -19,7 +19,7 @@ fn main() {
 
     let programs: &[(&str, &str, Lang, bool)] = &[
         ("initcode", "INITCODE_BIN_PATH", Lang::Asm, false),
-        ("echo", "ECHO_BIN_PATH", Lang::Asm, false),
+        ("echo", "ECHO_BIN_PATH", Lang::C, true),
         ("hello", "HELLO_BIN_PATH", Lang::Asm, false),
         ("pipetest", "PIPETEST_BIN_PATH", Lang::Asm, false),
         ("sh", "SH_BIN_PATH", Lang::C, true),
