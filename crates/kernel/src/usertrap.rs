@@ -20,6 +20,7 @@ use hal_riscv64::{
 const SCAUSE_ECALL_FROM_U: usize = 8;
 const SCAUSE_INTERRUPT: usize = 1usize << 63;
 const SCAUSE_TIMER: usize = 5;
+const SCAUSE_EXTERNAL: usize = 9;
 
 extern "C" {
     static _stack0: u8;
@@ -57,6 +58,10 @@ pub extern "C" fn rust_usertrap() -> ! {
                 hal_riscv64::arm_timer();
                 TrapEvent::Timer
             }
+            SCAUSE_EXTERNAL => {
+                hal_riscv64::handle_external_irq();
+                TrapEvent::Devintr
+            }
             _ => panic!("usertrap: unknown intr code {code}"),
         }
     } else {
@@ -92,7 +97,7 @@ pub fn return_to_user(proc: &Proc) -> ! {
     let uservec_va = TRAMPOLINE + uservec_offset();
     unsafe { write_stvec(uservec_va) };
 
-    let user_satp = <Arch as Hal>::pagetable_satp(&proc.pagetable);
+    let user_satp = proc.satp();
     let userret_va = TRAMPOLINE + userret_offset();
     let userret_fn: extern "C" fn(usize) -> ! =
         unsafe { core::mem::transmute(userret_va) };

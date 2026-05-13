@@ -43,17 +43,14 @@ pub struct Proc {
     pub pid: usize,
     pub state: AtomicI32,
     pub exit_code: AtomicI32,
-    pub pagetable: <Arch as Hal>::PageTable,
+    /// Page table protected by a lock so `sys_exec` can replace it.
+    pub pagetable: SpinLock<<Arch as Hal>::PageTable>,
     pub trapframe_pa: usize,
     pub size: AtomicUsize,
     pub task_id: AtomicU32,
     pub pending_trap: SpinLock<Option<TrapEvent>>,
-    /// Weak-ref to parent so `sys_exit` can notify `sys_wait`.
     pub parent: SpinLock<Option<Weak<Proc>>>,
-    /// Live (non-reaped) children. `sys_wait` drains zombies.
     pub children: SpinLock<Vec<Arc<Proc>>>,
-    /// Waker the parent is parked on in `sys_wait`. Woken by child's
-    /// `sys_exit`.
     pub wait_waker: WakerCell,
 }
 
@@ -97,9 +94,11 @@ impl Proc {
         pt.map(TRAPFRAME, tf_pa, PGSIZE, PtePerm::RW, &KFRAMES)
             .ok()?;
 
+        // Lock parent's pagetable across the whole copy.
+        let parent_pt = parent.pagetable.lock();
         let mut va = 0;
         while va < size {
-            let (parent_pa, perm) = parent.pagetable.translate(va)?;
+            let (parent_pa, perm) = parent_pt.translate(va)?;
             let child_pa = KFRAMES.alloc_zeroed()?;
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -111,6 +110,7 @@ impl Proc {
             pt.map(va, child_pa, PGSIZE, perm, &KFRAMES).ok()?;
             va += PGSIZE;
         }
+        drop(parent_pt);
 
         let parent_tf = parent.trapframe();
         let child_tf = unsafe { &mut *(tf_pa as *mut TrapFrame) };
@@ -125,7 +125,7 @@ impl Proc {
             pid: next_pid(),
             state: AtomicI32::new(ProcState::Runnable as i32),
             exit_code: AtomicI32::new(0),
-            pagetable: pt,
+            pagetable: SpinLock::new(pt),
             trapframe_pa,
             size: AtomicUsize::new(size),
             task_id: AtomicU32::new(0),
@@ -140,14 +140,28 @@ impl Proc {
         unsafe { &mut *(self.trapframe_pa as *mut TrapFrame) }
     }
 
+    pub fn satp(&self) -> usize {
+        <Arch as Hal>::pagetable_satp(&self.pagetable.lock())
+    }
+
     pub fn translate_user(&self, va: usize) -> Option<usize> {
         let page = va & !(PGSIZE - 1);
         let off = va & (PGSIZE - 1);
-        let (pa, perm) = self.pagetable.translate(page)?;
+        let pt = self.pagetable.lock();
+        let (pa, perm) = pt.translate(page)?;
         if perm.0 & PtePerm::USER == 0 {
             return None;
         }
         Some(pa + off)
+    }
+
+    /// Replace this proc's user pagetable + size. Caller has prepared
+    /// the new pagetable already (with TRAMPOLINE/TRAPFRAME re-mapped).
+    /// Old pagetable is dropped (frames leak in Phase 5c — TODO: real
+    /// vm-reap pass).
+    pub fn replace_image(&self, new_pt: <Arch as Hal>::PageTable, new_size: usize) {
+        *self.pagetable.lock() = new_pt;
+        self.size.store(new_size, Ordering::Release);
     }
 
     pub fn is_zombie(&self) -> bool {

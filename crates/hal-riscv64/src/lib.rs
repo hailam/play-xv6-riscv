@@ -7,14 +7,15 @@ use hal::Hal;
 mod csr;
 pub mod memlayout;
 mod pagetable;
+pub mod plic;
 mod start;
 mod trap;
 mod trap_hook;
 pub mod trapframe;
-mod uart;
+pub mod uart;
 
 pub use pagetable::PageTable;
-pub use trap::{arm_timer, init_kernel_trap_vec, TIMER_INTERVAL};
+pub use trap::{arm_timer, handle_external_irq, init_kernel_trap_vec, TIMER_INTERVAL};
 pub use trapframe::TrapFrame;
 
 core::arch::global_asm!(include_str!("../asm/entry.S"));
@@ -31,20 +32,16 @@ extern "C" {
     pub fn userret();
 }
 
-/// Trampoline-page kernel virtual address (= physical address pre-paging,
-/// and identity-mapped post-paging).
 #[inline]
 pub fn trampoline_pa() -> usize {
     trampoline as *const () as usize
 }
 
-/// Offset of `uservec` inside the trampoline page.
 #[inline]
 pub fn uservec_offset() -> usize {
     uservec as *const () as usize - trampoline as *const () as usize
 }
 
-/// Offset of `userret` inside the trampoline page.
 #[inline]
 pub fn userret_offset() -> usize {
     userret as *const () as usize - trampoline as *const () as usize
@@ -98,8 +95,6 @@ impl Hal for Riscv64 {
     }
 }
 
-/// Re-export csr functions the kernel needs without exposing the whole
-/// module. Used by the kernel-side trap handler.
 pub mod csr_api {
     use crate::csr;
 

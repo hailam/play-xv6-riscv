@@ -5,7 +5,9 @@ extern crate alloc;
 
 mod arch;
 mod console;
+mod console_in;
 mod cpu;
+mod embed;
 mod executor;
 mod heap;
 mod kalloc;
@@ -30,8 +32,6 @@ use crate::proc::Proc;
 #[cfg(target_arch = "riscv64")]
 extern crate hal_riscv64 as _;
 
-const INITCODE: &[u8] = include_bytes!(env!("INITCODE_BIN_PATH"));
-
 static STARTED: AtomicBool = AtomicBool::new(false);
 
 #[no_mangle]
@@ -48,6 +48,8 @@ pub extern "C" fn kmain() -> ! {
         );
         vm::init_and_install();
         println!("kvm: installed (satp={:#x})", vm::kernel_satp());
+        hal_riscv64::uart::init();
+        hal_riscv64::plic::init();
         STARTED.store(true, Ordering::Release);
     } else {
         while !STARTED.load(Ordering::Acquire) {
@@ -57,11 +59,12 @@ pub extern "C" fn kmain() -> ! {
     }
     cpu::init_this_hart();
     trap::init_this_hart();
+    hal_riscv64::plic::init_for_hart();
     println!("hart {} up, paging on", id);
 
     if id == 0 {
-        println!("spawning init proc ({} bytes)", INITCODE.len());
-        let init = Arc::new(Proc::new_initcode(INITCODE));
+        println!("spawning init proc ({} bytes)", embed::INITCODE.len());
+        let init = Arc::new(Proc::new_initcode(embed::INITCODE));
         proc::spawn_proc_main(init);
         unsafe { Arch::intr_on() };
         executor::run();
