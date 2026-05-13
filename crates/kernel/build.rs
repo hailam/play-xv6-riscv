@@ -10,6 +10,7 @@ fn main() {
         ("initcode", "INITCODE_BIN_PATH"),
         ("echo", "ECHO_BIN_PATH"),
         ("hello", "HELLO_BIN_PATH"),
+        ("pipetest", "PIPETEST_BIN_PATH"),
     ] {
         let bin = build_user_program(&out_dir, name);
         println!("cargo:rustc-env={env_var}={}", bin.display());

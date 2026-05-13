@@ -9,6 +9,7 @@ mod console_in;
 mod cpu;
 mod embed;
 mod executor;
+mod file;
 mod heap;
 mod kalloc;
 mod proc;

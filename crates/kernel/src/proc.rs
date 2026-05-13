@@ -13,6 +13,7 @@ use hal::{FrameAllocator, PageTableOps, PtePerm};
 use crate::arch::{Arch, Hal};
 use crate::cpu;
 use crate::executor;
+use crate::file::File;
 use crate::kalloc::KFRAMES;
 use crate::sync::SpinLock;
 use crate::syscall;
@@ -23,6 +24,8 @@ use hal_riscv64::{
     memlayout::{PGSIZE, TRAMPOLINE, TRAPFRAME},
     trampoline_pa, TrapFrame,
 };
+
+pub const NOFILE: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
@@ -43,7 +46,6 @@ pub struct Proc {
     pub pid: usize,
     pub state: AtomicI32,
     pub exit_code: AtomicI32,
-    /// Page table protected by a lock so `sys_exec` can replace it.
     pub pagetable: SpinLock<<Arch as Hal>::PageTable>,
     pub trapframe_pa: usize,
     pub size: AtomicUsize,
@@ -52,6 +54,8 @@ pub struct Proc {
     pub parent: SpinLock<Option<Weak<Proc>>>,
     pub children: SpinLock<Vec<Arc<Proc>>>,
     pub wait_waker: WakerCell,
+    /// Per-proc file descriptor table.
+    pub files: SpinLock<Vec<Option<Arc<File>>>>,
 }
 
 impl Proc {
@@ -81,7 +85,7 @@ impl Proc {
         tf.epc = 0;
         tf.sp = PGSIZE as u64;
 
-        Self::with_layout(pt, tf_pa, PGSIZE)
+        Self::with_layout(pt, tf_pa, PGSIZE, default_files())
     }
 
     pub fn fork_from(parent: &Arc<Proc>) -> Option<Self> {
@@ -94,7 +98,6 @@ impl Proc {
         pt.map(TRAPFRAME, tf_pa, PGSIZE, PtePerm::RW, &KFRAMES)
             .ok()?;
 
-        // Lock parent's pagetable across the whole copy.
         let parent_pt = parent.pagetable.lock();
         let mut va = 0;
         while va < size {
@@ -117,10 +120,23 @@ impl Proc {
         *child_tf = *parent_tf;
         child_tf.a0 = 0;
 
-        Some(Self::with_layout(pt, tf_pa, size))
+        // Clone parent's fd table.
+        let child_files: Vec<Option<Arc<File>>> = parent
+            .files
+            .lock()
+            .iter()
+            .map(|f| f.clone())
+            .collect();
+
+        Some(Self::with_layout(pt, tf_pa, size, child_files))
     }
 
-    fn with_layout(pt: <Arch as Hal>::PageTable, trapframe_pa: usize, size: usize) -> Self {
+    fn with_layout(
+        pt: <Arch as Hal>::PageTable,
+        trapframe_pa: usize,
+        size: usize,
+        files: Vec<Option<Arc<File>>>,
+    ) -> Self {
         Self {
             pid: next_pid(),
             state: AtomicI32::new(ProcState::Runnable as i32),
@@ -133,6 +149,7 @@ impl Proc {
             parent: SpinLock::new(None),
             children: SpinLock::new(Vec::new()),
             wait_waker: WakerCell::new(),
+            files: SpinLock::new(files),
         }
     }
 
@@ -155,10 +172,6 @@ impl Proc {
         Some(pa + off)
     }
 
-    /// Replace this proc's user pagetable + size. Caller has prepared
-    /// the new pagetable already (with TRAMPOLINE/TRAPFRAME re-mapped).
-    /// Old pagetable is dropped (frames leak in Phase 5c — TODO: real
-    /// vm-reap pass).
     pub fn replace_image(&self, new_pt: <Arch as Hal>::PageTable, new_size: usize) {
         *self.pagetable.lock() = new_pt;
         self.size.store(new_size, Ordering::Release);
@@ -167,6 +180,53 @@ impl Proc {
     pub fn is_zombie(&self) -> bool {
         self.state.load(Ordering::Acquire) == ProcState::Zombie as i32
     }
+
+    /// Look up an fd's File; clones the Arc.
+    pub fn get_file(&self, fd: i32) -> Option<Arc<File>> {
+        if fd < 0 {
+            return None;
+        }
+        self.files.lock().get(fd as usize).cloned().flatten()
+    }
+
+    /// Find the lowest free fd and install `file` there. Returns the fd
+    /// number or `None` if the table is full.
+    pub fn alloc_fd(&self, file: Arc<File>) -> Option<i32> {
+        let mut files = self.files.lock();
+        for (i, slot) in files.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(file);
+                return Some(i as i32);
+            }
+        }
+        None
+    }
+
+    /// Drop the file in `fd`. Returns 0 on success, -1 if `fd` was
+    /// already empty / out of range.
+    pub fn close_fd(&self, fd: i32) -> i64 {
+        if fd < 0 {
+            return -1;
+        }
+        let mut files = self.files.lock();
+        let Some(slot) = files.get_mut(fd as usize) else {
+            return -1;
+        };
+        if slot.take().is_some() {
+            0
+        } else {
+            -1
+        }
+    }
+}
+
+fn default_files() -> Vec<Option<Arc<File>>> {
+    let mut files: Vec<Option<Arc<File>>> = (0..NOFILE).map(|_| None).collect();
+    let console = Arc::new(File::Console);
+    files[0] = Some(console.clone());
+    files[1] = Some(console.clone());
+    files[2] = Some(console);
+    files
 }
 
 fn next_pid() -> usize {
