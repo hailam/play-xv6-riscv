@@ -13,9 +13,12 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
+use hal::Hal;
+
+use crate::arch::Arch;
 use crate::driver::virtio_blk;
 use crate::sync::SpinLock;
 use crate::wait::WakerCell;
@@ -34,6 +37,8 @@ pub struct Buffer {
     pub loading: AtomicBool,
     /// Woken whenever `loading` transitions to false.
     pub io_waker: WakerCell,
+    /// Monotonic counter bumped on each `bread` hit/load — used for LRU.
+    pub last_used: AtomicU64,
 }
 
 unsafe impl Send for Buffer {}
@@ -47,6 +52,7 @@ impl Buffer {
             valid: AtomicBool::new(false),
             loading: AtomicBool::new(false),
             io_waker: WakerCell::new(),
+            last_used: AtomicU64::new(0),
         }
     }
 
@@ -57,6 +63,10 @@ impl Buffer {
 
     fn data_addr(&self) -> usize {
         self.data.get() as usize
+    }
+
+    fn touch(&self) {
+        self.last_used.store(Arch::now_ticks(), Ordering::Relaxed);
     }
 }
 
@@ -85,11 +95,15 @@ enum Role {
 /// Look up `block_no` in the cache. On hit, returns the buffer. On
 /// miss, awaits an I/O (issuing one if no other task is already
 /// loading the same block).
+///
+/// Eviction: an idle valid slot can be repurposed iff its
+/// `Arc::strong_count == 1` (only the cache holds it). Among idle
+/// slots the one with the lowest `last_used` wins.
 pub async fn bread(block_no: u32) -> Arc<Buffer> {
     loop {
         let (buf, role) = {
             let cache = CACHE.lock();
-            // First: search for a valid hit.
+            // 1) Hit?
             let mut hit = None;
             for (i, b) in cache.bufs.iter().enumerate() {
                 if b.block_no.load(Ordering::Acquire) == block_no
@@ -100,9 +114,11 @@ pub async fn bread(block_no: u32) -> Arc<Buffer> {
                 }
             }
             if let Some(i) = hit {
-                (cache.bufs[i].clone(), Role::Hit)
+                let b = cache.bufs[i].clone();
+                b.touch();
+                (b, Role::Hit)
             } else {
-                // Look for an in-progress loader of the same block.
+                // 2) In-progress loader of the same block?
                 let mut loading = None;
                 for (i, b) in cache.bufs.iter().enumerate() {
                     if b.block_no.load(Ordering::Acquire) == block_no
@@ -115,21 +131,17 @@ pub async fn bread(block_no: u32) -> Arc<Buffer> {
                 if let Some(i) = loading {
                     (cache.bufs[i].clone(), Role::Waiter)
                 } else {
-                    // Claim an idle slot.
-                    let mut slot = None;
-                    for (i, b) in cache.bufs.iter().enumerate() {
-                        if !b.valid.load(Ordering::Acquire)
-                            && !b.loading.load(Ordering::Acquire)
-                        {
-                            slot = Some(i);
-                            break;
-                        }
-                    }
-                    let i = slot.expect("bio: buffer cache full (no eviction yet)");
-                    let buf = cache.bufs[i].clone();
-                    buf.block_no.store(block_no, Ordering::Release);
+                    // 3) Pick an eviction slot.
+                    let slot = pick_evict_slot(&cache.bufs)
+                        .expect("bio: no evictable buffer (all in use)");
+                    let buf = cache.bufs[slot].clone();
+                    // Mark invalid + loading inside the lock so a
+                    // concurrent `bread` for the old block can't hit
+                    // a half-evicted buffer.
                     buf.valid.store(false, Ordering::Release);
+                    buf.block_no.store(block_no, Ordering::Release);
                     buf.loading.store(true, Ordering::Release);
+                    buf.touch();
                     (buf, Role::Loader)
                 }
             }
@@ -149,12 +161,43 @@ pub async fn bread(block_no: u32) -> Arc<Buffer> {
             }
             Role::Waiter => {
                 LoadWait { buf: &buf }.await;
-                // The loader marked valid=true (or failed and marked
-                // loading=false). Loop and re-resolve.
                 continue;
             }
         }
     }
+}
+
+/// Returns the index of the best buffer to evict, or None if every
+/// buffer is currently held by a caller.
+///
+/// Preference order:
+///   1. invalid + not loading (free slot from cold cache)
+///   2. valid + not loading + `Arc::strong_count == 1` (idle hit),
+///      picking the slot with the smallest `last_used`.
+fn pick_evict_slot(bufs: &[Arc<Buffer>]) -> Option<usize> {
+    // First sweep: free slots.
+    for (i, b) in bufs.iter().enumerate() {
+        if !b.valid.load(Ordering::Acquire) && !b.loading.load(Ordering::Acquire) {
+            return Some(i);
+        }
+    }
+    // Second sweep: LRU among idle valid slots.
+    let mut best: Option<(usize, u64)> = None;
+    for (i, b) in bufs.iter().enumerate() {
+        if b.loading.load(Ordering::Acquire) {
+            continue;
+        }
+        if Arc::strong_count(b) > 1 {
+            continue; // someone outside the cache is holding it
+        }
+        let lu = b.last_used.load(Ordering::Relaxed);
+        match best {
+            None => best = Some((i, lu)),
+            Some((_, lu_best)) if lu < lu_best => best = Some((i, lu)),
+            _ => {}
+        }
+    }
+    best.map(|(i, _)| i)
 }
 
 struct LoadWait<'a> {

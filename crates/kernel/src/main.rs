@@ -88,34 +88,34 @@ pub extern "C" fn kmain() -> ! {
 }
 
 async fn disk_smoke_test() {
-    let dump = |label: &str, data: &[u8]| {
-        print!(
-            "{} (after {} I/Os): ",
-            label,
+    let report = |stage: &str| {
+        println!(
+            "bio test ({}): {} I/Os submitted",
+            stage,
             driver::virtio_blk::IO_COUNT.load(Ordering::Relaxed)
         );
-        for &b in &data[..24] {
-            let c = if (b' '..=b'~').contains(&b) {
-                b as char
-            } else if b == b'\n' {
-                '_'
-            } else {
-                '.'
-            };
-            print!("{}", c);
-        }
-        println!();
     };
 
-    let b1 = driver::bio::bread(0).await;
-    dump("bio block 0 #1", b1.data());
-    drop(b1);
+    // Read block 0 twice — second is a cache hit.
+    {
+        let _b1 = driver::bio::bread(0).await;
+        let _b2 = driver::bio::bread(0).await;
+    }
+    report("after 2 reads of block 0");
 
-    let b2 = driver::bio::bread(0).await;
-    dump("bio block 0 #2", b2.data());
-    drop(b2);
+    // Now read 64 distinct blocks. With NBUF=32 and the LRU evictor
+    // running, the cache stays bounded; reads issue ~64 I/Os total.
+    for blk in 0..64 {
+        let _b = driver::bio::bread(blk).await;
+    }
+    report("after reading blocks 0..64");
 
-    // Park forever.
+    // Re-read block 63 — should be a hit (most recent).
+    {
+        let _b = driver::bio::bread(63).await;
+    }
+    report("after re-reading block 63 (expect hit)");
+
     core::future::pending::<()>().await;
 }
 
