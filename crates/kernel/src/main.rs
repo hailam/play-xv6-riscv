@@ -55,6 +55,7 @@ pub extern "C" fn kmain() -> ! {
         hal_riscv64::uart::init();
         hal_riscv64::plic::init();
         driver::virtio_blk::init();
+        driver::bio::init();
         STARTED.store(true, Ordering::Release);
     } else {
         while !STARTED.load(Ordering::Acquire) {
@@ -87,26 +88,34 @@ pub extern "C" fn kmain() -> ! {
 }
 
 async fn disk_smoke_test() {
-    let mut buf = [0u8; driver::virtio_blk::SECTOR_SIZE];
-    let addr = buf.as_mut_ptr() as usize;
-    match driver::virtio_blk::read_block_async(0, addr).await {
-        Ok(()) => {
-            print!("disk(async) block 0 first 32 bytes: ");
-            for &b in &buf[..32] {
-                let c = if (b' '..=b'~').contains(&b) {
-                    b as char
-                } else if b == b'\n' {
-                    '_'
-                } else {
-                    '.'
-                };
-                print!("{}", c);
-            }
-            println!();
+    let dump = |label: &str, data: &[u8]| {
+        print!(
+            "{} (after {} I/Os): ",
+            label,
+            driver::virtio_blk::IO_COUNT.load(Ordering::Relaxed)
+        );
+        for &b in &data[..24] {
+            let c = if (b' '..=b'~').contains(&b) {
+                b as char
+            } else if b == b'\n' {
+                '_'
+            } else {
+                '.'
+            };
+            print!("{}", c);
         }
-        Err(e) => println!("disk(async) read failed: {:?}", e),
-    }
-    // Park forever — the task has nothing more to do.
+        println!();
+    };
+
+    let b1 = driver::bio::bread(0).await;
+    dump("bio block 0 #1", b1.data());
+    drop(b1);
+
+    let b2 = driver::bio::bread(0).await;
+    dump("bio block 0 #2", b2.data());
+    drop(b2);
+
+    // Park forever.
     core::future::pending::<()>().await;
 }
 

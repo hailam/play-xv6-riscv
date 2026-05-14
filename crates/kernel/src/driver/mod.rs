@@ -1,3 +1,4 @@
-//! Device drivers. Phase 6a: virtio_blk for the disk.
+//! Device drivers + the buffer cache that sits above them.
 
+pub mod bio;
 pub mod virtio_blk;

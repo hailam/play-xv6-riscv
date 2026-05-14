@@ -10,7 +10,7 @@
 use core::future::Future;
 use core::pin::Pin;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
-use core::sync::atomic::{fence, AtomicBool, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
 use hal::Hal;
@@ -180,6 +180,10 @@ static DISK: SpinLock<DiskState> = SpinLock::new(DiskState {
 
 static COMPLETED: [AtomicBool; NUM] = [const { AtomicBool::new(false) }; NUM];
 static WAKERS: [WakerCell; NUM] = [const { WakerCell::new() }; NUM];
+
+/// Count of submitted I/O ops since boot — used by bio's smoke test
+/// to observe cache hits (no new I/O issued).
+pub static IO_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
 pub enum DiskError {
@@ -371,6 +375,7 @@ fn submit_chain(
     buf_ptr: *mut u8,
     write: bool,
 ) -> Result<usize, DiskError> {
+    IO_COUNT.fetch_add(1, Ordering::Relaxed);
     let idx;
     {
         let mut state = DISK.lock();
