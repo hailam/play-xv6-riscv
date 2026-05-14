@@ -12,6 +12,7 @@ mod elf;
 mod embed;
 mod executor;
 mod file;
+mod fs;
 mod heap;
 mod kalloc;
 mod proc;
@@ -90,43 +91,60 @@ pub extern "C" fn kmain() -> ! {
 async fn disk_smoke_test() {
     let count = || driver::virtio_blk::IO_COUNT.load(Ordering::Relaxed);
 
-    // --- Write a marker into block 100 -----------------------------
-    let pre_write = count();
+    // Bring the log up. Hardcoded layout for now (replaced when fs
+    // lands and we read these from a superblock):
+    //   block 0  — unused
+    //   block 1  — (future) superblock
+    //   block 2  — log header
+    //   blocks 3..33 — log data slots
+    //   blocks 33..  — free space (where our test writes go)
+    fs::log::init(2, 31).await;
+
+    // --- Transaction: atomically update blocks 300 and 301 ---------
+    let pre_tx = count();
+    fs::log::begin_op().await;
     {
-        let b = driver::bio::bread(100).await;
-        // Safety: only this task holds the Arc; no concurrent reader.
+        let b = driver::bio::bread(300).await;
         unsafe {
-            let data = b.data_mut();
-            data[..16].copy_from_slice(b"WROTE-BY-KERNEL!");
+            b.data_mut()[..10].copy_from_slice(b"TX-BLOCK-A");
         }
-        driver::bio::bwrite(&b).await.expect("bwrite");
+        fs::log::log_write(&b);
     }
+    {
+        let b = driver::bio::bread(301).await;
+        unsafe {
+            b.data_mut()[..10].copy_from_slice(b"TX-BLOCK-B");
+        }
+        fs::log::log_write(&b);
+    }
+    fs::log::end_op().await;
     println!(
-        "bio write: wrote marker to block 100 ({} I/Os used)",
-        count() - pre_write
+        "log: 2-block transaction committed ({} I/Os: 2 log writes + 1 header + 2 home writes + 1 clear)",
+        count() - pre_tx
     );
 
-    // --- Evict block 100 by reading many other blocks --------------
-    for blk in 200..240 {
+    // --- Force eviction so the next reads come from disk -----------
+    for blk in 500..540 {
         let _b = driver::bio::bread(blk).await;
     }
 
-    // --- Re-read block 100; must be a fresh disk load --------------
-    let pre_reread = count();
-    let b = driver::bio::bread(100).await;
-    let cost = count() - pre_reread;
-    print!(
-        "bio re-read block 100 ({} fresh I/Os), first 16 bytes: ",
-        cost
-    );
-    for &c in &b.data()[..16] {
-        if (b' '..=b'~').contains(&c) {
-            print!("{}", c as char);
-        } else {
-            print!(".");
+    // --- Verify both blocks landed on disk -------------------------
+    let dump = |label: &str, data: &[u8]| {
+        print!("{}: ", label);
+        for &c in &data[..10] {
+            if (b' '..=b'~').contains(&c) {
+                print!("{}", c as char);
+            } else {
+                print!(".");
+            }
         }
-    }
-    println!();
+        println!();
+    };
+
+    let b1 = driver::bio::bread(300).await;
+    dump("block 300", b1.data());
+    let b2 = driver::bio::bread(301).await;
+    dump("block 301", b2.data());
 
     core::future::pending::<()>().await;
 }
