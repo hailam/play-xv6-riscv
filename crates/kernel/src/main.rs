@@ -88,33 +88,45 @@ pub extern "C" fn kmain() -> ! {
 }
 
 async fn disk_smoke_test() {
-    let report = |stage: &str| {
-        println!(
-            "bio test ({}): {} I/Os submitted",
-            stage,
-            driver::virtio_blk::IO_COUNT.load(Ordering::Relaxed)
-        );
-    };
+    let count = || driver::virtio_blk::IO_COUNT.load(Ordering::Relaxed);
 
-    // Read block 0 twice — second is a cache hit.
+    // --- Write a marker into block 100 -----------------------------
+    let pre_write = count();
     {
-        let _b1 = driver::bio::bread(0).await;
-        let _b2 = driver::bio::bread(0).await;
+        let b = driver::bio::bread(100).await;
+        // Safety: only this task holds the Arc; no concurrent reader.
+        unsafe {
+            let data = b.data_mut();
+            data[..16].copy_from_slice(b"WROTE-BY-KERNEL!");
+        }
+        driver::bio::bwrite(&b).await.expect("bwrite");
     }
-    report("after 2 reads of block 0");
+    println!(
+        "bio write: wrote marker to block 100 ({} I/Os used)",
+        count() - pre_write
+    );
 
-    // Now read 64 distinct blocks. With NBUF=32 and the LRU evictor
-    // running, the cache stays bounded; reads issue ~64 I/Os total.
-    for blk in 0..64 {
+    // --- Evict block 100 by reading many other blocks --------------
+    for blk in 200..240 {
         let _b = driver::bio::bread(blk).await;
     }
-    report("after reading blocks 0..64");
 
-    // Re-read block 63 — should be a hit (most recent).
-    {
-        let _b = driver::bio::bread(63).await;
+    // --- Re-read block 100; must be a fresh disk load --------------
+    let pre_reread = count();
+    let b = driver::bio::bread(100).await;
+    let cost = count() - pre_reread;
+    print!(
+        "bio re-read block 100 ({} fresh I/Os), first 16 bytes: ",
+        cost
+    );
+    for &c in &b.data()[..16] {
+        if (b' '..=b'~').contains(&c) {
+            print!("{}", c as char);
+        } else {
+            print!(".");
+        }
     }
-    report("after re-reading block 63 (expect hit)");
+    println!();
 
     core::future::pending::<()>().await;
 }

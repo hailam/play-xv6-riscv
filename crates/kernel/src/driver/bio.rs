@@ -61,6 +61,21 @@ impl Buffer {
         unsafe { &*self.data.get() }
     }
 
+    /// Mutable access to the buffer's data.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure no concurrent reader is observing `data()`
+    /// while this reference is live. In practice that means the caller
+    /// either:
+    ///   (a) holds the only `Arc<Buffer>` (refcount == 1) — common when
+    ///       a single task is preparing a write; or
+    ///   (b) coordinates externally (the future log layer holds a
+    ///       transaction-scoped lock when mutating).
+    pub unsafe fn data_mut(&self) -> &mut [u8; BSIZE] {
+        &mut *self.data.get()
+    }
+
     fn data_addr(&self) -> usize {
         self.data.get() as usize
     }
@@ -198,6 +213,17 @@ fn pick_evict_slot(bufs: &[Arc<Buffer>]) -> Option<usize> {
         }
     }
     best.map(|(i, _)| i)
+}
+
+/// Flush a buffer's contents back to disk.
+///
+/// No dirty-bit / writeback batching yet — the caller decides when to
+/// flush. The log layer (Phase 6c.5) will wrap groups of `bwrite`s in a
+/// transaction so they commit atomically.
+pub async fn bwrite(buf: &Arc<Buffer>) -> Result<(), virtio_blk::DiskError> {
+    let block_no = buf.block_no.load(Ordering::Acquire);
+    let addr = buf.data_addr();
+    virtio_blk::write_block_async(block_no as u64, addr).await
 }
 
 struct LoadWait<'a> {

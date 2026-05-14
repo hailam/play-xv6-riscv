@@ -10,21 +10,20 @@ directory contains a `README.md` with the plan/summary, plus optional
 
 | Bucket | Count | What's in it |
 |---|---|---|
-| `done/` | 17 | Boot through buffer-cache + eviction |
-| `pending/` | 11 | Filesystem stack (top of queue), then polish + portability |
+| `done/` | 18 | Boot through real disk writes (persistence verified) |
+| `pending/` | 10 | Filesystem stack (top of queue), then polish + portability |
 | `revisit/` | 3 | Decisions to potentially revisit later |
 
 ## Pending — priority order
 
-The first five are the **filesystem path**. Land them in this order and
+The first four are the **filesystem path**. Land them in this order and
 `exec` can finally load programs from disk instead of from
 kernel-embedded ELFs.
 
-1. [02-bio-write](pending/02-bio-write/) — `bwrite` + dirty tracking
-2. [03-log-wal](pending/03-log-wal/) — write-ahead log for crash safety
-3. [04-fs-inode-and-dir](pending/04-fs-inode-and-dir/) — inode + directory + path resolution
-4. [05-file-syscalls](pending/05-file-syscalls/) — `open`/`close`/`stat`/`mkdir`/`unlink`/`link`/`chdir`
-5. [06-mkfs-host-tool](pending/06-mkfs-host-tool/) — host tool to build `fs.img` with init binaries
+1. [03-log-wal](pending/03-log-wal/) — write-ahead log for crash safety
+2. [04-fs-inode-and-dir](pending/04-fs-inode-and-dir/) — inode + directory + path resolution
+3. [05-file-syscalls](pending/05-file-syscalls/) — `open`/`close`/`stat`/`mkdir`/`unlink`/`link`/`chdir`
+4. [06-mkfs-host-tool](pending/06-mkfs-host-tool/) — host tool to build `fs.img` with init binaries
 
 Then **polish + portability**:
 
@@ -56,8 +55,9 @@ Then **polish + portability**:
 | 14 | [async-virtio-kernel-tasks](done/14-async-virtio-kernel-tasks/) | +75 |
 | 15 | [buffer-cache](done/15-buffer-cache/) | +190 |
 | 16 | [bio-eviction](done/16-bio-eviction/) | +60 |
+| 17 | [bio-write](done/17-bio-write/) | +50 |
 
-Current totals: **~4,280 LoC, 116 unsafe-ish lines** (~2.7%, well inside
+Current totals: **~4,310 LoC, 117 unsafe-ish lines** (~2.7%, well inside
 the 700-line budget set in the original plan).
 
 ## Revisit
