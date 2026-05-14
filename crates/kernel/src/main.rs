@@ -68,31 +68,15 @@ pub extern "C" fn kmain() -> ! {
     println!("hart {} up, paging on", id);
 
     if id == 0 {
-        // Disk smoke test: read block 0 of fs.img and dump the first
-        // 32 bytes. fs.img is set up with a known banner at offset 0.
-        unsafe { Arch::intr_on() };
-        let mut buf = [0u8; driver::virtio_blk::SECTOR_SIZE];
-        match driver::virtio_blk::sync_read_block(0, &mut buf) {
-            Ok(()) => {
-                print!("disk block 0 first 32 bytes: ");
-                for &b in &buf[..32] {
-                    let c = if (b' '..=b'~').contains(&b) {
-                        b as char
-                    } else if b == b'\n' {
-                        '_'
-                    } else {
-                        '.'
-                    };
-                    print!("{}", c);
-                }
-                println!();
-            }
-            Err(e) => println!("disk read failed: {:?}", e),
-        }
+        // Spawn an async kernel task that exercises the async virtio path.
+        // It runs concurrently with the init proc; the executor interleaves
+        // them via the disk IRQ waker.
+        executor::spawn_kernel(|| alloc::boxed::Box::pin(disk_smoke_test()));
 
         println!("spawning init proc ({} bytes)", embed::INITCODE.len());
         let init = Arc::new(Proc::new_initcode(embed::INITCODE));
         proc::spawn_proc_main(init);
+        unsafe { Arch::intr_on() };
         executor::run();
     }
 
@@ -100,6 +84,30 @@ pub extern "C" fn kmain() -> ! {
     loop {
         unsafe { Arch::wfi() }
     }
+}
+
+async fn disk_smoke_test() {
+    let mut buf = [0u8; driver::virtio_blk::SECTOR_SIZE];
+    let addr = buf.as_mut_ptr() as usize;
+    match driver::virtio_blk::read_block_async(0, addr).await {
+        Ok(()) => {
+            print!("disk(async) block 0 first 32 bytes: ");
+            for &b in &buf[..32] {
+                let c = if (b' '..=b'~').contains(&b) {
+                    b as char
+                } else if b == b'\n' {
+                    '_'
+                } else {
+                    '.'
+                };
+                print!("{}", c);
+            }
+            println!();
+        }
+        Err(e) => println!("disk(async) read failed: {:?}", e),
+    }
+    // Park forever — the task has nothing more to do.
+    core::future::pending::<()>().await;
 }
 
 #[panic_handler]

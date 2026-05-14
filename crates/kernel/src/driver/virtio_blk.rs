@@ -7,13 +7,17 @@
 //! Reference: xv6-riscv `kernel/virtio_disk.c`, plus the virtio 1.x
 //! "MMIO Device" spec.
 
+use core::future::Future;
+use core::pin::Pin;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use core::sync::atomic::{fence, AtomicBool, Ordering};
+use core::task::{Context, Poll};
 
 use hal::Hal;
 
 use crate::arch::Arch;
 use crate::sync::SpinLock;
+use crate::wait::WakerCell;
 
 #[cfg(target_arch = "riscv64")]
 use hal_riscv64::memlayout::VIRTIO0;
@@ -175,6 +179,7 @@ static DISK: SpinLock<DiskState> = SpinLock::new(DiskState {
 });
 
 static COMPLETED: [AtomicBool; NUM] = [const { AtomicBool::new(false) }; NUM];
+static WAKERS: [WakerCell; NUM] = [const { WakerCell::new() }; NUM];
 
 #[derive(Debug)]
 pub enum DiskError {
@@ -302,19 +307,70 @@ fn free_chain(state: &mut DiskState, head: usize) {
 // ---------- read / write --------------------------------------------------
 
 pub fn sync_read_block(sector: u64, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), DiskError> {
-    sync_rw(sector, buf.as_mut_ptr(), false)
+    let head = submit_chain(sector, buf.as_mut_ptr(), false)?;
+    // Spin-with-wfi until IRQ flips our completion flag.
+    while !COMPLETED[head].load(Ordering::Acquire) {
+        unsafe { Arch::wfi() };
+    }
+    finish(head)
 }
 
 #[allow(dead_code)]
 pub fn sync_write_block(sector: u64, buf: &[u8; SECTOR_SIZE]) -> Result<(), DiskError> {
-    sync_rw(sector, buf.as_ptr() as *mut u8, true)
+    let head = submit_chain(sector, buf.as_ptr() as *mut u8, true)?;
+    while !COMPLETED[head].load(Ordering::Acquire) {
+        unsafe { Arch::wfi() };
+    }
+    finish(head)
 }
 
-fn sync_rw(
+/// Async-friendly read. Parks the current task on a per-descriptor
+/// `WakerCell`; `on_irq` wakes it.
+///
+/// `buf_addr` is taken as `usize` (not `*mut u8`) so the returned
+/// `Future` is `Send` — needed for the executor's task-storage bound.
+/// The caller computes `buf.as_mut_ptr() as usize`.
+pub async fn read_block_async(
+    sector: u64,
+    buf_addr: usize,
+) -> Result<(), DiskError> {
+    let head = submit_chain(sector, buf_addr as *mut u8, false)?;
+    BlockOp { head }.await;
+    finish(head)
+}
+
+#[allow(dead_code)]
+pub async fn write_block_async(
+    sector: u64,
+    buf_addr: usize,
+) -> Result<(), DiskError> {
+    let head = submit_chain(sector, buf_addr as *mut u8, true)?;
+    BlockOp { head }.await;
+    finish(head)
+}
+
+struct BlockOp {
+    head: usize,
+}
+
+impl Future for BlockOp {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // Register first to close the wake-loss race.
+        WAKERS[self.head].register(cx.waker());
+        if COMPLETED[self.head].load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+        Poll::Pending
+    }
+}
+
+fn submit_chain(
     sector: u64,
     buf_ptr: *mut u8,
     write: bool,
-) -> Result<(), DiskError> {
+) -> Result<usize, DiskError> {
     let idx;
     {
         let mut state = DISK.lock();
@@ -322,7 +378,6 @@ fn sync_rw(
 
         let [i0, i1, i2] = idx;
 
-        // Header descriptor: VirtioBlkReq.
         unsafe {
             (*addr_of_mut!(OPS)).reqs[i0] = VirtioBlkReq {
                 typ: if write { VIRTIO_BLK_T_OUT } else { VIRTIO_BLK_T_IN },
@@ -338,7 +393,6 @@ fn sync_rw(
             };
         }
 
-        // Data descriptor.
         let data_flags = if write {
             DESC_F_NEXT
         } else {
@@ -353,7 +407,6 @@ fn sync_rw(
             };
         }
 
-        // Status descriptor.
         unsafe {
             (*addr_of_mut!(STATUS_BYTES)).bytes[i0] = 0xff;
             let status_pa = addr_of!((*addr_of!(STATUS_BYTES)).bytes[i0]) as u64;
@@ -367,7 +420,6 @@ fn sync_rw(
 
         COMPLETED[i0].store(false, Ordering::Release);
 
-        // Publish on avail ring.
         unsafe {
             let avail = &mut *addr_of_mut!(AVAIL);
             let pos = avail.idx as usize % NUM;
@@ -376,25 +428,19 @@ fn sync_rw(
             avail.idx = avail.idx.wrapping_add(1);
         }
         fence(Ordering::SeqCst);
-    } // drop lock before notify + wait
-
-    // Kick the device.
-    unsafe { write_reg(MMIO_QUEUE_NOTIFY, 0) };
-
-    // Spin-with-wfi until IRQ flips our completion flag.
-    let head = idx[0];
-    while !COMPLETED[head].load(Ordering::Acquire) {
-        unsafe { Arch::wfi() };
     }
 
-    let status = unsafe { (*addr_of!(STATUS_BYTES)).bytes[head] };
+    unsafe { write_reg(MMIO_QUEUE_NOTIFY, 0) };
 
-    // Free the chain.
+    Ok(idx[0])
+}
+
+fn finish(head: usize) -> Result<(), DiskError> {
+    let status = unsafe { (*addr_of!(STATUS_BYTES)).bytes[head] };
     {
         let mut state = DISK.lock();
         free_chain(&mut state, head);
     }
-
     if status == 0 {
         Ok(())
     } else {
@@ -420,10 +466,10 @@ pub fn on_irq() {
     while state.used_idx != used_now {
         let pos = state.used_idx as usize % NUM;
         let id = unsafe { (*addr_of!(USED)).ring[pos].id as usize };
-        // Mark completion. Caller spinning on wfi will see this on
-        // its next load. (Releases the status byte write that virtio
-        // did before bumping used.idx.)
+        // Set completion *before* waking — readers register the
+        // waker first, then check the flag, so the orderings line up.
         COMPLETED[id].store(true, Ordering::Release);
+        WAKERS[id].wake();
         state.used_idx = state.used_idx.wrapping_add(1);
     }
 }

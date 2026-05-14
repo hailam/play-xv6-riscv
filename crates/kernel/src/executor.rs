@@ -30,7 +30,8 @@ pub type TaskId = u32;
 pub type FutureBox = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 struct Task {
-    proc: Arc<Proc>,
+    /// `None` for kernel-only tasks (no return-to-user, no current_proc).
+    proc: Option<Arc<Proc>>,
     future: FutureBox,
 }
 
@@ -53,15 +54,30 @@ where
     let id = EXECUTOR.next_id.fetch_add(1, Ordering::Relaxed);
     proc.task_id.store(id, Ordering::Relaxed);
     let future = future_fn(proc.clone());
+    insert_task(id, Task { proc: Some(proc), future });
+    id
+}
+
+/// Spawn a kernel-only task — no Proc, no return-to-user.
+pub fn spawn_kernel<F>(future_fn: F) -> TaskId
+where
+    F: FnOnce() -> FutureBox,
+{
+    let id = EXECUTOR.next_id.fetch_add(1, Ordering::Relaxed);
+    let future = future_fn();
+    insert_task(id, Task { proc: None, future });
+    id
+}
+
+fn insert_task(id: TaskId, task: Task) {
     {
         let mut tasks = EXECUTOR.tasks.lock();
         while tasks.len() <= id as usize {
             tasks.push(None);
         }
-        tasks[id as usize] = Some(Task { proc, future });
+        tasks[id as usize] = Some(task);
     }
     EXECUTOR.ready.lock().push_back(id);
-    id
 }
 
 pub fn wake(id: TaskId) {
@@ -89,7 +105,11 @@ pub fn run() -> ! {
             None => continue,
         };
 
-        cpu::set_current_proc(Arc::as_ptr(&task.proc) as *mut _);
+        let proc_ptr: *mut Proc = match &task.proc {
+            Some(p) => Arc::as_ptr(p) as *mut _,
+            None => core::ptr::null_mut(),
+        };
+        cpu::set_current_proc(proc_ptr);
 
         let waker = task_waker(tid);
         let mut cx = Context::from_waker(&waker);
