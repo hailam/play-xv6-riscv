@@ -10,19 +10,17 @@ directory contains a `README.md` with the plan/summary, plus optional
 
 | Bucket | Count | What's in it |
 |---|---|---|
-| `done/` | 19 | Boot through transactional fs writes |
-| `pending/` | 9 | Filesystem stack (top of queue), then polish + portability |
+| `done/` | 21 | Through fs inode/dir/path — kernel resolves `/echo` and reads its ELF magic |
+| `pending/` | 7 | `05-file-syscalls` next; then polish + portability |
 | `revisit/` | 3 | Decisions to potentially revisit later |
 
 ## Pending — priority order
 
-The first three are the **filesystem path**. Land them in this order and
-`exec` can finally load programs from disk instead of from
+Next up is **file syscalls** — `open`/`close`/`stat`/`chdir`/etc. With
+those in, `sys_exec` can load programs from disk instead of from
 kernel-embedded ELFs.
 
-1. [04-fs-inode-and-dir](pending/04-fs-inode-and-dir/) — inode + directory + path resolution
-2. [05-file-syscalls](pending/05-file-syscalls/) — `open`/`close`/`stat`/`mkdir`/`unlink`/`link`/`chdir`
-3. [06-mkfs-host-tool](pending/06-mkfs-host-tool/) — host tool to build `fs.img` with init binaries
+1. [05-file-syscalls](pending/05-file-syscalls/) — `open`/`close`/`stat`/`mkdir`/`unlink`/`link`/`chdir`
 
 Then **polish + portability**:
 
@@ -56,9 +54,12 @@ Then **polish + portability**:
 | 16 | [bio-eviction](done/16-bio-eviction/) | +60 |
 | 17 | [bio-write](done/17-bio-write/) | +50 |
 | 18 | [log-wal](done/18-log-wal/) | +210 |
+| 19 | [mkfs-host-tool](done/19-mkfs-host-tool/) | +270 (host) |
+| 20 | [fs-inode-and-dir](done/20-fs-inode-and-dir/) | +400 |
 
-Current totals: **~4,500 LoC, 118 unsafe-ish lines** (~2.6%, well inside
-the 700-line budget set in the original plan).
+Current kernel totals: **~5,015 LoC, ~133 unsafe-ish lines** (~2.7%,
+well inside the 700-line budget). Plus ~270 LoC host code in `mkfs/`
+and ~40 LoC in the shared `xv6-fs-layout` crate.
 
 ## Revisit
 

@@ -89,62 +89,50 @@ pub extern "C" fn kmain() -> ! {
 }
 
 async fn disk_smoke_test() {
-    let count = || driver::virtio_blk::IO_COUNT.load(Ordering::Relaxed);
-
-    // Bring the log up. Hardcoded layout for now (replaced when fs
-    // lands and we read these from a superblock):
-    //   block 0  — unused
-    //   block 1  — (future) superblock
-    //   block 2  — log header
-    //   blocks 3..33 — log data slots
-    //   blocks 33..  — free space (where our test writes go)
-    fs::log::init(2, 31).await;
-
-    // --- Transaction: atomically update blocks 300 and 301 ---------
-    let pre_tx = count();
-    fs::log::begin_op().await;
-    {
-        let b = driver::bio::bread(300).await;
-        unsafe {
-            b.data_mut()[..10].copy_from_slice(b"TX-BLOCK-A");
-        }
-        fs::log::log_write(&b);
-    }
-    {
-        let b = driver::bio::bread(301).await;
-        unsafe {
-            b.data_mut()[..10].copy_from_slice(b"TX-BLOCK-B");
-        }
-        fs::log::log_write(&b);
-    }
-    fs::log::end_op().await;
+    // 1. Superblock.
+    fs::superblock::init().await;
+    let sb = fs::superblock::get();
     println!(
-        "log: 2-block transaction committed ({} I/Os: 2 log writes + 1 header + 2 home writes + 1 clear)",
-        count() - pre_tx
+        "fs: superblock OK (size={}, log@{}, inodes@{}, bmap@{})",
+        sb.size, sb.logstart, sb.inodestart, sb.bmapstart
     );
 
-    // --- Force eviction so the next reads come from disk -----------
-    for blk in 500..540 {
-        let _b = driver::bio::bread(blk).await;
+    // 2. Log uses superblock now.
+    fs::log::init(sb.logstart, sb.nlog + 1).await;
+
+    // 3. Inode cache.
+    fs::inode::init_cache();
+
+    // 4. List the root directory.
+    let root = fs::inode::iget(0, 1);
+    let rli = fs::inode::ilock(&root).await;
+    println!("fs: / contents ({} bytes of dirents):", rli.state().size);
+    fs::dir::for_each_entry(&rli, |inum, name| {
+        println!("  inum {:3}  {}", inum, name);
+    })
+    .await;
+    drop(rli);
+
+    // 5. Resolve /echo, read its first 32 bytes, verify ELF magic.
+    let ip = fs::namei("/echo").await.expect("namei /echo");
+    let li = fs::inode::ilock(&ip).await;
+    let typ = li.state().typ;
+    let size = li.state().size;
+    let mut head = [0u8; 32];
+    let n = fs::inode::readi(&li, &mut head, 0).await;
+    drop(li);
+
+    println!("fs: /echo typ={} size={} bytes, read {}", typ, size, n);
+    print!("     first 16 bytes:");
+    for &b in &head[..16] {
+        print!(" {:02x}", b);
     }
-
-    // --- Verify both blocks landed on disk -------------------------
-    let dump = |label: &str, data: &[u8]| {
-        print!("{}: ", label);
-        for &c in &data[..10] {
-            if (b' '..=b'~').contains(&c) {
-                print!("{}", c as char);
-            } else {
-                print!(".");
-            }
-        }
-        println!();
-    };
-
-    let b1 = driver::bio::bread(300).await;
-    dump("block 300", b1.data());
-    let b2 = driver::bio::bread(301).await;
-    dump("block 301", b2.data());
+    println!();
+    if &head[..4] == b"\x7fELF" {
+        println!("fs: ELF magic confirmed — exec-from-disk path is unblocked!");
+    } else {
+        println!("fs: WARNING — no ELF magic at /echo offset 0");
+    }
 
     core::future::pending::<()>().await;
 }

@@ -1,6 +1,15 @@
-//! Filesystem layers. Built bottom-up:
-//!   * `log` — write-ahead log; the only safe write path for fs.
-//!   * (future) inode, dir, path
-//!   * (future) the syscall surface that ties them to procs
+//! Filesystem layers (bottom-up):
+//!   * `superblock` — single static cache, populated at boot.
+//!   * `log`        — write-ahead log; only safe write path for fs.
+//!   * `inode`      — inode cache + async `ilock` + `readi`.
+//!   * `dir`        — directory operations on top of `inode`.
+//!   * `path`       — `namei` / `nameiparent`.
 
+pub mod dir;
+pub mod inode;
 pub mod log;
+pub mod path;
+pub mod superblock;
+
+pub use path::{namei, nameiparent};
+pub use xv6_fs_layout::{Dirent, DIRSIZ};

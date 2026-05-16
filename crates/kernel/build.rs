@@ -14,6 +14,16 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
+    // Resolve workspace `target/` from OUT_DIR. OUT_DIR is
+    // `<target>/<triple>/<profile>/build/<crate>-<hash>/out`, so 5
+    // ancestors up == target/. Copies stripped user ELFs there with
+    // stable filenames so mkfs can find them.
+    let target_dir = out_dir.ancestors().nth(5).map(|p| p.to_path_buf());
+    let user_dir = target_dir.as_ref().map(|t| t.join("user"));
+    if let Some(ud) = user_dir.as_ref() {
+        let _ = std::fs::create_dir_all(ud);
+    }
+
     let ulib_obj = compile_to_obj(&out_dir, "ulib", Lang::Asm);
 
     let programs: &[(&str, &str, Lang, bool)] = &[
@@ -28,6 +38,10 @@ fn main() {
     for (name, env_var, lang, with_ulib) in programs {
         let bin = build_user_program(&out_dir, name, *lang, *with_ulib, &ulib_obj);
         println!("cargo:rustc-env={env_var}={}", bin.display());
+        if let Some(ud) = user_dir.as_ref() {
+            let stable = ud.join(format!("{name}.elf"));
+            let _ = std::fs::copy(&bin, &stable);
+        }
     }
 }
 

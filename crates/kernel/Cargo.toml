@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 hal = { path = "../hal" }
+xv6-fs-layout = { path = "../xv6-fs-layout" }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 hal-riscv64 = { path = "../hal-riscv64" }
