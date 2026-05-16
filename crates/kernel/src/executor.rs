@@ -113,10 +113,15 @@ pub fn run() -> ! {
 
         let waker = task_waker(tid);
         let mut cx = Context::from_waker(&waker);
-        let _ = task.future.as_mut().poll(&mut cx);
+        let poll = task.future.as_mut().poll(&mut cx);
 
-        // Put the task back BEFORE potentially noreturning into user mode.
-        EXECUTOR.tasks.lock()[tid as usize] = Some(task);
+        if poll.is_pending() {
+            // Put the task back BEFORE potentially noreturning into
+            // user mode. If it completed, just leave the slot empty;
+            // a stale waker firing later will then find `None` and
+            // skip the task.
+            EXECUTOR.tasks.lock()[tid as usize] = Some(task);
+        }
 
         if let Some(target) = cpu::take_user_target() {
             // SAFETY: target points into a `Proc` owned by an `Arc` in

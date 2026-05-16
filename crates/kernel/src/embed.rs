@@ -1,22 +1,6 @@
-//! Embedded user binaries. Phase 5d/e/f stand-in for a filesystem.
+//! Embedded user binary. Only `initcode` is baked in — every other
+//! user program now lives on disk (loaded via `sys_exec` → `fs::namei`
+//! → `readi`). `initcode` is the bootstrap that calls
+//! `exec("/sh", ...)`.
 
 pub const INITCODE: &[u8] = include_bytes!(env!("INITCODE_BIN_PATH"));
-const ECHO: &[u8] = include_bytes!(env!("ECHO_BIN_PATH"));
-const HELLO: &[u8] = include_bytes!(env!("HELLO_BIN_PATH"));
-const PIPETEST: &[u8] = include_bytes!(env!("PIPETEST_BIN_PATH"));
-const SH: &[u8] = include_bytes!(env!("SH_BIN_PATH"));
-const CAT: &[u8] = include_bytes!(env!("CAT_BIN_PATH"));
-
-const BINS: &[(&str, &[u8])] = &[
-    ("/echo", ECHO),
-    ("/hello", HELLO),
-    ("/pipetest", PIPETEST),
-    ("/sh", SH),
-    ("/cat", CAT),
-];
-
-pub fn find(path: &str) -> Option<&'static [u8]> {
-    BINS.iter()
-        .find(|(name, _)| *name == path)
-        .map(|(_, bytes)| *bytes)
-}

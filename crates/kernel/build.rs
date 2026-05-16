@@ -26,6 +26,10 @@ fn main() {
 
     let ulib_obj = compile_to_obj(&out_dir, "ulib", Lang::Asm);
 
+    // Only `initcode` is `include_bytes!`'d into the kernel; every
+    // other binary now lives on disk and is loaded via `sys_exec`.
+    // We still build them all here because mkfs reads them out of
+    // `target/user/`.
     let programs: &[(&str, &str, Lang, bool)] = &[
         ("initcode", "INITCODE_BIN_PATH", Lang::Asm, false),
         ("echo", "ECHO_BIN_PATH", Lang::C, true),
@@ -33,6 +37,7 @@ fn main() {
         ("pipetest", "PIPETEST_BIN_PATH", Lang::Asm, false),
         ("sh", "SH_BIN_PATH", Lang::C, true),
         ("cat", "CAT_BIN_PATH", Lang::C, true),
+        ("ls", "LS_BIN_PATH", Lang::C, true),
     ];
 
     for (name, env_var, lang, with_ulib) in programs {

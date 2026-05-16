@@ -10,26 +10,26 @@ directory contains a `README.md` with the plan/summary, plus optional
 
 | Bucket | Count | What's in it |
 |---|---|---|
-| `done/` | 21 | Through fs inode/dir/path — kernel resolves `/echo` and reads its ELF magic |
-| `pending/` | 7 | `05-file-syscalls` next; then polish + portability |
+| `done/` | 22 | Through file-syscalls read path — `sh` execs from disk, `ls /` works |
+| `pending/` | 7 | `13-fs-writes` next, then polish + portability |
 | `revisit/` | 3 | Decisions to potentially revisit later |
 
 ## Pending — priority order
 
-Next up is **file syscalls** — `open`/`close`/`stat`/`chdir`/etc. With
-those in, `sys_exec` can load programs from disk instead of from
-kernel-embedded ELFs.
+Next up is **fs writes** — `mkdir`/`mknod`/`unlink`/`link` +
+`O_CREATE` + `writei`. With those in, userspace can create / mutate
+files, and we can start running larger pieces of `usertests`.
 
-1. [05-file-syscalls](pending/05-file-syscalls/) — `open`/`close`/`stat`/`mkdir`/`unlink`/`link`/`chdir`
+1. [13-fs-writes](pending/13-fs-writes/) — write-path file syscalls + per-proc cwd
 
 Then **polish + portability**:
 
-7. [07-sys-kill-cancellation](pending/07-sys-kill-cancellation/) — `kill` + every `.await` checks `proc.killed`
-8. [08-sbrk-and-malloc](pending/08-sbrk-and-malloc/) — user heap, tiny `malloc` in ulib
-9. [09-vm-reaping](pending/09-vm-reaping/) — `Drop` for `PageTable`; stop leaking on `exec`/`exit`
-10. [10-smp-user-procs](pending/10-smp-user-procs/) — per-CPU executors with sticky `home_cpu`
-11. [11-aarch64-hal](pending/11-aarch64-hal/) — second HAL impl; prove the trait surface holds
-12. [12-phase2-gui](pending/12-phase2-gui/) — minimal framebuffer-backed display
+2. [07-sys-kill-cancellation](pending/07-sys-kill-cancellation/) — `kill` + every `.await` checks `proc.killed`
+3. [08-sbrk-and-malloc](pending/08-sbrk-and-malloc/) — user heap, tiny `malloc` in ulib
+4. [09-vm-reaping](pending/09-vm-reaping/) — `Drop` for `PageTable`; stop leaking on `exec`/`exit`
+5. [10-smp-user-procs](pending/10-smp-user-procs/) — per-CPU executors with sticky `home_cpu`
+6. [11-aarch64-hal](pending/11-aarch64-hal/) — second HAL impl; prove the trait surface holds
+7. [12-phase2-gui](pending/12-phase2-gui/) — minimal framebuffer-backed display
 
 ## Done — chronological
 
@@ -56,10 +56,12 @@ Then **polish + portability**:
 | 18 | [log-wal](done/18-log-wal/) | +210 |
 | 19 | [mkfs-host-tool](done/19-mkfs-host-tool/) | +270 (host) |
 | 20 | [fs-inode-and-dir](done/20-fs-inode-and-dir/) | +400 |
+| 21 | [file-syscalls-read-path](done/21-file-syscalls-read-path/) | +310 (+120 user) |
 
-Current kernel totals: **~5,015 LoC, ~133 unsafe-ish lines** (~2.7%,
-well inside the 700-line budget). Plus ~270 LoC host code in `mkfs/`
-and ~40 LoC in the shared `xv6-fs-layout` crate.
+Current kernel totals: **~5,325 LoC, ~133 unsafe-ish lines** (~2.5%,
+well inside the 700-line budget). Plus ~270 LoC host code in `mkfs/`,
+~40 LoC in the shared `xv6-fs-layout` crate, and ~120 LoC user code
+(`ls.c`).
 
 ## Revisit
 

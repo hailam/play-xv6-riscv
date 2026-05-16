@@ -11,5 +11,4 @@ pub mod log;
 pub mod path;
 pub mod superblock;
 
-pub use path::{namei, nameiparent};
-pub use xv6_fs_layout::{Dirent, DIRSIZ};
+pub use path::namei;

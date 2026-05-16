@@ -2,27 +2,26 @@
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::{Context, Poll};
 
-use hal::{FrameAllocator, Hal, PageTableOps, PtePerm};
+use hal::Hal;
 
 use crate::arch::Arch;
 use crate::file::{File, PipeInner};
-use crate::kalloc::KFRAMES;
+use crate::fs;
 use crate::proc::{Proc, ProcState};
 use crate::uapi::{
-    SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_PIPE, SYS_READ, SYS_SLEEP, SYS_WAIT,
-    SYS_WRITE,
+    Stat, O_RDONLY, O_RDWR, O_WRONLY, SYS_CHDIR, SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT,
+    SYS_FORK, SYS_FSTAT, SYS_GETPID, SYS_KILL, SYS_LINK, SYS_MKDIR, SYS_MKNOD, SYS_OPEN,
+    SYS_PIPE, SYS_READ, SYS_SBRK, SYS_SLEEP, SYS_UNLINK, SYS_UPTIME, SYS_WAIT, SYS_WRITE,
 };
 
 #[cfg(target_arch = "riscv64")]
-use hal_riscv64::{
-    memlayout::{PGSIZE, TRAMPOLINE, TRAPFRAME},
-    trampoline_pa, TrapFrame, TIMER_INTERVAL,
-};
+use hal_riscv64::{TrapFrame, TIMER_INTERVAL};
 
 pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
     match nr {
@@ -67,6 +66,27 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
         SYS_DUP => {
             let fd = proc.trapframe().a0 as i32;
             sys_dup(proc, fd).await
+        }
+        SYS_OPEN => {
+            let tf = proc.trapframe();
+            let path_va = tf.a0 as usize;
+            let flags = tf.a1 as u32;
+            sys_open(proc, path_va, flags).await
+        }
+        SYS_FSTAT => {
+            let tf = proc.trapframe();
+            let fd = tf.a0 as i32;
+            let stat_va = tf.a1 as usize;
+            sys_fstat(proc, fd, stat_va).await
+        }
+        SYS_GETPID => proc.pid as i64,
+        SYS_UPTIME => (Arch::now_ticks() / TIMER_INTERVAL) as i64,
+        SYS_KILL => -1, // pending/07-sys-kill-cancellation
+        SYS_SBRK => -1, // pending/08-sbrk-and-malloc
+        SYS_CHDIR | SYS_MKDIR | SYS_MKNOD | SYS_UNLINK | SYS_LINK => {
+            // Writes through the log not implemented yet; tracked in
+            // pending/13-fs-writes.
+            -1
         }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
@@ -171,6 +191,10 @@ async fn sys_write(proc: &Arc<Proc>, fd: i32, buf_va: usize, len: usize) -> i64 
         File::Console => console_write(proc, buf_va, len),
         File::PipeWrite(p) => pipe_write(p.clone(), proc, buf_va, len).await,
         File::PipeRead(_) => -1,
+        // Disk writes are not implemented yet (writei lives in
+        // pending/13-fs-writes). Reject so user code sees an error
+        // instead of a silent no-op.
+        File::Inode { .. } => -1,
     }
 }
 
@@ -200,7 +224,46 @@ async fn sys_read(proc: &Arc<Proc>, fd: i32, buf_va: usize, len: usize) -> i64 {
         File::Console => console_read(proc, buf_va, len).await,
         File::PipeRead(p) => pipe_read(p.clone(), proc, buf_va, len).await,
         File::PipeWrite(_) => -1,
+        File::Inode {
+            ip,
+            off,
+            readable,
+            writable: _,
+        } => {
+            if !*readable {
+                return -1;
+            }
+            inode_read(proc, ip.clone(), off, buf_va, len).await
+        }
     }
+}
+
+async fn inode_read(
+    proc: &Arc<Proc>,
+    ip: Arc<crate::fs::inode::Inode>,
+    off: &AtomicU32,
+    buf_va: usize,
+    len: usize,
+) -> i64 {
+    let cur = off.load(Ordering::Acquire);
+    let mut tmp = alloc::vec![0u8; len];
+    let li = fs::inode::ilock(&ip).await;
+    let n = fs::inode::readi(&li, &mut tmp, cur).await;
+    drop(li);
+    if n == 0 {
+        return 0;
+    }
+    // Copy the bytes out into the user buffer, page-aware.
+    let mut copied = 0usize;
+    while copied < n {
+        let Some(kva) = proc.translate_user(buf_va + copied) else {
+            return -1;
+        };
+        unsafe { *(kva as *mut u8) = tmp[copied] };
+        copied += 1;
+    }
+    off.store(cur + n as u32, Ordering::Release);
+    n as i64
 }
 
 async fn console_read(proc: &Proc, buf_va: usize, len: usize) -> i64 {
@@ -365,21 +428,97 @@ impl Future for PipeReadByte {
     }
 }
 
+// ---------- sys_open / sys_fstat -------------------------------------------
+
+async fn sys_open(proc: &Arc<Proc>, path_va: usize, flags: u32) -> i64 {
+    let Some(path) = read_user_cstring(proc, path_va, 128) else {
+        return -1;
+    };
+    // O_CREATE / O_TRUNC need writei — not yet supported.
+    if (flags & !(O_RDONLY | O_WRONLY | O_RDWR)) != 0 {
+        return -1;
+    }
+    let Some(ip) = fs::namei(&path).await else {
+        return -1;
+    };
+    // Sanity-check the inode by ilocking it once (forces load).
+    {
+        let li = fs::inode::ilock(&ip).await;
+        if li.state().typ == 0 {
+            return -1;
+        }
+    }
+    let readable = (flags & O_WRONLY) == 0; // RDONLY (=0) or RDWR
+    let writable = (flags & (O_WRONLY | O_RDWR)) != 0;
+    let f = Arc::new(File::Inode {
+        ip,
+        off: AtomicU32::new(0),
+        readable,
+        writable,
+    });
+    proc.alloc_fd(f).map(|fd| fd as i64).unwrap_or(-1)
+}
+
+async fn sys_fstat(proc: &Arc<Proc>, fd: i32, stat_va: usize) -> i64 {
+    let Some(file) = proc.get_file(fd) else {
+        return -1;
+    };
+    let File::Inode { ip, .. } = &*file else {
+        return -1;
+    };
+    let (typ, nlink, size, inum, dev);
+    {
+        let li = fs::inode::ilock(ip).await;
+        let s = li.state();
+        typ = s.typ as i16;
+        nlink = s.nlink as i16;
+        size = s.size as u64;
+        inum = li.inum();
+        dev = li.dev() as i32;
+    }
+    let st = Stat {
+        dev,
+        ino: inum,
+        typ,
+        nlink,
+        _pad: 0,
+        size,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &st as *const _ as *const u8,
+            core::mem::size_of::<Stat>(),
+        )
+    };
+    for (i, b) in bytes.iter().enumerate() {
+        let Some(kva) = proc.translate_user(stat_va + i) else {
+            return -1;
+        };
+        unsafe { *(kva as *mut u8) = *b };
+    }
+    0
+}
+
 // ---------- sys_exec --------------------------------------------------------
 
 async fn sys_exec(proc: &Arc<Proc>, path_va: usize, argv_va: usize) -> i64 {
-    let Some(path) = read_user_cstring(proc, path_va, 64) else {
+    let Some(path) = read_user_cstring(proc, path_va, 128) else {
         return -1;
     };
     let Some(argv) = read_user_argv(proc, argv_va, MAX_ARGS, MAX_ARG_LEN) else {
         return -1;
     };
-    let Some(bin) = crate::embed::find(&path) else {
-        crate::println!("exec: no such program: {}", path);
-        return -1;
+
+    // Load the ELF bytes from the on-disk file pointed to by `path`.
+    let bin = match read_file_fully(&path).await {
+        Some(b) => b,
+        None => {
+            crate::println!("exec: no such file: {}", path);
+            return -1;
+        }
     };
 
-    let image = match crate::user_vm::build_image_from_elf(bin, proc.trapframe_pa) {
+    let image = match crate::user_vm::build_image_from_elf(&bin, proc.trapframe_pa) {
         Ok(img) => img,
         Err(e) => {
             crate::println!("exec: image build failed: {:?}", e);
@@ -401,6 +540,22 @@ async fn sys_exec(proc: &Arc<Proc>, path_va: usize, argv_va: usize) -> i64 {
     // `proc_main` writes our return value into `tf.a0` → becomes the
     // new image's `a0` (i.e., `argc`) when sret to user mode.
     argc
+}
+
+async fn read_file_fully(path: &str) -> Option<Vec<u8>> {
+    let ip = fs::namei(path).await?;
+    let li = fs::inode::ilock(&ip).await;
+    let size = li.state().size as usize;
+    let mut buf = alloc::vec![0u8; size];
+    let mut off: u32 = 0;
+    while (off as usize) < size {
+        let n = fs::inode::readi(&li, &mut buf[off as usize..], off).await;
+        if n == 0 {
+            break;
+        }
+        off += n as u32;
+    }
+    Some(buf)
 }
 
 const MAX_ARGS: usize = 16;

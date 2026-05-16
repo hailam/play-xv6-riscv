@@ -11,8 +11,9 @@
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
+use crate::fs::inode::Inode;
 use crate::sync::SpinLock;
 use crate::wait::WakerCell;
 
@@ -46,6 +47,15 @@ pub enum File {
     Console,
     PipeRead(Arc<PipeInner>),
     PipeWrite(Arc<PipeInner>),
+    /// On-disk file. Each fd has its own seek offset; the underlying
+    /// inode is shared via `Arc<Inode>` (the inode cache holds another
+    /// strong ref).
+    Inode {
+        ip: Arc<Inode>,
+        off: AtomicU32,
+        readable: bool,
+        writable: bool,
+    },
 }
 
 impl Clone for File {
@@ -60,6 +70,17 @@ impl Clone for File {
                 p.writers.fetch_add(1, Ordering::AcqRel);
                 File::PipeWrite(Arc::clone(p))
             }
+            File::Inode {
+                ip,
+                off,
+                readable,
+                writable,
+            } => File::Inode {
+                ip: Arc::clone(ip),
+                off: AtomicU32::new(off.load(Ordering::Acquire)),
+                readable: *readable,
+                writable: *writable,
+            },
         }
     }
 }
@@ -75,7 +96,7 @@ impl Drop for File {
                 p.writers.fetch_sub(1, Ordering::AcqRel);
                 p.read_waker.wake();
             }
-            File::Console => {}
+            File::Console | File::Inode { .. } => {}
         }
     }
 }

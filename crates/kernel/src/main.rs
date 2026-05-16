@@ -70,14 +70,7 @@ pub extern "C" fn kmain() -> ! {
     println!("hart {} up, paging on", id);
 
     if id == 0 {
-        // Spawn an async kernel task that exercises the async virtio path.
-        // It runs concurrently with the init proc; the executor interleaves
-        // them via the disk IRQ waker.
-        executor::spawn_kernel(|| alloc::boxed::Box::pin(disk_smoke_test()));
-
-        println!("spawning init proc ({} bytes)", embed::INITCODE.len());
-        let init = Arc::new(Proc::new_initcode(embed::INITCODE));
-        proc::spawn_proc_main(init);
+        executor::spawn_kernel(|| alloc::boxed::Box::pin(bringup_then_init()));
         unsafe { Arch::intr_on() };
         executor::run();
     }
@@ -88,53 +81,27 @@ pub extern "C" fn kmain() -> ! {
     }
 }
 
-async fn disk_smoke_test() {
-    // 1. Superblock.
+async fn bringup_then_init() {
+    // Bring the fs up before spawning the init proc — `initcode`
+    // immediately calls `exec("/sh", ...)`, which needs `namei` and
+    // `readi` ready.
     fs::superblock::init().await;
     let sb = fs::superblock::get();
+    fs::log::init(sb.logstart, sb.nlog + 1).await;
+    fs::inode::init_cache();
     println!(
-        "fs: superblock OK (size={}, log@{}, inodes@{}, bmap@{})",
-        sb.size, sb.logstart, sb.inodestart, sb.bmapstart
+        "fs: ready (sb@1, log@{}..{}, inodes@{}..{}, bmap@{}, data@{}..)",
+        sb.logstart,
+        sb.logstart + 1 + sb.nlog,
+        sb.inodestart,
+        sb.bmapstart,
+        sb.bmapstart,
+        sb.bmapstart + 1,
     );
 
-    // 2. Log uses superblock now.
-    fs::log::init(sb.logstart, sb.nlog + 1).await;
-
-    // 3. Inode cache.
-    fs::inode::init_cache();
-
-    // 4. List the root directory.
-    let root = fs::inode::iget(0, 1);
-    let rli = fs::inode::ilock(&root).await;
-    println!("fs: / contents ({} bytes of dirents):", rli.state().size);
-    fs::dir::for_each_entry(&rli, |inum, name| {
-        println!("  inum {:3}  {}", inum, name);
-    })
-    .await;
-    drop(rli);
-
-    // 5. Resolve /echo, read its first 32 bytes, verify ELF magic.
-    let ip = fs::namei("/echo").await.expect("namei /echo");
-    let li = fs::inode::ilock(&ip).await;
-    let typ = li.state().typ;
-    let size = li.state().size;
-    let mut head = [0u8; 32];
-    let n = fs::inode::readi(&li, &mut head, 0).await;
-    drop(li);
-
-    println!("fs: /echo typ={} size={} bytes, read {}", typ, size, n);
-    print!("     first 16 bytes:");
-    for &b in &head[..16] {
-        print!(" {:02x}", b);
-    }
-    println!();
-    if &head[..4] == b"\x7fELF" {
-        println!("fs: ELF magic confirmed — exec-from-disk path is unblocked!");
-    } else {
-        println!("fs: WARNING — no ELF magic at /echo offset 0");
-    }
-
-    core::future::pending::<()>().await;
+    println!("spawning init proc ({} bytes)", embed::INITCODE.len());
+    let init = Arc::new(Proc::new_initcode(embed::INITCODE));
+    proc::spawn_proc_main(init);
 }
 
 #[panic_handler]
