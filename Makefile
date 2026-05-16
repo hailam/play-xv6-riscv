@@ -43,7 +43,10 @@ fs.img: build $(MKFS)
 		cat:$(USER_DIR)/cat.elf \
 		hello:$(USER_DIR)/hello.elf \
 		pipetest:$(USER_DIR)/pipetest.elf \
-		ls:$(USER_DIR)/ls.elf
+		ls:$(USER_DIR)/ls.elf \
+		mkdir:$(USER_DIR)/mkdir.elf \
+		rm:$(USER_DIR)/rm.elf \
+		wr:$(USER_DIR)/wr.elf
 
 qemu: build fs.img
 	$(QEMU) $(QEMUOPTS)

@@ -5,10 +5,11 @@
 //!   * `dir`        — directory operations on top of `inode`.
 //!   * `path`       — `namei` / `nameiparent`.
 
+pub mod bmap;
 pub mod dir;
 pub mod inode;
 pub mod log;
 pub mod path;
 pub mod superblock;
 
-pub use path::namei;
+pub use path::{namei, nameiparent};

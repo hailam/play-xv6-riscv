@@ -15,9 +15,10 @@ use crate::file::{File, PipeInner};
 use crate::fs;
 use crate::proc::{Proc, ProcState};
 use crate::uapi::{
-    Stat, O_RDONLY, O_RDWR, O_WRONLY, SYS_CHDIR, SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT,
-    SYS_FORK, SYS_FSTAT, SYS_GETPID, SYS_KILL, SYS_LINK, SYS_MKDIR, SYS_MKNOD, SYS_OPEN,
-    SYS_PIPE, SYS_READ, SYS_SBRK, SYS_SLEEP, SYS_UNLINK, SYS_UPTIME, SYS_WAIT, SYS_WRITE,
+    Stat, O_CREATE, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SYS_CHDIR, SYS_CLOSE, SYS_DUP,
+    SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FSTAT, SYS_GETPID, SYS_KILL, SYS_LINK, SYS_MKDIR,
+    SYS_MKNOD, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_SBRK, SYS_SLEEP, SYS_UNLINK, SYS_UPTIME,
+    SYS_WAIT, SYS_WRITE,
 };
 
 #[cfg(target_arch = "riscv64")]
@@ -83,9 +84,24 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
         SYS_UPTIME => (Arch::now_ticks() / TIMER_INTERVAL) as i64,
         SYS_KILL => -1, // pending/07-sys-kill-cancellation
         SYS_SBRK => -1, // pending/08-sbrk-and-malloc
-        SYS_CHDIR | SYS_MKDIR | SYS_MKNOD | SYS_UNLINK | SYS_LINK => {
-            // Writes through the log not implemented yet; tracked in
-            // pending/13-fs-writes.
+        SYS_MKDIR => {
+            let path_va = proc.trapframe().a0 as usize;
+            sys_mkdir(proc, path_va).await
+        }
+        SYS_MKNOD => {
+            let tf = proc.trapframe();
+            let path_va = tf.a0 as usize;
+            let major = tf.a1 as u16;
+            let minor = tf.a2 as u16;
+            sys_mknod(proc, path_va, major, minor).await
+        }
+        SYS_UNLINK => {
+            let path_va = proc.trapframe().a0 as usize;
+            sys_unlink(proc, path_va).await
+        }
+        SYS_LINK | SYS_CHDIR => {
+            // Both touched in a follow-up — `link` needs cross-dir
+            // unlink semantics; `chdir` needs per-proc cwd.
             -1
         }
         _ => {
@@ -191,11 +207,47 @@ async fn sys_write(proc: &Arc<Proc>, fd: i32, buf_va: usize, len: usize) -> i64 
         File::Console => console_write(proc, buf_va, len),
         File::PipeWrite(p) => pipe_write(p.clone(), proc, buf_va, len).await,
         File::PipeRead(_) => -1,
-        // Disk writes are not implemented yet (writei lives in
-        // pending/13-fs-writes). Reject so user code sees an error
-        // instead of a silent no-op.
-        File::Inode { .. } => -1,
+        File::Inode {
+            ip,
+            off,
+            readable: _,
+            writable,
+        } => {
+            if !*writable {
+                return -1;
+            }
+            inode_write(proc, ip.clone(), off, buf_va, len).await
+        }
     }
+}
+
+async fn inode_write(
+    proc: &Arc<Proc>,
+    ip: Arc<crate::fs::inode::Inode>,
+    off: &AtomicU32,
+    buf_va: usize,
+    len: usize,
+) -> i64 {
+    // Copy user bytes into a kernel buffer first so that writei (which
+    // does many awaits) doesn't have to keep crossing into user VA.
+    let mut tmp = alloc::vec![0u8; len];
+    for i in 0..len {
+        let Some(kva) = proc.translate_user(buf_va + i) else {
+            return -1;
+        };
+        tmp[i] = unsafe { *(kva as *const u8) };
+    }
+
+    let cur = off.load(Ordering::Acquire);
+    fs::log::begin_op().await;
+    let mut li = fs::inode::ilock(&ip).await;
+    let n = fs::inode::writei(&mut li, &tmp, cur).await;
+    drop(li);
+    fs::log::end_op().await;
+    if n > 0 {
+        off.store(cur + n as u32, Ordering::Release);
+    }
+    n as i64
 }
 
 fn console_write(proc: &Proc, buf_va: usize, len: usize) -> i64 {
@@ -434,21 +486,43 @@ async fn sys_open(proc: &Arc<Proc>, path_va: usize, flags: u32) -> i64 {
     let Some(path) = read_user_cstring(proc, path_va, 128) else {
         return -1;
     };
-    // O_CREATE / O_TRUNC need writei — not yet supported.
-    if (flags & !(O_RDONLY | O_WRONLY | O_RDWR)) != 0 {
+    let allowed = O_RDONLY | O_WRONLY | O_RDWR | O_CREATE | O_TRUNC;
+    if (flags & !allowed) != 0 {
         return -1;
     }
-    let Some(ip) = fs::namei(&path).await else {
-        return -1;
+
+    let ip = if (flags & O_CREATE) != 0 {
+        match create_at_path(&path, xv6_fs_layout::T_FILE, 0, 0).await {
+            Some(i) => i,
+            None => return -1,
+        }
+    } else {
+        let Some(i) = fs::namei(&path).await else {
+            return -1;
+        };
+        i
     };
-    // Sanity-check the inode by ilocking it once (forces load).
+
+    let typ;
     {
-        let li = fs::inode::ilock(&ip).await;
-        if li.state().typ == 0 {
+        let mut li = fs::inode::ilock(&ip).await;
+        typ = li.state().typ;
+        if typ == 0 {
             return -1;
         }
+        if typ == xv6_fs_layout::T_DIR && (flags & (O_WRONLY | O_RDWR)) != 0 {
+            return -1; // can't open a directory for writing
+        }
+        if (flags & O_TRUNC) != 0 && typ == xv6_fs_layout::T_FILE {
+            fs::log::begin_op().await;
+            fs::inode::itrunc(&mut li).await;
+            // itrunc already called iupdate; just close the op.
+            drop(li);
+            fs::log::end_op().await;
+        }
     }
-    let readable = (flags & O_WRONLY) == 0; // RDONLY (=0) or RDWR
+
+    let readable = (flags & O_WRONLY) == 0;
     let writable = (flags & (O_WRONLY | O_RDWR)) != 0;
     let f = Arc::new(File::Inode {
         ip,
@@ -457,6 +531,153 @@ async fn sys_open(proc: &Arc<Proc>, path_va: usize, flags: u32) -> i64 {
         writable,
     });
     proc.alloc_fd(f).map(|fd| fd as i64).unwrap_or(-1)
+}
+
+async fn sys_mkdir(proc: &Arc<Proc>, path_va: usize) -> i64 {
+    let Some(path) = read_user_cstring(proc, path_va, 128) else {
+        return -1;
+    };
+    match create_at_path(&path, xv6_fs_layout::T_DIR, 0, 0).await {
+        Some(_) => 0,
+        None => -1,
+    }
+}
+
+async fn sys_mknod(proc: &Arc<Proc>, path_va: usize, major: u16, minor: u16) -> i64 {
+    let Some(path) = read_user_cstring(proc, path_va, 128) else {
+        return -1;
+    };
+    match create_at_path(&path, xv6_fs_layout::T_DEVICE, major, minor).await {
+        Some(_) => 0,
+        None => -1,
+    }
+}
+
+async fn sys_unlink(proc: &Arc<Proc>, path_va: usize) -> i64 {
+    let Some(path) = read_user_cstring(proc, path_va, 128) else {
+        return -1;
+    };
+    let Some((dir, name)) = fs::nameiparent(&path).await else {
+        return -1;
+    };
+    if name == "." || name == ".." {
+        return -1;
+    }
+    fs::log::begin_op().await;
+    let result: i64 = unlink_inside_op(&dir, &name).await;
+    fs::log::end_op().await;
+    result
+}
+
+async fn unlink_inside_op(
+    dir: &Arc<crate::fs::inode::Inode>,
+    name: &str,
+) -> i64 {
+    let mut dir_li = fs::inode::ilock(dir).await;
+    let Some((child_ip, off)) =
+        crate::fs::dir::dirlookup_full(&dir_li, name).await
+    else {
+        return -1;
+    };
+    let mut child_li = fs::inode::ilock(&child_ip).await;
+    let child_typ = child_li.state().typ;
+    if child_typ == xv6_fs_layout::T_DIR
+        && !crate::fs::dir::dir_is_empty(&child_li).await
+    {
+        return -1;
+    }
+    crate::fs::dir::dirunlink_at(&mut dir_li, off).await;
+    if child_typ == xv6_fs_layout::T_DIR {
+        dir_li.state_mut().nlink -= 1;
+        fs::inode::iupdate(&dir_li).await;
+    }
+    child_li.state_mut().nlink -= 1;
+    if child_li.state().nlink == 0 && Arc::strong_count(&child_ip) <= 2 {
+        fs::inode::itrunc(&mut child_li).await;
+        child_li.state_mut().typ = 0;
+        fs::inode::iupdate(&child_li).await;
+    } else {
+        fs::inode::iupdate(&child_li).await;
+    }
+    0
+}
+
+/// Allocate a new inode of `typ` and link it at `path`. For T_DIR,
+/// also populates `.` and `..`. Returns the new inode on success.
+async fn create_at_path(
+    path: &str,
+    typ: u16,
+    major: u16,
+    minor: u16,
+) -> Option<Arc<crate::fs::inode::Inode>> {
+    let (dir, name) = fs::nameiparent(path).await?;
+    if name.is_empty() || name == "." || name == ".." || name.len() > xv6_fs_layout::DIRSIZ
+    {
+        return None;
+    }
+    fs::log::begin_op().await;
+    let result = create_inside_op(&dir, &name, typ, major, minor).await;
+    fs::log::end_op().await;
+    result
+}
+
+async fn create_inside_op(
+    dir: &Arc<crate::fs::inode::Inode>,
+    name: &str,
+    typ: u16,
+    major: u16,
+    minor: u16,
+) -> Option<Arc<crate::fs::inode::Inode>> {
+    let mut dir_li = fs::inode::ilock(dir).await;
+
+    // If the entry already exists and we're opening a regular file,
+    // return the existing inode (matches xv6's `create` for O_CREATE
+    // without O_EXCL). mkdir/mknod of an existing entry fails.
+    if let Some((existing, _)) =
+        crate::fs::dir::dirlookup_full(&dir_li, name).await
+    {
+        if typ != xv6_fs_layout::T_FILE {
+            return None;
+        }
+        let exist_li = fs::inode::ilock(&existing).await;
+        let existing_typ = exist_li.state().typ;
+        drop(exist_li);
+        if existing_typ == xv6_fs_layout::T_FILE
+            || existing_typ == xv6_fs_layout::T_DEVICE
+        {
+            return Some(existing);
+        }
+        return None;
+    }
+
+    let dev = dir_li.dev();
+    let child = fs::inode::ialloc(dev, typ).await?;
+    {
+        let mut child_li = fs::inode::ilock(&child).await;
+        child_li.state_mut().major = major;
+        child_li.state_mut().minor = minor;
+        child_li.state_mut().nlink = 1;
+        fs::inode::iupdate(&child_li).await;
+
+        if typ == xv6_fs_layout::T_DIR {
+            let dir_inum = dir_li.inum() as u16;
+            let child_inum = child_li.inum() as u16;
+            if !crate::fs::dir::dirlink(&mut child_li, ".", child_inum).await
+                || !crate::fs::dir::dirlink(&mut child_li, "..", dir_inum).await
+            {
+                return None;
+            }
+        }
+    }
+    let child_inum = child.inum.load(Ordering::Acquire) as u16;
+    if !crate::fs::dir::dirlink(&mut dir_li, name, child_inum).await {
+        return None;
+    }
+    if typ == xv6_fs_layout::T_DIR {
+        dir_li.state_mut().nlink += 1;
+        fs::inode::iupdate(&dir_li).await;
+    }
+    Some(child)
 }
 
 async fn sys_fstat(proc: &Arc<Proc>, fd: i32, stat_va: usize) -> i64 {

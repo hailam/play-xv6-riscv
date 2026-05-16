@@ -80,6 +80,14 @@ impl<'a> LockedInode<'a> {
         // Safety: `locked == true` for the duration of self.
         unsafe { &*self.inode.state.get() }
     }
+    /// Mutable access to the inode's in-memory state. Caller must
+    /// remember to `iupdate` (or `writei` which calls it) before
+    /// releasing the lock if disk needs to see the change.
+    pub fn state_mut(&mut self) -> &mut InodeState {
+        // Safety: `locked == true` and `&mut self` proves no aliasing
+        // `&InodeState` is live through `state()`.
+        unsafe { &mut *self.inode.state.get() }
+    }
     pub fn inode(&self) -> &Arc<Inode> {
         self.inode
     }
@@ -227,4 +235,173 @@ async fn bmap(li: &LockedInode<'_>, bn: u32) -> u32 {
     let ind_buf = bio::bread(ind_blkno).await;
     let o = idx * 4;
     u32::from_le_bytes(ind_buf.data()[o..o + 4].try_into().unwrap())
+}
+
+/// Like `bmap` but allocates the block (and an indirect block if
+/// needed) when it isn't present. Returns `None` on disk-full.
+/// Caller must hold an open log transaction.
+async fn bmap_or_alloc(li: &mut LockedInode<'_>, bn: u32) -> Option<u32> {
+    let dev = li.dev();
+    if (bn as usize) < NDIRECT {
+        let cur = li.state().addrs[bn as usize];
+        if cur != 0 {
+            return Some(cur);
+        }
+        let new_blk = crate::fs::bmap::balloc(dev).await?;
+        li.state_mut().addrs[bn as usize] = new_blk;
+        return Some(new_blk);
+    }
+    let idx = (bn as usize) - NDIRECT;
+    assert!(idx < NINDIRECT, "bmap_or_alloc: file too big");
+    let ind_blkno = li.state().addrs[NDIRECT];
+    let ind_blkno = if ind_blkno != 0 {
+        ind_blkno
+    } else {
+        let new_ind = crate::fs::bmap::balloc(dev).await?;
+        li.state_mut().addrs[NDIRECT] = new_ind;
+        new_ind
+    };
+    let ind_buf = bio::bread(ind_blkno).await;
+    let o = idx * 4;
+    let cur = u32::from_le_bytes(ind_buf.data()[o..o + 4].try_into().unwrap());
+    if cur != 0 {
+        return Some(cur);
+    }
+    let new_blk = crate::fs::bmap::balloc(dev).await?;
+    unsafe {
+        ind_buf.data_mut()[o..o + 4].copy_from_slice(&new_blk.to_le_bytes());
+    }
+    crate::fs::log::log_write(&ind_buf);
+    Some(new_blk)
+}
+
+/// Write `src` into the inode starting at offset `off`, extending the
+/// file if needed. Returns the number of bytes written (always
+/// `src.len()` unless we hit disk-full or the per-file size cap).
+/// Caller must hold an open log transaction.
+pub async fn writei(li: &mut LockedInode<'_>, src: &[u8], off: u32) -> usize {
+    let max_bytes = (xv6_fs_layout::MAXFILE as usize) * BSIZE;
+    if off as usize >= max_bytes {
+        return 0;
+    }
+    let want = src.len().min(max_bytes - off as usize);
+    let mut tot = 0usize;
+    let mut cur_off = off;
+    while tot < want {
+        let bn = cur_off / BSIZE as u32;
+        let Some(blkno) = bmap_or_alloc(li, bn).await else {
+            break;
+        };
+        let block_off = (cur_off as usize) % BSIZE;
+        let chunk = (BSIZE - block_off).min(want - tot);
+        let buf = bio::bread(blkno).await;
+        unsafe {
+            buf.data_mut()[block_off..block_off + chunk]
+                .copy_from_slice(&src[tot..tot + chunk]);
+        }
+        crate::fs::log::log_write(&buf);
+        tot += chunk;
+        cur_off += chunk as u32;
+    }
+    if cur_off > li.state().size {
+        li.state_mut().size = cur_off;
+        iupdate(li).await;
+    }
+    tot
+}
+
+/// Flush the in-memory inode back to disk through the log.
+/// Caller must hold an open log transaction.
+pub async fn iupdate(li: &LockedInode<'_>) {
+    let sb = superblock::get();
+    let inum = li.inum();
+    let blkno = inum / IPB + sb.inodestart;
+    let off = (inum % IPB) as usize * core::mem::size_of::<DInode>();
+    let buf = bio::bread(blkno).await;
+    let s = li.state();
+    let dino = DInode {
+        typ: s.typ,
+        major: s.major,
+        minor: s.minor,
+        nlink: s.nlink,
+        size: s.size,
+        addrs: s.addrs,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &dino as *const _ as *const u8,
+            core::mem::size_of::<DInode>(),
+        )
+    };
+    unsafe {
+        buf.data_mut()[off..off + bytes.len()].copy_from_slice(bytes);
+    }
+    crate::fs::log::log_write(&buf);
+}
+
+/// Free all data blocks owned by the file. Doesn't change typ/nlink —
+/// caller decides whether to zero those. Caller must hold an open log
+/// transaction. After this returns, the inode's in-memory `addrs` are
+/// all zero and `size == 0`, and `iupdate` has been called to push
+/// that to disk.
+pub async fn itrunc(li: &mut LockedInode<'_>) {
+    let dev = li.dev();
+    let addrs = li.state().addrs;
+    for i in 0..NDIRECT {
+        if addrs[i] != 0 {
+            crate::fs::bmap::bfree(dev, addrs[i]).await;
+        }
+    }
+    if addrs[NDIRECT] != 0 {
+        let ind_blkno = addrs[NDIRECT];
+        let ind_buf = bio::bread(ind_blkno).await;
+        for j in 0..NINDIRECT {
+            let o = j * 4;
+            let b = u32::from_le_bytes(ind_buf.data()[o..o + 4].try_into().unwrap());
+            if b != 0 {
+                crate::fs::bmap::bfree(dev, b).await;
+            }
+        }
+        crate::fs::bmap::bfree(dev, ind_blkno).await;
+    }
+    let state = li.state_mut();
+    state.addrs = [0; NDIRECT + 1];
+    state.size = 0;
+    iupdate(li).await;
+}
+
+/// Find a free on-disk inode slot, claim it with `typ`, and return an
+/// `Arc<Inode>` for it. Caller must hold an open log transaction.
+pub async fn ialloc(dev: u32, typ: u16) -> Option<Arc<Inode>> {
+    let sb = superblock::get();
+    for inum in 1..sb.ninodes {
+        let blkno = inum / IPB + sb.inodestart;
+        let off = (inum % IPB) as usize * core::mem::size_of::<DInode>();
+        let buf = bio::bread(blkno).await;
+        let mut dino = unsafe {
+            core::ptr::read_unaligned(buf.data()[off..].as_ptr() as *const DInode)
+        };
+        if dino.typ == 0 {
+            dino = DInode {
+                typ,
+                major: 0,
+                minor: 0,
+                nlink: 1,
+                size: 0,
+                addrs: [0; NDIRECT + 1],
+            };
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &dino as *const _ as *const u8,
+                    core::mem::size_of::<DInode>(),
+                )
+            };
+            unsafe {
+                buf.data_mut()[off..off + bytes.len()].copy_from_slice(bytes);
+            }
+            crate::fs::log::log_write(&buf);
+            return Some(iget(dev, inum));
+        }
+    }
+    None
 }

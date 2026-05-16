@@ -38,6 +38,9 @@ fn main() {
         ("sh", "SH_BIN_PATH", Lang::C, true),
         ("cat", "CAT_BIN_PATH", Lang::C, true),
         ("ls", "LS_BIN_PATH", Lang::C, true),
+        ("mkdir", "MKDIR_BIN_PATH", Lang::C, true),
+        ("rm", "RM_BIN_PATH", Lang::C, true),
+        ("wr", "WR_BIN_PATH", Lang::C, true),
     ];
 
     for (name, env_var, lang, with_ulib) in programs {
