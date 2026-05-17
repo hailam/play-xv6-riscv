@@ -11,6 +11,8 @@ use core::task::{Context, Poll};
 use hal::Hal;
 
 use crate::arch::Arch;
+use crate::cpu;
+use crate::executor;
 use crate::file::{File, PipeInner};
 use crate::fs;
 use crate::proc::{Proc, ProcState};
@@ -29,7 +31,7 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
         SYS_FORK => sys_fork(proc).await,
         SYS_EXIT => {
             let code = proc.trapframe().a0 as i32;
-            sys_exit(proc, code).await
+            sys_exit_inner(proc, code).await
         }
         SYS_WAIT => sys_wait(proc).await,
         SYS_WRITE => {
@@ -82,7 +84,10 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
         }
         SYS_GETPID => proc.pid as i64,
         SYS_UPTIME => (Arch::now_ticks() / TIMER_INTERVAL) as i64,
-        SYS_KILL => -1, // pending/07-sys-kill-cancellation
+        SYS_KILL => {
+            let pid = proc.trapframe().a0 as i32;
+            sys_kill(proc, pid).await
+        }
         SYS_SBRK => -1, // pending/08-sbrk-and-malloc
         SYS_MKDIR => {
             let path_va = proc.trapframe().a0 as usize;
@@ -111,6 +116,29 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
     }
 }
 
+async fn sys_kill(_proc: &Arc<Proc>, pid: i32) -> i64 {
+    if pid <= 0 {
+        return -1;
+    }
+    let Some(target) = executor::find_proc_by_pid(pid as usize) else {
+        return -1;
+    };
+    target.killed.store(true, Ordering::Release);
+    // Boot every blocking future this proc may be parked on. Each
+    // poll checks `killed` and returns a cancellation sentinel.
+    target.wait_waker.wake();
+    crate::console_in::wake();
+    executor::wake(target.task_id.load(Ordering::Relaxed));
+    0
+}
+
+/// Helper for futures: is the currently-polling proc killed?
+fn current_proc_killed() -> bool {
+    cpu::current_proc()
+        .map(|p| p.killed.load(Ordering::Acquire))
+        .unwrap_or(false)
+}
+
 async fn sys_fork(parent: &Arc<Proc>) -> i64 {
     let Some(child) = Proc::fork_from(parent) else {
         return -1;
@@ -125,7 +153,13 @@ async fn sys_fork(parent: &Arc<Proc>) -> i64 {
     child_pid
 }
 
-async fn sys_exit(proc: &Arc<Proc>, code: i32) -> i64 {
+/// Set as `pub(crate)` so `proc_main` can route killed procs into a
+/// clean exit.
+pub(crate) async fn sys_exit(proc: &Arc<Proc>, code: i32) -> i64 {
+    sys_exit_inner(proc, code).await
+}
+
+async fn sys_exit_inner(proc: &Arc<Proc>, code: i32) -> i64 {
     // Drop all fds so pipe end counts decrement now (rather than
     // waiting for the Proc itself to be reclaimed, which never happens
     // in Phase 5x).
@@ -153,6 +187,9 @@ impl Future for Wait<'_> {
     type Output = i64;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i64> {
+        if self.proc.killed.load(Ordering::Acquire) {
+            return Poll::Ready(-1);
+        }
         self.proc.wait_waker.register(cx.waker());
         let mut children = self.proc.children.lock();
         let mut zombie_idx = None;
@@ -189,6 +226,9 @@ impl Future for Sleep {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if current_proc_killed() {
+            return Poll::Ready(());
+        }
         if Arch::now_ticks() >= self.deadline {
             return Poll::Ready(());
         }
@@ -321,7 +361,9 @@ async fn inode_read(
 async fn console_read(proc: &Proc, buf_va: usize, len: usize) -> i64 {
     let mut n: usize = 0;
     while n < len {
-        let b = ConsoleByte.await;
+        let Some(b) = ConsoleByte.await else {
+            return -1; // killed
+        };
         let Some(kva) = proc.translate_user(buf_va + n) else {
             return -1;
         };
@@ -337,12 +379,15 @@ async fn console_read(proc: &Proc, buf_va: usize, len: usize) -> i64 {
 struct ConsoleByte;
 
 impl Future for ConsoleByte {
-    type Output = u8;
+    type Output = Option<u8>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u8> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<u8>> {
+        if current_proc_killed() {
+            return Poll::Ready(None);
+        }
         crate::console_in::register_waker(cx.waker());
         if let Some(b) = crate::console_in::try_pop() {
-            return Poll::Ready(b);
+            return Poll::Ready(Some(b));
         }
         Poll::Pending
     }
@@ -395,15 +440,21 @@ async fn pipe_write(
 ) -> i64 {
     let mut n: usize = 0;
     while n < len {
+        if proc.killed.load(Ordering::Acquire) {
+            return -1;
+        }
         let Some(kva) = proc.translate_user(buf_va + n) else {
             return -1;
         };
         let byte = unsafe { *(kva as *const u8) };
-        PipeWriteByte {
+        if !(PipeWriteByte {
             pipe: pipe.clone(),
             byte,
         }
-        .await;
+        .await)
+        {
+            return -1; // killed mid-write
+        }
         n += 1;
     }
     n as i64
@@ -415,16 +466,23 @@ struct PipeWriteByte {
 }
 
 impl Future for PipeWriteByte {
-    type Output = ();
+    type Output = bool; // true on success, false if killed
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
+        if current_proc_killed() {
+            return Poll::Ready(false);
+        }
         self.pipe.write_waker.register(cx.waker());
         let mut buf = self.pipe.buf.lock();
         if buf.len() < self.pipe.cap() {
             buf.push_back(self.byte);
             drop(buf);
             self.pipe.read_waker.wake();
-            return Poll::Ready(());
+            return Poll::Ready(true);
+        }
+        // No readers left? Writers should fail rather than block.
+        if self.pipe.readers.load(Ordering::Acquire) == 0 {
+            return Poll::Ready(false);
         }
         Poll::Pending
     }
@@ -466,6 +524,9 @@ impl Future for PipeReadByte {
     type Output = Option<u8>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<u8>> {
+        if current_proc_killed() {
+            return Poll::Ready(None);
+        }
         // Register first, then check — closes the wake-lost race.
         self.pipe.read_waker.register(cx.waker());
         let popped = self.pipe.buf.lock().pop_front();

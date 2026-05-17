@@ -5,7 +5,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
 use hal::{FrameAllocator, PageTableOps, PtePerm};
@@ -55,6 +55,10 @@ pub struct Proc {
     pub parent: SpinLock<Option<Weak<Proc>>>,
     pub children: SpinLock<Vec<Arc<Proc>>>,
     pub wait_waker: WakerCell,
+    /// Set by `sys_kill`. Every blocking future's `poll` checks this
+    /// and bails (returning a sentinel value); `proc_main` then routes
+    /// the killed proc into `sys_exit(-1)`.
+    pub killed: AtomicBool,
     /// Per-proc file descriptor table.
     pub files: SpinLock<Vec<Option<Arc<File>>>>,
 }
@@ -153,6 +157,7 @@ impl Proc {
             parent: SpinLock::new(None),
             children: SpinLock::new(Vec::new()),
             wait_waker: WakerCell::new(),
+            killed: AtomicBool::new(false),
             files: SpinLock::new(files),
         }
     }
@@ -249,11 +254,19 @@ async fn proc_main(proc: Arc<Proc>) {
             TrapEvent::Syscall { nr } => {
                 let ret = syscall::dispatch(&proc, nr).await;
                 proc.trapframe().a0 = ret as u64;
-                if proc.is_zombie() {
-                    core::future::pending::<()>().await;
-                }
             }
             TrapEvent::Timer | TrapEvent::Devintr => {}
+        }
+        // Killed mid-syscall? Convert into an `exit(-1)` so the
+        // parent's `wait` unblocks promptly.
+        if proc.killed.load(Ordering::Acquire) && !proc.is_zombie() {
+            let _ = syscall::sys_exit(&proc, -1).await;
+        }
+        if proc.is_zombie() {
+            // Task is done; park forever so the executor sees `Pending`
+            // and never re-polls us. The proc itself lives on (parent
+            // still holds an `Arc`) until it's reaped via `wait`.
+            core::future::pending::<()>().await;
         }
     }
 }

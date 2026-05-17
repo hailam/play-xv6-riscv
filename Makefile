@@ -46,7 +46,9 @@ fs.img: build $(MKFS)
 		ls:$(USER_DIR)/ls.elf \
 		mkdir:$(USER_DIR)/mkdir.elf \
 		rm:$(USER_DIR)/rm.elf \
-		wr:$(USER_DIR)/wr.elf
+		wr:$(USER_DIR)/wr.elf \
+		kill:$(USER_DIR)/kill.elf \
+		killtest:$(USER_DIR)/killtest.elf
 
 qemu: build fs.img
 	$(QEMU) $(QEMUOPTS)

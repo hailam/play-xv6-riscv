@@ -10,21 +10,17 @@ directory contains a `README.md` with the plan/summary, plus optional
 
 | Bucket | Count | What's in it |
 |---|---|---|
-| `done/` | 23 | Through fs writes — `mkdir` / `O_CREATE` / `unlink`, durable across reboot |
-| `pending/` | 6 | Polish + portability |
+| `done/` | 24 | Through kill+cancellation — a 10k-tick sleep is killable within ms |
+| `pending/` | 5 | Polish + portability |
 | `revisit/` | 3 | Decisions to potentially revisit later |
 
 ## Pending — priority order
 
-Userland-visible features are done for the in-tree binaries; the
-remaining queue is polish + portability work.
-
-1. [07-sys-kill-cancellation](pending/07-sys-kill-cancellation/) — `kill` + every `.await` checks `proc.killed`
-2. [08-sbrk-and-malloc](pending/08-sbrk-and-malloc/) — user heap, tiny `malloc` in ulib
-3. [09-vm-reaping](pending/09-vm-reaping/) — `Drop` for `PageTable`; stop leaking on `exec`/`exit`
-4. [10-smp-user-procs](pending/10-smp-user-procs/) — per-CPU executors with sticky `home_cpu`
-5. [11-aarch64-hal](pending/11-aarch64-hal/) — second HAL impl; prove the trait surface holds
-6. [12-phase2-gui](pending/12-phase2-gui/) — minimal framebuffer-backed display
+1. [08-sbrk-and-malloc](pending/08-sbrk-and-malloc/) — user heap, tiny `malloc` in ulib
+2. [09-vm-reaping](pending/09-vm-reaping/) — `Drop` for `PageTable`; stop leaking on `exec`/`exit`
+3. [10-smp-user-procs](pending/10-smp-user-procs/) — per-CPU executors with sticky `home_cpu`
+4. [11-aarch64-hal](pending/11-aarch64-hal/) — second HAL impl; prove the trait surface holds
+5. [12-phase2-gui](pending/12-phase2-gui/) — minimal framebuffer-backed display
 
 ## Done — chronological
 
@@ -53,11 +49,12 @@ remaining queue is polish + portability work.
 | 20 | [fs-inode-and-dir](done/20-fs-inode-and-dir/) | +400 |
 | 21 | [file-syscalls-read-path](done/21-file-syscalls-read-path/) | +310 (+120 user) |
 | 22 | [fs-writes](done/22-fs-writes/) | +570 (+120 user) |
+| 23 | [sys-kill-cancellation](done/23-sys-kill-cancellation/) | +150 (+70 user) |
 
-Current kernel totals: **~5,895 LoC, ~153 unsafe-ish lines** (~2.6%,
+Current kernel totals: **~6,045 LoC, ~153 unsafe-ish lines** (~2.5%,
 well inside the 700-line budget). Plus ~270 LoC host code in `mkfs/`,
-~40 LoC in the shared `xv6-fs-layout` crate, and ~240 LoC user code
-(`ls/mkdir/rm/wr` C sources).
+~40 LoC in the shared `xv6-fs-layout` crate, and ~310 LoC user code
+(`ls/mkdir/rm/wr/kill/killtest` C sources).
 
 ## Revisit
 

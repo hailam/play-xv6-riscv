@@ -31,3 +31,9 @@ pub fn try_pop() -> Option<u8> {
 pub fn register_waker(w: &Waker) {
     READER.register(w);
 }
+
+/// Boot the currently-parked reader (if any). Called by `sys_kill`
+/// so a killed proc blocked in console read returns promptly.
+pub fn wake() {
+    READER.wake();
+}

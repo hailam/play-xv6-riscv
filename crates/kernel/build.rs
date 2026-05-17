@@ -41,6 +41,8 @@ fn main() {
         ("mkdir", "MKDIR_BIN_PATH", Lang::C, true),
         ("rm", "RM_BIN_PATH", Lang::C, true),
         ("wr", "WR_BIN_PATH", Lang::C, true),
+        ("kill", "KILL_BIN_PATH", Lang::C, true),
+        ("killtest", "KILLTEST_BIN_PATH", Lang::C, true),
     ];
 
     for (name, env_var, lang, with_ulib) in programs {

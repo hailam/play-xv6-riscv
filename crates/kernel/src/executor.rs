@@ -84,6 +84,20 @@ pub fn wake(id: TaskId) {
     EXECUTOR.ready.lock().push_back(id);
 }
 
+/// Linear scan of all live tasks for one whose proc has `pid`. Used
+/// by `sys_kill`; N is tiny.
+pub fn find_proc_by_pid(pid: usize) -> Option<Arc<Proc>> {
+    let tasks = EXECUTOR.tasks.lock();
+    for t in tasks.iter().flatten() {
+        if let Some(p) = t.proc.as_ref() {
+            if p.pid == pid {
+                return Some(Arc::clone(p));
+            }
+        }
+    }
+    None
+}
+
 pub fn run() -> ! {
     // We enter `run` at the top of a kernel stack with no locks held —
     // either from kmain (where intr_on was already called) or from
