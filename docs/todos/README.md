@@ -10,16 +10,15 @@ directory contains a `README.md` with the plan/summary, plus optional
 
 | Bucket | Count | What's in it |
 |---|---|---|
-| `done/` | 25 | Through sbrk+umalloc — user programs have a heap |
-| `pending/` | 4 | Polish + portability |
+| `done/` | 26 | Through vm-reaping — free-frame count flat across 20× fork/exec/exit |
+| `pending/` | 3 | Portability + perf |
 | `revisit/` | 3 | Decisions to potentially revisit later |
 
 ## Pending — priority order
 
-1. [09-vm-reaping](pending/09-vm-reaping/) — `Drop` for `PageTable`; stop leaking on `exec`/`exit`/`sbrk` partials
-2. [10-smp-user-procs](pending/10-smp-user-procs/) — per-CPU executors with sticky `home_cpu`
-3. [11-aarch64-hal](pending/11-aarch64-hal/) — second HAL impl; prove the trait surface holds
-4. [12-phase2-gui](pending/12-phase2-gui/) — minimal framebuffer-backed display
+1. [10-smp-user-procs](pending/10-smp-user-procs/) — per-CPU executors with sticky `home_cpu`
+2. [11-aarch64-hal](pending/11-aarch64-hal/) — second HAL impl; prove the trait surface holds
+3. [12-phase2-gui](pending/12-phase2-gui/) — minimal framebuffer-backed display
 
 ## Done — chronological
 
@@ -50,11 +49,11 @@ directory contains a `README.md` with the plan/summary, plus optional
 | 22 | [fs-writes](done/22-fs-writes/) | +570 (+120 user) |
 | 23 | [sys-kill-cancellation](done/23-sys-kill-cancellation/) | +150 (+70 user) |
 | 24 | [sbrk-and-malloc](done/24-sbrk-and-malloc/) | +50 (+160 user) |
+| 25 | [vm-reaping](done/25-vm-reaping/) | +130 |
 
-Current kernel totals: **~6,095 LoC, ~153 unsafe-ish lines** (~2.5%,
+Current kernel totals: **~6,225 LoC, ~158 unsafe-ish lines** (~2.5%,
 well inside the 700-line budget). Plus ~270 LoC host code in `mkfs/`,
-~40 LoC in the shared `xv6-fs-layout` crate, and ~470 LoC user code
-(`ls/mkdir/rm/wr/kill/killtest/malloctest` + ported `umalloc.c`).
+~40 LoC in the shared `xv6-fs-layout` crate, and ~470 LoC user code.
 
 ## Revisit
 

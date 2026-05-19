@@ -9,6 +9,8 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering
 use core::task::{Context, Poll};
 
 use hal::{FrameAllocator, PageTableOps, PtePerm};
+// (FrameAllocator brought in above so `Drop for Proc` can free
+// `trapframe_pa` via the same KFRAMES handle the rest of the code uses.)
 
 use crate::arch::{Arch, Hal};
 use crate::cpu;
@@ -229,6 +231,18 @@ impl Proc {
     }
 }
 
+impl Drop for Proc {
+    fn drop(&mut self) {
+        // The pagetable's own Drop already frees user pages +
+        // intermediate tables; the trapframe was allocated separately
+        // (it's mapped into the pagetable without PTE_U so the
+        // reaper leaves it alone).
+        if self.trapframe_pa != 0 {
+            unsafe { KFRAMES.free(self.trapframe_pa) };
+        }
+    }
+}
+
 fn default_files() -> Vec<Option<Arc<File>>> {
     let mut files: Vec<Option<Arc<File>>> = (0..NOFILE).map(|_| None).collect();
     let console = Arc::new(File::Console);
@@ -257,16 +271,17 @@ async fn proc_main(proc: Arc<Proc>) {
             }
             TrapEvent::Timer | TrapEvent::Devintr => {}
         }
-        // Killed mid-syscall? Convert into an `exit(-1)` so the
-        // parent's `wait` unblocks promptly.
         if proc.killed.load(Ordering::Acquire) && !proc.is_zombie() {
             let _ = syscall::sys_exit(&proc, -1).await;
         }
         if proc.is_zombie() {
-            // Task is done; park forever so the executor sees `Pending`
-            // and never re-polls us. The proc itself lives on (parent
-            // still holds an `Arc`) until it's reaped via `wait`.
-            core::future::pending::<()>().await;
+            // Return cleanly. The executor sees `Poll::Ready(())` and
+            // leaves the task slot empty. Dropping this future also
+            // drops its captured `Arc<Proc>` — once the parent's
+            // `wait` reaps the child from `parent.children`, the
+            // refcount falls to zero and `Drop for Proc` returns the
+            // trapframe page and the (now-empty) pagetable root.
+            return;
         }
     }
 }

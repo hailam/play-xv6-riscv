@@ -218,9 +218,16 @@ pub(crate) async fn sys_exit(proc: &Arc<Proc>, code: i32) -> i64 {
 
 async fn sys_exit_inner(proc: &Arc<Proc>, code: i32) -> i64 {
     // Drop all fds so pipe end counts decrement now (rather than
-    // waiting for the Proc itself to be reclaimed, which never happens
-    // in Phase 5x).
+    // waiting for the Proc itself to be reclaimed).
     proc.files.lock().clear();
+
+    // Tear down the user pagetable now — this is what reclaims the
+    // user data pages, heap, and L1/L0 table pages. After this the
+    // proc is a Zombie; its parent will reap the (already-small)
+    // remaining `Proc` via `wait`.
+    let fresh = <Arch as Hal>::PageTable::new(&KFRAMES).expect("exit: dummy pt");
+    let old_pt = core::mem::replace(&mut *proc.pagetable.lock(), fresh);
+    drop(old_pt); // <- triggers `Drop for PageTable`
 
     proc.exit_code.store(code, Ordering::Relaxed);
     proc.state.store(ProcState::Zombie as i32, Ordering::Release);
@@ -228,7 +235,11 @@ async fn sys_exit_inner(proc: &Arc<Proc>, code: i32) -> i64 {
     if let Some(p) = parent_weak.and_then(|w| w.upgrade()) {
         p.wait_waker.wake();
     }
-    crate::println!("pid {} exit({code})", proc.pid);
+    crate::println!(
+        "pid {} exit({code}) kalloc.free={}",
+        proc.pid,
+        KFRAMES.free_count(),
+    );
     0
 }
 

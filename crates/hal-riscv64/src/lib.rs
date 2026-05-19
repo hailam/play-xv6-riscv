@@ -14,7 +14,7 @@ mod trap_hook;
 pub mod trapframe;
 pub mod uart;
 
-pub use pagetable::PageTable;
+pub use pagetable::{install_free_frame, PageTable};
 pub use trap::{arm_timer, handle_external_irq, init_kernel_trap_vec, TIMER_INTERVAL};
 pub use trapframe::TrapFrame;
 

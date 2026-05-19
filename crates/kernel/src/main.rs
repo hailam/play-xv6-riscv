@@ -51,6 +51,9 @@ pub extern "C" fn kmain() -> ! {
             kalloc::KFRAMES.free_count(),
             kalloc::KFRAMES.free_count() * 4 / 1024,
         );
+        // Register the global frame-free callback used by
+        // `Drop for PageTable` to reclaim user pages on exec/exit.
+        hal_riscv64::install_free_frame(kernel_free_frame);
         vm::init_and_install();
         println!("kvm: installed (satp={:#x})", vm::kernel_satp());
         hal_riscv64::uart::init();
@@ -102,6 +105,14 @@ async fn bringup_then_init() {
     println!("spawning init proc ({} bytes)", embed::INITCODE.len());
     let init = Arc::new(Proc::new_initcode(embed::INITCODE));
     proc::spawn_proc_main(init);
+}
+
+/// Shim handed to `hal_riscv64::pagetable::install_free_frame` so the
+/// page-table reaper can return frames to the kernel allocator without
+/// hal-riscv64 depending on `crate::kalloc`.
+unsafe fn kernel_free_frame(pa: usize) {
+    use hal::FrameAllocator;
+    unsafe { kalloc::KFRAMES.free(pa) };
 }
 
 #[panic_handler]

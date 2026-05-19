@@ -10,6 +10,8 @@
 //!   [9:0]  flags (V/R/W/X/U/G/A/D + 2 RSW)
 //!   [53:10] PPN  (44 bits)
 
+use core::sync::atomic::{AtomicPtr, Ordering};
+
 use hal::{FrameAllocator, PageTableOps, PtePerm, VmError};
 
 use crate::memlayout::{MAXVA, PGSIZE};
@@ -19,6 +21,30 @@ const PTE_R: u64 = 1 << 1;
 const PTE_W: u64 = 1 << 2;
 const PTE_X: u64 = 1 << 3;
 const PTE_U: u64 = 1 << 4;
+
+/// Frame-free function registered by the kernel at boot. Used by
+/// `Drop for PageTable` to return user data pages + intermediate
+/// table pages to the global pool. Kept as a function pointer (not
+/// a `&dyn` trait object) to dodge the fat-pointer-in-AtomicPtr
+/// problem; the kernel installs it once at startup.
+static FREE_FRAME: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Install the frame-free callback. Idempotent; safe to call once
+/// per boot before any user-mode pagetable could be dropped.
+pub fn install_free_frame(f: unsafe fn(usize)) {
+    FREE_FRAME.store(f as *mut (), Ordering::Release);
+}
+
+/// Safety: caller must have previously registered the matching
+/// allocator and `pa` must be one of its frames.
+unsafe fn free_frame(pa: usize) {
+    let p = FREE_FRAME.load(Ordering::Acquire);
+    if p.is_null() {
+        return; // not registered yet; leak rather than crash
+    }
+    let f: unsafe fn(usize) = unsafe { core::mem::transmute(p) };
+    unsafe { f(pa) };
+}
 
 #[derive(Copy, Clone)]
 #[repr(transparent)]
@@ -74,9 +100,54 @@ impl Pte {
     }
 }
 
-/// Owned Sv39 root page table. Drop frees the entire tree.
+/// Owned Sv39 root page table. Drop frees the entire tree:
+///   * user leaves (PTE_U set) are returned to the page-frame pool
+///   * non-user leaves (TRAMPOLINE = RX kernel; TRAPFRAME = RW
+///     kernel-owned) are left alone — they're managed by their
+///     owners (the kernel image, or `Proc`)
+///   * all intermediate table pages are freed
+///   * finally the root itself
+///
+/// The `core::mem::forget(pt)` in `vm::init_and_install` keeps the
+/// kernel pagetable safe from this Drop.
 pub struct PageTable {
     root_pa: usize,
+}
+
+impl Drop for PageTable {
+    fn drop(&mut self) {
+        unsafe {
+            free_subtree(self.root_pa, 2);
+        }
+    }
+}
+
+/// Recursively walk a (sub)tree rooted at `pt_pa`. `level` is the
+/// number of additional indirections (2 = root, 1 = L1, 0 = L0).
+/// Leaves with PTE_U set are freed; non-user leaves are left in
+/// place. All non-leaf tables are freed after their children are
+/// processed.
+unsafe fn free_subtree(pt_pa: usize, level: i32) {
+    let ents = pt_pa as *mut [Pte; 512];
+    for i in 0..512 {
+        let pte = unsafe { (*ents)[i] };
+        if !pte.is_valid() {
+            continue;
+        }
+        let target = pte.pa() as usize;
+        if pte.is_leaf() {
+            if (pte.0 & PTE_U) != 0 {
+                unsafe { free_frame(target) };
+            }
+            // PTE_U == 0 → kernel-owned leaf (TRAMPOLINE / TRAPFRAME).
+            // The kernel image manages TRAMPOLINE; `Proc` frees its
+            // own `trapframe_pa` explicitly.
+        } else if level > 0 {
+            unsafe { free_subtree(target, level - 1) };
+        }
+        unsafe { (*ents)[i] = Pte::empty() };
+    }
+    unsafe { free_frame(pt_pa) };
 }
 
 impl PageTable {
