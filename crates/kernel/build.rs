@@ -24,7 +24,9 @@ fn main() {
         let _ = std::fs::create_dir_all(ud);
     }
 
-    let ulib_obj = compile_to_obj(&out_dir, "ulib", Lang::Asm);
+    let ulib_obj    = compile_to_obj(&out_dir, "ulib", Lang::Asm);
+    let umalloc_obj = compile_to_obj(&out_dir, "umalloc", Lang::C);
+    let user_objs   = vec![ulib_obj, umalloc_obj];
 
     // Only `initcode` is `include_bytes!`'d into the kernel; every
     // other binary now lives on disk and is loaded via `sys_exec`.
@@ -43,10 +45,11 @@ fn main() {
         ("wr", "WR_BIN_PATH", Lang::C, true),
         ("kill", "KILL_BIN_PATH", Lang::C, true),
         ("killtest", "KILLTEST_BIN_PATH", Lang::C, true),
+        ("malloctest", "MALLOCTEST_BIN_PATH", Lang::C, true),
     ];
 
     for (name, env_var, lang, with_ulib) in programs {
-        let bin = build_user_program(&out_dir, name, *lang, *with_ulib, &ulib_obj);
+        let bin = build_user_program(&out_dir, name, *lang, *with_ulib, &user_objs);
         println!("cargo:rustc-env={env_var}={}", bin.display());
         if let Some(ud) = user_dir.as_ref() {
             let stable = ud.join(format!("{name}.elf"));
@@ -74,6 +77,7 @@ fn compile_to_obj(out_dir: &Path, name: &str, lang: Lang) -> PathBuf {
             "-nostdlib", "-fno-pie", "-static",
             "-ffreestanding", "-fno-stack-protector",
             "-fno-asynchronous-unwind-tables",
+            "-fno-builtin",  // don't infer libc signatures for malloc/free/etc
             "-Os", "-Wall",
             "-c", "-o", obj.to_str().unwrap(),
             &src,
@@ -87,7 +91,7 @@ fn build_user_program(
     name: &str,
     lang: Lang,
     with_ulib: bool,
-    ulib_obj: &Path,
+    runtime_objs: &[PathBuf],
 ) -> PathBuf {
     let obj = compile_to_obj(out_dir, name, lang);
     let elf = out_dir.join(format!("{name}.elf"));
@@ -101,7 +105,9 @@ fn build_user_program(
         elf.to_str().unwrap().to_string(),
     ];
     if with_ulib {
-        ld_args.push(ulib_obj.to_str().unwrap().to_string());
+        for o in runtime_objs {
+            ld_args.push(o.to_str().unwrap().to_string());
+        }
     }
     ld_args.push(obj.to_str().unwrap().to_string());
     let ld_args_ref: Vec<&str> = ld_args.iter().map(|s| s.as_str()).collect();

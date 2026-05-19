@@ -8,14 +8,16 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::{Context, Poll};
 
-use hal::Hal;
+use hal::{FrameAllocator, Hal, PageTableOps, PtePerm};
 
 use crate::arch::Arch;
 use crate::cpu;
 use crate::executor;
 use crate::file::{File, PipeInner};
 use crate::fs;
+use crate::kalloc::KFRAMES;
 use crate::proc::{Proc, ProcState};
+use crate::user_vm::STACK_VA_BASE;
 use crate::uapi::{
     Stat, O_CREATE, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SYS_CHDIR, SYS_CLOSE, SYS_DUP,
     SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FSTAT, SYS_GETPID, SYS_KILL, SYS_LINK, SYS_MKDIR,
@@ -24,7 +26,7 @@ use crate::uapi::{
 };
 
 #[cfg(target_arch = "riscv64")]
-use hal_riscv64::{TrapFrame, TIMER_INTERVAL};
+use hal_riscv64::{memlayout::PGSIZE, TrapFrame, TIMER_INTERVAL};
 
 pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
     match nr {
@@ -88,7 +90,10 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let pid = proc.trapframe().a0 as i32;
             sys_kill(proc, pid).await
         }
-        SYS_SBRK => -1, // pending/08-sbrk-and-malloc
+        SYS_SBRK => {
+            let n = proc.trapframe().a0 as i64;
+            sys_sbrk(proc, n).await
+        }
         SYS_MKDIR => {
             let path_va = proc.trapframe().a0 as usize;
             sys_mkdir(proc, path_va).await
@@ -114,6 +119,58 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             -1
         }
     }
+}
+
+/// Grow (or shrink) the user data segment by `n` bytes. Returns the
+/// OLD break (matches xv6 / classic `sbrk` semantics). On error
+/// returns `-1`.
+///
+/// Growth allocates fresh zero-filled frames and maps them URW
+/// starting at `ceil(old_break / PGSIZE)`. Shrink is currently a
+/// metadata-only update — pages aren't unmapped or freed. Reclaiming
+/// pages on shrink is tracked in `pending/09-vm-reaping`.
+async fn sys_sbrk(proc: &Arc<Proc>, n: i64) -> i64 {
+    let old = proc.size.load(Ordering::Acquire);
+    if n == 0 {
+        return old as i64;
+    }
+    if n < 0 {
+        let shrink = (-n) as usize;
+        if shrink > old {
+            return -1;
+        }
+        proc.size.store(old - shrink, Ordering::Release);
+        return old as i64;
+    }
+    let new = match old.checked_add(n as usize) {
+        Some(x) => x,
+        None => return -1,
+    };
+    // Reserve one page of guard between the heap top and the user
+    // stack so an overflowing malloc can't silently scribble on
+    // argv / the trapframe.
+    let heap_top = STACK_VA_BASE.saturating_sub(PGSIZE);
+    if new > heap_top {
+        return -1;
+    }
+    let start = (old + PGSIZE - 1) & !(PGSIZE - 1);
+    let end = (new + PGSIZE - 1) & !(PGSIZE - 1);
+    {
+        let mut pt = proc.pagetable.lock();
+        let mut va = start;
+        while va < end {
+            let Some(pa) = KFRAMES.alloc_zeroed() else {
+                // Partial allocation leaks until vm-reaping lands.
+                return -1;
+            };
+            if pt.map(va, pa, PGSIZE, PtePerm::URW, &KFRAMES).is_err() {
+                return -1;
+            }
+            va += PGSIZE;
+        }
+    }
+    proc.size.store(new, Ordering::Release);
+    old as i64
 }
 
 async fn sys_kill(_proc: &Arc<Proc>, pid: i32) -> i64 {
