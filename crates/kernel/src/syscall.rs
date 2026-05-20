@@ -109,10 +109,15 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let path_va = proc.trapframe().a0 as usize;
             sys_unlink(proc, path_va).await
         }
-        SYS_LINK | SYS_CHDIR => {
-            // Both touched in a follow-up — `link` needs cross-dir
-            // unlink semantics; `chdir` needs per-proc cwd.
-            -1
+        SYS_CHDIR => {
+            let path_va = proc.trapframe().a0 as usize;
+            sys_chdir(proc, path_va).await
+        }
+        SYS_LINK => {
+            let tf = proc.trapframe();
+            let old_va = tf.a0 as usize;
+            let new_va = tf.a1 as usize;
+            sys_link(proc, old_va, new_va).await
         }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
@@ -622,12 +627,12 @@ async fn sys_open(proc: &Arc<Proc>, path_va: usize, flags: u32) -> i64 {
     }
 
     let ip = if (flags & O_CREATE) != 0 {
-        match create_at_path(&path, xv6_fs_layout::T_FILE, 0, 0).await {
+        match create_at_path(proc, &path, xv6_fs_layout::T_FILE, 0, 0).await {
             Some(i) => i,
             None => return -1,
         }
     } else {
-        let Some(i) = fs::namei(&path).await else {
+        let Some(i) = resolve_path(proc, &path).await else {
             return -1;
         };
         i
@@ -667,7 +672,7 @@ async fn sys_mkdir(proc: &Arc<Proc>, path_va: usize) -> i64 {
     let Some(path) = read_user_cstring(proc, path_va, 128) else {
         return -1;
     };
-    match create_at_path(&path, xv6_fs_layout::T_DIR, 0, 0).await {
+    match create_at_path(proc, &path, xv6_fs_layout::T_DIR, 0, 0).await {
         Some(_) => 0,
         None => -1,
     }
@@ -677,7 +682,7 @@ async fn sys_mknod(proc: &Arc<Proc>, path_va: usize, major: u16, minor: u16) -> 
     let Some(path) = read_user_cstring(proc, path_va, 128) else {
         return -1;
     };
-    match create_at_path(&path, xv6_fs_layout::T_DEVICE, major, minor).await {
+    match create_at_path(proc, &path, xv6_fs_layout::T_DEVICE, major, minor).await {
         Some(_) => 0,
         None => -1,
     }
@@ -687,7 +692,7 @@ async fn sys_unlink(proc: &Arc<Proc>, path_va: usize) -> i64 {
     let Some(path) = read_user_cstring(proc, path_va, 128) else {
         return -1;
     };
-    let Some((dir, name)) = fs::nameiparent(&path).await else {
+    let Some((dir, name)) = nameiparent_via_cwd(proc, &path).await else {
         return -1;
     };
     if name == "." || name == ".." {
@@ -735,12 +740,13 @@ async fn unlink_inside_op(
 /// Allocate a new inode of `typ` and link it at `path`. For T_DIR,
 /// also populates `.` and `..`. Returns the new inode on success.
 async fn create_at_path(
+    proc: &Arc<Proc>,
     path: &str,
     typ: u16,
     major: u16,
     minor: u16,
 ) -> Option<Arc<crate::fs::inode::Inode>> {
-    let (dir, name) = fs::nameiparent(path).await?;
+    let (dir, name) = nameiparent_via_cwd(proc, path).await?;
     if name.is_empty() || name == "." || name == ".." || name.len() > xv6_fs_layout::DIRSIZ
     {
         return None;
@@ -861,7 +867,7 @@ async fn sys_exec(proc: &Arc<Proc>, path_va: usize, argv_va: usize) -> i64 {
     };
 
     // Load the ELF bytes from the on-disk file pointed to by `path`.
-    let bin = match read_file_fully(&path).await {
+    let bin = match read_file_fully(proc, &path).await {
         Some(b) => b,
         None => {
             crate::println!("exec: no such file: {}", path);
@@ -893,8 +899,115 @@ async fn sys_exec(proc: &Arc<Proc>, path_va: usize, argv_va: usize) -> i64 {
     argc
 }
 
-async fn read_file_fully(path: &str) -> Option<Vec<u8>> {
-    let ip = fs::namei(path).await?;
+/// Resolve `path` against `proc`'s cwd (or `/` if no cwd is set).
+async fn resolve_path(proc: &Arc<Proc>, path: &str) -> Option<Arc<crate::fs::inode::Inode>> {
+    let cwd = proc.cwd.lock().clone();
+    match cwd {
+        Some(c) => fs::path::namei_from(c, path).await,
+        None => fs::namei(path).await,
+    }
+}
+
+async fn nameiparent_via_cwd(
+    proc: &Arc<Proc>,
+    path: &str,
+) -> Option<(Arc<crate::fs::inode::Inode>, alloc::string::String)> {
+    let cwd = proc.cwd.lock().clone();
+    match cwd {
+        Some(c) => fs::path::nameiparent_from(c, path).await,
+        None => fs::nameiparent(path).await,
+    }
+}
+
+async fn sys_chdir(proc: &Arc<Proc>, path_va: usize) -> i64 {
+    let Some(path) = read_user_cstring(proc, path_va, 128) else {
+        return -1;
+    };
+    let Some(ip) = resolve_path(proc, &path).await else {
+        return -1;
+    };
+    {
+        let li = fs::inode::ilock(&ip).await;
+        if li.state().typ != xv6_fs_layout::T_DIR {
+            return -1;
+        }
+    }
+    *proc.cwd.lock() = Some(ip);
+    0
+}
+
+/// Hard-link `new` to point at the same inode as `old`. Both paths
+/// resolve through the proc's cwd. Refuses to link directories.
+async fn sys_link(proc: &Arc<Proc>, old_va: usize, new_va: usize) -> i64 {
+    let Some(old) = read_user_cstring(proc, old_va, 128) else {
+        return -1;
+    };
+    let Some(new) = read_user_cstring(proc, new_va, 128) else {
+        return -1;
+    };
+    let Some(ip) = resolve_path(proc, &old).await else {
+        return -1;
+    };
+    fs::log::begin_op().await;
+    let result = link_inside_op(proc, ip, &new).await;
+    fs::log::end_op().await;
+    result
+}
+
+async fn link_inside_op(
+    proc: &Arc<Proc>,
+    ip: Arc<crate::fs::inode::Inode>,
+    new_path: &str,
+) -> i64 {
+    {
+        let mut li = fs::inode::ilock(&ip).await;
+        if li.state().typ == xv6_fs_layout::T_DIR {
+            return -1;
+        }
+        li.state_mut().nlink += 1;
+        fs::inode::iupdate(&li).await;
+    }
+    let Some((dir, name)) = nameiparent_via_cwd(proc, new_path).await else {
+        // Undo the nlink bump we just did.
+        let mut li = fs::inode::ilock(&ip).await;
+        li.state_mut().nlink -= 1;
+        fs::inode::iupdate(&li).await;
+        return -1;
+    };
+    // Names must be in the same device (single device today, but the
+    // check costs nothing).
+    let dir_dev;
+    let ip_dev;
+    {
+        let dli = fs::inode::ilock(&dir).await;
+        dir_dev = dli.dev();
+    }
+    {
+        let ili = fs::inode::ilock(&ip).await;
+        ip_dev = ili.dev();
+    }
+    if dir_dev != ip_dev {
+        let mut li = fs::inode::ilock(&ip).await;
+        li.state_mut().nlink -= 1;
+        fs::inode::iupdate(&li).await;
+        return -1;
+    }
+    let inum = ip.inum.load(Ordering::Acquire) as u16;
+    let ok = {
+        let mut dli = fs::inode::ilock(&dir).await;
+        crate::fs::dir::dirlink(&mut dli, &name, inum).await
+    };
+    if !ok {
+        let mut li = fs::inode::ilock(&ip).await;
+        li.state_mut().nlink -= 1;
+        fs::inode::iupdate(&li).await;
+        return -1;
+    }
+    0
+}
+
+async fn read_file_fully(proc: &Arc<Proc>, path: &str) -> Option<Vec<u8>> {
+    let ip = resolve_path(proc, path).await?;
     let li = fs::inode::ilock(&ip).await;
     let size = li.state().size as usize;
     let mut buf = alloc::vec![0u8; size];

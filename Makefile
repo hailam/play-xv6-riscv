@@ -50,7 +50,8 @@ fs.img: build $(MKFS)
 		kill:$(USER_DIR)/kill.elf \
 		killtest:$(USER_DIR)/killtest.elf \
 		malloctest:$(USER_DIR)/malloctest.elf \
-		smptest:$(USER_DIR)/smptest.elf
+		smptest:$(USER_DIR)/smptest.elf \
+		ln:$(USER_DIR)/ln.elf
 
 qemu: build fs.img
 	$(QEMU) $(QEMUOPTS)

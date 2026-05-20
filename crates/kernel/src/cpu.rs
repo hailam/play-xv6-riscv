@@ -1,10 +1,20 @@
 //! Per-CPU state.
 
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use crate::arch::{Arch, Hal, MAX_CPUS};
 use crate::proc::Proc;
+
+/// Bitmask of harts that have called [`init_this_hart`]. Used by
+/// `executor::pick_home_cpu` so we never assign a task to a hart
+/// that QEMU didn't actually spin up (the static `MAX_CPUS` is just
+/// the upper bound).
+static ACTIVE_CPUS: AtomicU64 = AtomicU64::new(0);
+
+pub fn active_cpu_mask() -> u64 {
+    ACTIVE_CPUS.load(Ordering::Acquire)
+}
 
 #[repr(align(64))]
 pub struct Cpu {
@@ -41,6 +51,7 @@ pub fn current() -> &'static Cpu {
 pub fn init_this_hart() {
     let id = Arch::hartid();
     CPUS[id].hartid.store(id, Ordering::Relaxed);
+    ACTIVE_CPUS.fetch_or(1u64 << id, Ordering::Release);
 }
 
 pub fn push_off() {

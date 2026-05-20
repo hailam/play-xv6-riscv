@@ -47,6 +47,7 @@ fn main() {
         ("killtest", "KILLTEST_BIN_PATH", Lang::C, true),
         ("malloctest", "MALLOCTEST_BIN_PATH", Lang::C, true),
         ("smptest", "SMPTEST_BIN_PATH", Lang::C, true),
+        ("ln", "LN_BIN_PATH", Lang::C, true),
     ];
 
     for (name, env_var, lang, with_ulib) in programs {

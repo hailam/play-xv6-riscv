@@ -10,7 +10,7 @@ directory contains a `README.md` with the plan/summary, plus optional
 
 | Bucket | Count | What's in it |
 |---|---|---|
-| `done/` | 28 | Through aarch64-HAL skeleton — trait surface proven on a second arch |
+| `done/` | 29 | Through fs polish — cwd, chdir, hard links, sh `>` redirect |
 | `pending/` | 2 | Real aarch64 boot + phase-2 GUI |
 | `revisit/` | 3 | Decisions to potentially revisit later |
 
@@ -51,10 +51,11 @@ directory contains a `README.md` with the plan/summary, plus optional
 | 25 | [vm-reaping](done/25-vm-reaping/) | +130 |
 | 26 | [smp-user-procs](done/26-smp-user-procs/) | +150 (+25 user) |
 | 27 | [aarch64-hal-skeleton](done/27-aarch64-hal-skeleton/) | +210 (hal-aarch64) |
+| 28 | [fs-polish](done/28-fs-polish/) | +180 (+80 user) |
 
-Current kernel totals: **~6,375 LoC, ~158 unsafe-ish lines** (~2.5%,
+Current kernel totals: **~6,555 LoC, ~158 unsafe-ish lines** (~2.4%,
 well inside the 700-line budget). Plus ~270 LoC host code in `mkfs/`,
-~40 LoC in the shared `xv6-fs-layout` crate, ~495 LoC user code, and
+~40 LoC in the shared `xv6-fs-layout` crate, ~575 LoC user code, and
 ~210 LoC in `hal-aarch64` (skeleton).
 
 ## Revisit

@@ -106,6 +106,7 @@ async fn bringup_then_init() {
 
     println!("spawning init proc ({} bytes)", embed::INITCODE.len());
     let init = Arc::new(Proc::new_initcode(embed::INITCODE));
+    *init.cwd.lock() = Some(fs::inode::iget(0, 1));
     proc::spawn_proc_main(init);
 }
 

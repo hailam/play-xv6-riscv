@@ -82,14 +82,23 @@ fn current_exec() -> &'static PerCpuExec {
     &EXECUTORS[Arch::hartid()]
 }
 
-/// Pick the home CPU for a new task: the one with the shortest
-/// ready queue right now. Cheap because forks are rare and
-/// `MAX_CPUS` is tiny.
+/// Pick the home CPU for a new task: the active hart with the
+/// shortest ready queue. "Active" means it has called
+/// `cpu::init_this_hart` — so we never spawn onto a hart QEMU
+/// didn't actually start.
 fn pick_home_cpu() -> usize {
-    let n = Arch::ncpus();
-    let mut best = 0usize;
-    let mut best_len = usize::MAX;
-    for c in 0..n {
+    let active = cpu::active_cpu_mask();
+    if active == 0 {
+        // Boot path — nobody's marked active yet (we're called from
+        // hart 0 before its init). Default to hart 0.
+        return 0;
+    }
+    let mut best = active.trailing_zeros() as usize; // first set bit
+    let mut best_len = EXECUTORS[best].ready.lock().len();
+    for c in (best + 1)..MAX_CPUS {
+        if active & (1u64 << c) == 0 {
+            continue;
+        }
         let l = EXECUTORS[c].ready.lock().len();
         if l < best_len {
             best_len = l;

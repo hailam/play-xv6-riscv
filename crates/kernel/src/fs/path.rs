@@ -1,4 +1,5 @@
-//! Path → inode resolution.
+//! Path → inode resolution. Relative paths resolve from the caller's
+//! current working directory; absolute paths start at inode 1.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -6,26 +7,41 @@ use alloc::sync::Arc;
 use crate::fs::dir::dirlookup;
 use crate::fs::inode::{iget, ilock, Inode};
 
-/// Resolve a path to an `Arc<Inode>`. Absolute paths start at inode 1.
+/// Resolve `path` against `start`. If the path is absolute (starts
+/// with `/`), `start` is ignored and the walk begins at inode 1.
+pub async fn namei_from(start: Arc<Inode>, path: &str) -> Option<Arc<Inode>> {
+    namex(start, path, false).await.map(|(ip, _)| ip)
+}
+
+/// Resolve `path` against root.
 pub async fn namei(path: &str) -> Option<Arc<Inode>> {
-    namex(path, false).await.map(|(ip, _)| ip)
+    namei_from(iget(0, 1), path).await
 }
 
-/// Resolve a path's parent directory + the final component's name
-/// (without crossing into the final component). Used by syscalls that
-/// create (e.g. `mkdir`, `create`).
-#[allow(dead_code)]
+pub async fn nameiparent_from(
+    start: Arc<Inode>,
+    path: &str,
+) -> Option<(Arc<Inode>, String)> {
+    namex(start, path, true).await.and_then(|(ip, n)| n.map(|s| (ip, s)))
+}
+
 pub async fn nameiparent(path: &str) -> Option<(Arc<Inode>, String)> {
-    namex(path, true).await.and_then(|(ip, n)| n.map(|s| (ip, s)))
+    nameiparent_from(iget(0, 1), path).await
 }
 
-async fn namex(mut path: &str, want_parent: bool) -> Option<(Arc<Inode>, Option<String>)> {
-    // Always start from root for now. Per-proc cwd lands in the
-    // file-syscall phase.
-    let mut ip = iget(0, 1);
+async fn namex(
+    start: Arc<Inode>,
+    path: &str,
+    want_parent: bool,
+) -> Option<(Arc<Inode>, Option<String>)> {
+    let mut ip = if path.starts_with('/') {
+        iget(0, 1)
+    } else {
+        start
+    };
+    let mut path = path;
 
     loop {
-        // Skip leading slashes.
         path = path.trim_start_matches('/');
         if path.is_empty() {
             break;
@@ -41,7 +57,6 @@ async fn namex(mut path: &str, want_parent: bool) -> Option<(Arc<Inode>, Option<
             return None;
         }
         if want_parent && rest.trim_start_matches('/').is_empty() {
-            // Last component; caller wants the parent (current `ip`) + name.
             drop(li);
             return Some((ip, Some(String::from(name))));
         }
@@ -54,7 +69,7 @@ async fn namex(mut path: &str, want_parent: bool) -> Option<(Arc<Inode>, Option<
     }
 
     if want_parent {
-        return None; // path was empty or just `/`
+        return None;
     }
     Some((ip, None))
 }

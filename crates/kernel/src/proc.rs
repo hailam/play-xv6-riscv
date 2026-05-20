@@ -63,6 +63,10 @@ pub struct Proc {
     pub killed: AtomicBool,
     /// Per-proc file descriptor table.
     pub files: SpinLock<Vec<Option<Arc<File>>>>,
+    /// Current working directory. `None` until the fs is up; the
+    /// first `bringup_then_init` sets it to inode 1 (root) on the
+    /// init proc, and every `fork` clones the parent's cwd.
+    pub cwd: SpinLock<Option<Arc<crate::fs::inode::Inode>>>,
 }
 
 impl Proc {
@@ -138,7 +142,10 @@ impl Proc {
             .map(|f| f.as_ref().map(|a| Arc::new((**a).clone())))
             .collect();
 
-        Some(Self::with_layout(pt, tf_pa, code_end, child_files))
+        let child = Self::with_layout(pt, tf_pa, code_end, child_files);
+        // Child inherits the parent's cwd (Arc clone — same inode).
+        *child.cwd.lock() = parent.cwd.lock().clone();
+        Some(child)
     }
 
     fn with_layout(
@@ -161,6 +168,7 @@ impl Proc {
             wait_waker: WakerCell::new(),
             killed: AtomicBool::new(false),
             files: SpinLock::new(files),
+            cwd: SpinLock::new(None),
         }
     }
 
