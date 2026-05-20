@@ -1,6 +1,8 @@
 //! Per-process trap frame — laid out to match `trampoline.S`. Modifying
 //! this struct without updating the asm offsets WILL cause silent corruption.
 
+use hal::TrapFrameAccess;
+
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TrapFrame {
@@ -45,6 +47,71 @@ pub struct TrapFrame {
     pub t4: u64,
     pub t5: u64,
     pub t6: u64,
+}
+
+impl TrapFrameAccess for TrapFrame {
+    #[inline]
+    fn epc(&self) -> u64 {
+        self.epc
+    }
+    #[inline]
+    fn set_epc(&mut self, v: u64) {
+        self.epc = v;
+    }
+
+    #[inline]
+    fn sp(&self) -> u64 {
+        self.sp
+    }
+    #[inline]
+    fn set_sp(&mut self, v: u64) {
+        self.sp = v;
+    }
+
+    #[inline]
+    fn arg(&self, n: usize) -> u64 {
+        match n {
+            0 => self.a0,
+            1 => self.a1,
+            2 => self.a2,
+            3 => self.a3,
+            4 => self.a4,
+            5 => self.a5,
+            _ => 0,
+        }
+    }
+    #[inline]
+    fn set_arg(&mut self, n: usize, v: u64) {
+        match n {
+            0 => self.a0 = v,
+            1 => self.a1 = v,
+            2 => self.a2 = v,
+            3 => self.a3 = v,
+            _ => {}
+        }
+    }
+
+    #[inline]
+    fn syscall_nr(&self) -> u64 {
+        self.a7
+    }
+
+    #[inline]
+    fn set_kernel_satp(&mut self, v: u64) {
+        self.kernel_satp = v;
+    }
+    #[inline]
+    fn set_kernel_sp(&mut self, v: u64) {
+        self.kernel_sp = v;
+    }
+    #[inline]
+    fn set_kernel_trap(&mut self, v: u64) {
+        self.kernel_trap = v;
+    }
+    #[inline]
+    fn set_kernel_hartid(&mut self, v: u64) {
+        self.kernel_hartid = v;
+    }
 }
 
 // Compile-time check that the layout matches what trampoline.S assumes.

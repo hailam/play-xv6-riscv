@@ -49,6 +49,7 @@ pub fn userret_offset() -> usize {
 
 impl Hal for Riscv64 {
     type PageTable = PageTable;
+    type TrapFrame = TrapFrame;
 
     const PGSIZE: usize = memlayout::PGSIZE;
     const PHYSTOP: usize = memlayout::PHYSTOP;

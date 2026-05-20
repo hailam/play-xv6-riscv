@@ -4,8 +4,38 @@
 //! kernel sees. Each supported architecture provides a single zero-sized
 //! type that implements `Hal`.
 
+/// Portable view of a saved trap frame. Lets the arch-independent
+/// kernel read syscall args + tweak the return-to-user fields
+/// without knowing the arch's actual struct layout.
+///
+/// Each Hal impl provides a concrete `TrapFrame` type (matched to
+/// its trampoline asm) that implements this trait.
+pub trait TrapFrameAccess: Default + Copy + 'static {
+    fn epc(&self) -> u64;
+    fn set_epc(&mut self, v: u64);
+
+    fn sp(&self) -> u64;
+    fn set_sp(&mut self, v: u64);
+
+    // Syscall args / return value live in argument registers. RISC-V
+    // uses a0..a7; aarch64 uses x0..x7 — same idea, same indexes.
+    fn arg(&self, n: usize) -> u64;
+    fn set_arg(&mut self, n: usize, v: u64);
+    /// Number of the requested syscall (RISC-V: `a7`, aarch64: `x8`).
+    fn syscall_nr(&self) -> u64;
+
+    // Kernel-handover slots written by `return_to_user` before the
+    // S/EL1 → U/EL0 jump so the trampoline knows where to land on
+    // the next trap.
+    fn set_kernel_satp(&mut self, v: u64);
+    fn set_kernel_sp(&mut self, v: u64);
+    fn set_kernel_trap(&mut self, v: u64);
+    fn set_kernel_hartid(&mut self, v: u64);
+}
+
 pub trait Hal: 'static {
     type PageTable: PageTableOps;
+    type TrapFrame: TrapFrameAccess;
 
     // ----- arch-specific constants -----
     //

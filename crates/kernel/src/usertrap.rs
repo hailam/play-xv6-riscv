@@ -1,6 +1,6 @@
 //! Trap-from-user dispatch + the noreturn user-mode entry path.
 
-use hal::Hal;
+use hal::{Hal, TrapFrameAccess};
 
 use crate::arch::Arch;
 use crate::cpu;
@@ -39,13 +39,13 @@ pub extern "C" fn rust_usertrap() -> ! {
 
     let proc = cpu::current_proc().expect("rust_usertrap: no current proc");
     let tf = proc.trapframe();
-    tf.epc = read_sepc() as u64;
+    tf.set_epc(read_sepc() as u64);
 
     let scause = read_scause();
     let event = if scause == SCAUSE_ECALL_FROM_U {
-        tf.epc += 4;
+        tf.set_epc(tf.epc() + 4);
         TrapEvent::Syscall {
-            nr: tf.a7 as usize,
+            nr: tf.syscall_nr() as usize,
         }
     } else if scause & SCAUSE_INTERRUPT != 0 {
         let code = scause & !SCAUSE_INTERRUPT;
@@ -67,7 +67,9 @@ pub extern "C" fn rust_usertrap() -> ! {
         let stval = read_stval();
         panic!(
             "usertrap: scause={:#x} sepc={:#x} stval={:#x}",
-            scause, tf.epc, stval
+            scause,
+            tf.epc(),
+            stval
         );
     };
 
@@ -82,16 +84,16 @@ pub fn return_to_user(proc: &Proc) -> ! {
     let hartid = Arch::hartid();
 
     let tf = proc.trapframe();
-    tf.kernel_satp = crate::vm::kernel_satp() as u64;
-    tf.kernel_sp = kernel_stack_top(hartid) as u64;
-    tf.kernel_trap = rust_usertrap as *const () as u64;
-    tf.kernel_hartid = hartid as u64;
+    tf.set_kernel_satp(crate::vm::kernel_satp() as u64);
+    tf.set_kernel_sp(kernel_stack_top(hartid) as u64);
+    tf.set_kernel_trap(rust_usertrap as *const () as u64);
+    tf.set_kernel_hartid(hartid as u64);
 
     let mut sstatus = read_sstatus();
     sstatus &= !SSTATUS_SPP;
     sstatus |= SSTATUS_SPIE;
     unsafe { write_sstatus(sstatus) };
-    unsafe { write_sepc(tf.epc as usize) };
+    unsafe { write_sepc(tf.epc() as usize) };
 
     let uservec_va = TRAMPOLINE + uservec_offset();
     unsafe { write_stvec(uservec_va) };

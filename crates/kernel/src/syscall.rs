@@ -8,7 +8,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::{Context, Poll};
 
-use hal::{FrameAllocator, Hal, PageTableOps, PtePerm};
+use hal::{FrameAllocator, Hal, PageTableOps, PtePerm, TrapFrameAccess};
 
 use crate::arch::Arch;
 use crate::cpu;
@@ -18,6 +18,8 @@ use crate::fs;
 use crate::kalloc::KFRAMES;
 use crate::proc::{Proc, ProcState};
 use crate::user_vm::STACK_VA_BASE;
+
+type TrapFrame = <Arch as Hal>::TrapFrame;
 use crate::uapi::{
     Stat, O_CREATE, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SYS_CHDIR, SYS_CLOSE, SYS_DUP,
     SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FSTAT, SYS_GETPID, SYS_KILL, SYS_LINK, SYS_MKDIR,
@@ -27,100 +29,95 @@ use crate::uapi::{
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
 
-// TrapFrame struct access stays arch-specific until field-level
-// helpers land (tracked with the aarch64 boot follow-up).
-#[cfg(target_arch = "riscv64")]
-use hal_riscv64::TrapFrame;
-
 pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
     match nr {
         SYS_FORK => sys_fork(proc).await,
         SYS_EXIT => {
-            let code = proc.trapframe().a0 as i32;
+            let code = proc.trapframe().arg(0) as i32;
             sys_exit_inner(proc, code).await
         }
         SYS_WAIT => sys_wait(proc).await,
         SYS_WRITE => {
             let tf = proc.trapframe();
-            let fd = tf.a0 as i32;
-            let buf_va = tf.a1 as usize;
-            let len = tf.a2 as usize;
+            let fd = tf.arg(0) as i32;
+            let buf_va = tf.arg(1) as usize;
+            let len = tf.arg(2) as usize;
             sys_write(proc, fd, buf_va, len).await
         }
         SYS_READ => {
             let tf = proc.trapframe();
-            let fd = tf.a0 as i32;
-            let buf_va = tf.a1 as usize;
-            let len = tf.a2 as usize;
+            let fd = tf.arg(0) as i32;
+            let buf_va = tf.arg(1) as usize;
+            let len = tf.arg(2) as usize;
             sys_read(proc, fd, buf_va, len).await
         }
         SYS_SLEEP => {
-            let ticks = proc.trapframe().a0;
+            let ticks = proc.trapframe().arg(0);
             sys_sleep(proc, ticks).await
         }
         SYS_EXEC => {
             let tf = proc.trapframe();
-            let path_va = tf.a0 as usize;
-            let argv_va = tf.a1 as usize;
+            let path_va = tf.arg(0) as usize;
+            let argv_va = tf.arg(1) as usize;
             sys_exec(proc, path_va, argv_va).await
         }
         SYS_PIPE => {
-            let pipefd_va = proc.trapframe().a0 as usize;
+            let pipefd_va = proc.trapframe().arg(0) as usize;
             sys_pipe(proc, pipefd_va).await
         }
         SYS_CLOSE => {
-            let fd = proc.trapframe().a0 as i32;
+            let fd = proc.trapframe().arg(0) as i32;
             sys_close(proc, fd).await
         }
         SYS_DUP => {
-            let fd = proc.trapframe().a0 as i32;
+            let fd = proc.trapframe().arg(0) as i32;
             sys_dup(proc, fd).await
         }
         SYS_OPEN => {
             let tf = proc.trapframe();
-            let path_va = tf.a0 as usize;
-            let flags = tf.a1 as u32;
+            let path_va = tf.arg(0) as usize;
+            let flags = tf.arg(1) as u32;
             sys_open(proc, path_va, flags).await
         }
         SYS_FSTAT => {
             let tf = proc.trapframe();
-            let fd = tf.a0 as i32;
-            let stat_va = tf.a1 as usize;
+            let fd = tf.arg(0) as i32;
+            let stat_va = tf.arg(1) as usize;
             sys_fstat(proc, fd, stat_va).await
         }
         SYS_GETPID => proc.pid as i64,
         SYS_UPTIME => (Arch::now_ticks() / TIMER_INTERVAL) as i64,
         SYS_KILL => {
-            let pid = proc.trapframe().a0 as i32;
+            let pid = proc.trapframe().arg(0) as i32;
             sys_kill(proc, pid).await
         }
         SYS_SBRK => {
-            let n = proc.trapframe().a0 as i64;
+            let n = proc.trapframe().arg(0) as i64;
             sys_sbrk(proc, n).await
         }
         SYS_MKDIR => {
-            let path_va = proc.trapframe().a0 as usize;
+            let path_va = proc.trapframe().arg(0) as usize;
             sys_mkdir(proc, path_va).await
         }
         SYS_MKNOD => {
             let tf = proc.trapframe();
-            let path_va = tf.a0 as usize;
-            let major = tf.a1 as u16;
-            let minor = tf.a2 as u16;
+            let path_va = tf.arg(0) as usize;
+            let major = tf.arg(1) as u16;
+            let minor = tf.arg(2) as u16;
             sys_mknod(proc, path_va, major, minor).await
         }
         SYS_UNLINK => {
-            let path_va = proc.trapframe().a0 as usize;
+            let path_va = proc.trapframe().arg(0) as usize;
             sys_unlink(proc, path_va).await
         }
         SYS_CHDIR => {
-            let path_va = proc.trapframe().a0 as usize;
+            let path_va = proc.trapframe().arg(0) as usize;
             sys_chdir(proc, path_va).await
         }
         SYS_LINK => {
             let tf = proc.trapframe();
-            let old_va = tf.a0 as usize;
-            let new_va = tf.a1 as usize;
+            let old_va = tf.arg(0) as usize;
+            let new_va = tf.arg(1) as usize;
             sys_link(proc, old_va, new_va).await
         }
         _ => {
@@ -895,9 +892,9 @@ async fn sys_exec(proc: &Arc<Proc>, path_va: usize, argv_va: usize) -> i64 {
     proc.replace_image(image.pagetable, code_end);
     let tf = proc.trapframe();
     *tf = TrapFrame::default();
-    tf.epc = entry as u64;
-    tf.sp = sp_va as u64;
-    tf.a1 = argv_array_va as u64;
+    tf.set_epc(entry as u64);
+    tf.set_sp(sp_va as u64);
+    tf.set_arg(1, argv_array_va as u64);
     // `proc_main` writes our return value into `tf.a0` → becomes the
     // new image's `a0` (i.e., `argc`) when sret to user mode.
     argc

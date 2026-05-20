@@ -14,9 +14,11 @@ use hal::Hal;
 mod csr;
 pub mod memlayout;
 mod pagetable;
+pub mod trapframe;
 pub mod uart;
 
 pub use pagetable::PageTable;
+pub use trapframe::TrapFrame;
 
 pub struct AArch64;
 
@@ -24,6 +26,7 @@ pub const MAX_CPUS: usize = 8;
 
 impl Hal for AArch64 {
     type PageTable = PageTable;
+    type TrapFrame = TrapFrame;
 
     const PGSIZE: usize = memlayout::PGSIZE;
     const PHYSTOP: usize = memlayout::PHYSTOP;

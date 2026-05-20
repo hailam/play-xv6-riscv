@@ -8,9 +8,11 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
-use hal::{FrameAllocator, PageTableOps, PtePerm};
+use hal::{FrameAllocator, PageTableOps, PtePerm, TrapFrameAccess};
 // (FrameAllocator brought in above so `Drop for Proc` can free
 // `trapframe_pa` via the same KFRAMES handle the rest of the code uses.)
+
+type TrapFrame = <Arch as Hal>::TrapFrame;
 
 use crate::arch::{Arch, Hal};
 use crate::cpu;
@@ -23,11 +25,6 @@ use crate::user_vm::{self, STACK_VA_BASE};
 use crate::wait::WakerCell;
 
 use crate::arch::{trampoline_pa, PGSIZE, TRAMPOLINE, TRAPFRAME};
-
-// `TrapFrame` is still arch-specific (struct fields differ per arch).
-// The full move-behind-trait is part of the aarch64 boot follow-up.
-#[cfg(target_arch = "riscv64")]
-use hal_riscv64::TrapFrame;
 
 pub const NOFILE: usize = 16;
 
@@ -85,10 +82,10 @@ impl Proc {
             user_vm::place_argv_on_stack(image.stack_pa, &[]);
 
         let tf = unsafe { &mut *(tf_pa as *mut TrapFrame) };
-        tf.epc = image.entry as u64;
-        tf.sp = sp_va as u64;
-        tf.a0 = 0;
-        tf.a1 = argv_array_va as u64;
+        tf.set_epc(image.entry as u64);
+        tf.set_sp(sp_va as u64);
+        tf.set_arg(0, 0);
+        tf.set_arg(1, argv_array_va as u64);
 
         Self::with_layout(image.pagetable, tf_pa, image.code_end, default_files())
     }
@@ -139,7 +136,7 @@ impl Proc {
         let parent_tf = parent.trapframe();
         let child_tf = unsafe { &mut *(tf_pa as *mut TrapFrame) };
         *child_tf = *parent_tf;
-        child_tf.a0 = 0;
+        child_tf.set_arg(0, 0);
 
         let child_files: Vec<Option<Arc<File>>> = parent
             .files
@@ -281,7 +278,7 @@ async fn proc_main(proc: Arc<Proc>) {
         match event {
             TrapEvent::Syscall { nr } => {
                 let ret = syscall::dispatch(&proc, nr).await;
-                proc.trapframe().a0 = ret as u64;
+                proc.trapframe().set_arg(0, ret as u64);
             }
             TrapEvent::Timer | TrapEvent::Devintr => {}
         }
