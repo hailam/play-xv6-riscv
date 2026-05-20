@@ -3214,14 +3214,15 @@ runtests(struct test *tests, char *justone, int continuous) {
 int
 countfree()
 {
-  // STUBBED: running a tight sbrk-grow-shrink loop currently
-  // triggers a trampoline-region instruction fault after several
-  // thousand iterations — investigating under [[15-xv6-compat]]
-  // G-extra. The "lost some free pages" check usertests does
-  // around runtests is disabled in the meantime; the kernel's own
-  // per-exit `kalloc.free=` print is what we rely on for leak
-  // detection.
-  return 1;
+  int n = 0;
+  uint64 sz0 = (uint64)sbrk(0);
+  while(1){
+    char *a = sbrk(PGSIZE);
+    if(a == SBRK_ERROR) break;
+    n += 1;
+  }
+  sbrk(-((uint64)sbrk(0) - sz0));
+  return n;
 }
 
 int

@@ -19,7 +19,7 @@ xv6's full `usertests.c` against our kernel; mounting xv6's own
 | G7 `ulib.c` + `printf.c` port | **DONE** — ~210 LoC from xv6 verbatim, shared `user/user.h`, `build.rs` links into every C binary. `/xv6test` exercises `printf` / `strcpy` / `strlen` / `atoi` / `strcmp` / `memset` / `memmove` / `%p`. |
 | G1 BSIZE 512→1024 | Deferred — only matters for cross-mounting xv6's actual `fs.img`; our internally-consistent BSIZE=512 stack works fine. usertests' `bigfile` (one specific test) will hit our 70 KB single-file ceiling and fail. |
 | G3 + G9 LOGSIZE 30→31 + sb.nlog | Deferred — same reason as G1; affects only cross-mounting. |
-| Extra: **countfree-style sbrk loop hangs the proc** | **OPEN BUG** — usertests' `countfree()` does a tight `while(1) sbrk(PGSIZE)` loop. Around iteration ~9000 (with the loop in place) the proc dies with `scause=0xc` (instruction page fault) at a sepc *inside the trampoline page* (`TRAMPOLINE + 0x9c..0xac`). Reproduces with or without a printf in the loop, with the unmap-on-shrink fix, etc. Workaround in our copy of usertests.c: stub `countfree()` to return 1, so the "lost free pages" check passes vacuously. The kernel's own `kalloc.free=` print on every `sys_exit` is the actual leak watchdog. Root cause investigation tracked here; suspect the trampoline asm or some sepc-handling path corrupts user PC under repeated trap pressure. |
+| **TR (trampoline race in `return_to_user`)** | **FIXED** — the countfree loop crash turned out to be a missing `intr_off()` at the top of `usertrap.rs::return_to_user`. The kernel was setting `stvec = uservec` then doing some more work (set sepc, jump to `userret`) with S-mode interrupts ENABLED. If a timer interrupt fired in that window, `uservec` ran from S-mode and saved kernel register state into the user trapframe (a0 := TRAPFRAME, sp := kernel-stack, sepc := uservec-internal PC, etc.). The next `sret` would then jump the user PC into the trampoline page, faulting. Classic xv6-style bug; xv6 has `intr_off()` at the very top of `usertrapret` for exactly this reason. After the fix: unbounded `countfree` runs cleanly; broader usertests pass-rate jumped. |
 
 ## Bonus fixes shipped this round
 
@@ -35,20 +35,18 @@ xv6's full `usertests.c` against our kernel; mounting xv6's own
 
 ## Verified
 
-```
-$ /usertests exitwait
-... pid 4..103 each exit(N) cleanly on hart 0, free=32327 stable ...
-OK
-ALL TESTS PASSED
-$
-```
+usertests pass / fail (`/usertests <name>`):
 
-`exitwait` exercises 100 sequential `fork`/`exit`/`wait` cycles.
-On our async kernel + fixed `wait(int*)` + fault-handler + lazy
-sbrk + page-unmap, it passes cleanly.
-
-Other tests of varying coverage are queued behind the countfree
-bug fix.
+| Test | Status |
+|---|---|
+| `exitwait` (100 fork/wait cycles) | ✅ OK |
+| `bsstest` (BSS zero-init) | ✅ OK |
+| `stacktest` (deliberate fault on invalid SP — kernel survives) | ✅ OK |
+| `pgbug` (page-table bug probe) | ✅ OK |
+| `createtest` (many file creates/unlinks) | ✅ OK |
+| `copyin` | ❌ — `open(copyin1) failed` on the first call; specific to copyin/copyout's setup pattern; under investigation |
+| `copyout` | ❌ — `open(README) failed`; same family |
+| `writebig` | ❌ — fails at `i=140` because our `MAXFILE = NDIRECT + NINDIRECT = 12 + BSIZE/4 = 12 + 128 = 140` blocks, and `bigfile` writes 140 blocks of 1024 bytes each (140 KB). xv6's BSIZE=1024 → 140 KB fits; ours BSIZE=512 → 140*512 = 70 KB → block 140 is past `MAXFILE`. **This is G1.** |
 
 ## What was already compatible
 

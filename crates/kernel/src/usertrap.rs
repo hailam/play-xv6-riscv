@@ -108,6 +108,16 @@ pub extern "C" fn rust_usertrap() -> ! {
 }
 
 pub fn return_to_user(proc: &Proc) -> ! {
+    // CRITICAL: turn off S-mode interrupts before we switch `stvec`
+    // to `uservec`. If a trap (e.g. timer) fires in the window
+    // between the `stvec` write and `sret`, it would dispatch to
+    // `uservec` from S-mode — which then writes kernel register
+    // state into the user trapframe, corrupting epc/sp/a0/etc.
+    // (Spent a session chasing this; it manifests as a fault to
+    // a high-VA garbage PC after ~thousands of trap cycles.) sret
+    // re-enables interrupts via `sstatus.SPIE -> SIE`.
+    unsafe { Arch::intr_off() };
+
     let hartid = Arch::hartid();
 
     let tf = proc.trapframe();
