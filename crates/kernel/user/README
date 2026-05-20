@@ -1,0 +1,6 @@
+A Rust rewrite of xv6-riscv with an async-first kernel and a HAL
+trait surface. The shell, the on-disk fs format, and the user-space
+syscall ABI are xv6-compatible.
+
+See the project README at the root of the repo for the architecture
+overview and current status.

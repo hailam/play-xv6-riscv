@@ -37,6 +37,7 @@ $(MKFS):
 # binaries kernel build.rs copies to `target/user/<name>.elf`.
 fs.img: build $(MKFS)
 	$(MKFS) $@ \
+		README:crates/kernel/user/README \
 		init:$(USER_DIR)/initcode.elf \
 		echo:$(USER_DIR)/echo.elf \
 		sh:$(USER_DIR)/sh.elf \

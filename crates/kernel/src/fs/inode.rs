@@ -125,15 +125,34 @@ pub fn init_cache() {
 
 /// Get a cached `Arc<Inode>` for `(dev, inum)`. Doesn't lock or load;
 /// follow up with `ilock(&ip).await` before reading state.
+///
+/// Key invariant — matches xv6's `iget`: a "match by (dev, inum)" only
+/// counts if **someone other than the cache is still holding it**
+/// (`strong_count > 1`). If only the cache holds it, the slot is
+/// considered free for reuse, even though `dev`/`inum` haven't been
+/// cleared — and reuse re-stamps `valid = false`, forcing the next
+/// `ilock` to reload from disk.
+///
+/// Without this, an inode that was unlinked + freed by `sys_unlink`,
+/// then re-claimed by `ialloc` for a different file, would be
+/// returned with stale in-memory state (`typ`, `addrs`, `size` from
+/// the previous file). A subsequent `iupdate` would then write the
+/// stale state back to disk, clobbering the new file's metadata —
+/// which manifested as `usertests::copyin`'s `open(copyin1)` failing
+/// on the second iteration of its open/unlink loop.
 pub fn iget(dev: u32, inum: u32) -> Arc<Inode> {
     let cache = CACHE.lock();
-    // Existing entry?
+    // Live entry — someone other than the cache holds it.
     for ip in cache.bufs.iter() {
-        if ip.inum.load(Ordering::Acquire) == inum && ip.dev.load(Ordering::Acquire) == dev {
+        if Arc::strong_count(ip) > 1
+            && ip.inum.load(Ordering::Acquire) == inum
+            && ip.dev.load(Ordering::Acquire) == dev
+        {
             return ip.clone();
         }
     }
-    // Reuse first idle slot.
+    // No live holder. Reuse the first idle slot — re-stamping
+    // valid=false so the next `ilock` re-reads disk state.
     for ip in cache.bufs.iter() {
         if Arc::strong_count(ip) == 1 {
             ip.dev.store(dev, Ordering::Release);

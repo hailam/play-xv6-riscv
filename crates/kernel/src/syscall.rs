@@ -319,7 +319,7 @@ async fn sys_wait(proc: &Arc<Proc>, status_va: usize) -> i64 {
         None => return -1,
     };
     if status_va != 0 {
-        let Some(kva) = proc.translate_user(status_va) else {
+        let Some(kva) = proc.translate_user_write(status_va) else {
             return -1;
         };
         unsafe { *(kva as *mut i32) = code };
@@ -494,10 +494,12 @@ async fn inode_read(
     if n == 0 {
         return 0;
     }
-    // Copy the bytes out into the user buffer, page-aware.
+    // Copy the bytes out into the user buffer, page-aware. Use the
+    // write-checking translate so we refuse to scribble on user
+    // code / RO pages.
     let mut copied = 0usize;
     while copied < n {
-        let Some(kva) = proc.translate_user(buf_va + copied) else {
+        let Some(kva) = proc.translate_user_write(buf_va + copied) else {
             return -1;
         };
         unsafe { *(kva as *mut u8) = tmp[copied] };
@@ -513,7 +515,7 @@ async fn console_read(proc: &Proc, buf_va: usize, len: usize) -> i64 {
         let Some(b) = ConsoleByte.await else {
             return -1; // killed
         };
-        let Some(kva) = proc.translate_user(buf_va + n) else {
+        let Some(kva) = proc.translate_user_write(buf_va + n) else {
             return -1;
         };
         unsafe { *(kva as *mut u8) = b };
@@ -559,7 +561,7 @@ async fn sys_pipe(proc: &Arc<Proc>, pipefd_va: usize) -> i64 {
 
     for (i, fd) in [rfd, wfd].iter().enumerate() {
         let va = pipefd_va + i * 4;
-        let Some(kva) = proc.translate_user(va) else {
+        let Some(kva) = proc.translate_user_write(va) else {
             return -1;
         };
         unsafe { *(kva as *mut i32) = *fd };
@@ -647,7 +649,7 @@ async fn pipe_read(
     while n < len {
         match (PipeReadByte { pipe: pipe.clone() }).await {
             Some(b) => {
-                let Some(kva) = proc.translate_user(buf_va + n) else {
+                let Some(kva) = proc.translate_user_write(buf_va + n) else {
                     return -1;
                 };
                 unsafe { *(kva as *mut u8) = b };
@@ -923,7 +925,7 @@ async fn sys_fstat(proc: &Arc<Proc>, fd: i32, stat_va: usize) -> i64 {
         )
     };
     for (i, b) in bytes.iter().enumerate() {
-        let Some(kva) = proc.translate_user(stat_va + i) else {
+        let Some(kva) = proc.translate_user_write(stat_va + i) else {
             return -1;
         };
         unsafe { *(kva as *mut u8) = *b };

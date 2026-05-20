@@ -184,11 +184,29 @@ impl Proc {
     }
 
     pub fn translate_user(&self, va: usize) -> Option<usize> {
+        self.translate_user_perm(va, false)
+    }
+
+    /// Like `translate_user` but also requires the page to be
+    /// **writable** by user code (PTE_W set). Use this for syscalls
+    /// that copy *out* into a user buffer — e.g. `sys_read`,
+    /// `sys_fstat`, `sys_wait`'s status pointer. Without this check,
+    /// a malicious / buggy user could pass the address of its code
+    /// page (PTE_U + PTE_R + PTE_X, no W) and have the kernel
+    /// silently overwrite its own code.
+    pub fn translate_user_write(&self, va: usize) -> Option<usize> {
+        self.translate_user_perm(va, true)
+    }
+
+    fn translate_user_perm(&self, va: usize, write: bool) -> Option<usize> {
         let page = va & !(PGSIZE - 1);
         let off = va & (PGSIZE - 1);
         let pt = self.pagetable.lock();
         let (pa, perm) = pt.translate(page)?;
         if perm.0 & PtePerm::USER == 0 {
+            return None;
+        }
+        if write && perm.0 & PtePerm::WRITE == 0 {
             return None;
         }
         Some(pa + off)

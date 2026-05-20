@@ -1,8 +1,8 @@
 # 15: xv6 binary + source compatibility
 
-**Status:** In progress — 5 of 9 gaps closed; usertests' `exitwait` passes.
-**Estimated remaining:** 1–2 sessions for the rest + open-ended
-usertests-driven bug hunting.
+**Status:** In progress — all named gaps fixed except deferred-disk-format (G1/G3/G9); 8 distinct usertests pass.
+**Estimated remaining:** open-ended usertests sweep; each new failing
+test is its own bug to chase.
 **Depends on:** —
 **Unblocks:** running unmodified xv6 user programs and (eventually)
 xv6's full `usertests.c` against our kernel; mounting xv6's own
@@ -37,16 +37,26 @@ xv6's full `usertests.c` against our kernel; mounting xv6's own
 
 usertests pass / fail (`/usertests <name>`):
 
-| Test | Status |
-|---|---|
-| `exitwait` (100 fork/wait cycles) | ✅ OK |
-| `bsstest` (BSS zero-init) | ✅ OK |
-| `stacktest` (deliberate fault on invalid SP — kernel survives) | ✅ OK |
-| `pgbug` (page-table bug probe) | ✅ OK |
-| `createtest` (many file creates/unlinks) | ✅ OK |
-| `copyin` | ❌ — `open(copyin1) failed` on the first call; specific to copyin/copyout's setup pattern; under investigation |
-| `copyout` | ❌ — `open(README) failed`; same family |
-| `writebig` | ❌ — fails at `i=140` because our `MAXFILE = NDIRECT + NINDIRECT = 12 + BSIZE/4 = 12 + 128 = 140` blocks, and `bigfile` writes 140 blocks of 1024 bytes each (140 KB). xv6's BSIZE=1024 → 140 KB fits; ours BSIZE=512 → 140*512 = 70 KB → block 140 is past `MAXFILE`. **This is G1.** |
+| Test | Status | Notes |
+|---|---|---|
+| `copyin` | ✅ OK | passed after inode-cache fix |
+| `copyout` | ✅ OK | passed after W-perm check + ELF text/data split |
+| `copyinstr1` | ✅ OK | |
+| `exitwait` (100 fork/wait cycles) | ✅ OK | passed after trampoline-race fix |
+| `bsstest` | ✅ OK | BSS zero-init |
+| `stacktest` | ✅ OK | deliberate fault; kernel survives |
+| `pgbug` | ✅ OK | |
+| `createtest` | ✅ OK | many file creates/unlinks |
+| `twochildren` | running (1000 forks; long) | |
+| `writebig` | ❌ | Known: G1 (BSIZE 512 vs xv6's 1024 → max file 70KB vs 140KB) |
+| (remaining 40+ tests) | — | not yet run |
+
+### Bugs surfaced + fixed during this round
+
+- **TR — trampoline race (CRITICAL)**: missing `intr_off()` at the top of `return_to_user`. Timer firing in the window between `write_stvec(uservec)` and `sret` made the trap dispatch to `uservec` from S-mode, which then saved kernel register state into the trapframe and corrupted future syscalls. Manifested as faults at sepc=0x3ffffff0?? (inside trampoline page). Fix: `Arch::intr_off()` at the top of `return_to_user`.
+- **IC — inode-cache returning stale entries (CRITICAL)**: `iget`'s "find existing match" loop didn't require `Arc::strong_count > 1`, so it returned cached inodes whose only holder was the cache itself — which after `unlink` + `ialloc(reused inum)` had stale in-memory state. Fix: match `existing` only when count > 1; otherwise fall through to the "reuse idle slot" loop which sets `valid=false` and forces a disk reload on next `ilock`.
+- **WP — `translate_user_write` (CRITICAL)**: our `translate_user` only checked PTE_U, not PTE_W. With a single RWX user segment, `read(fd, NULL, ...)` was silently overwriting user code at VA 0. Fix: separate `translate_user_write` that also requires PTE_W; routed `sys_wait`/`sys_pipe`/`sys_read`/`sys_fstat`/`pipe_read` write-into-user paths through it.
+- **ES — user ELF text/data split**: our linker script collapsed `.text` + `.rodata` + `.data` + `.bss` into a single PT_LOAD with `RWE` flags, so even with WP above in place, the entire address range was writable (and executable) per the PT_LOAD perms our loader honors. Fix: PHDRS in `user/user.ld` declaring two segments — `text` (R+X), `data` (R+W) — with an explicit `. = ALIGN(0x1000)` between them so the data segment never shares a frame with code.
 
 ## What was already compatible
 
