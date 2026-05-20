@@ -239,10 +239,45 @@ matching `try_getc` reading PL011_DR after checking PL011_FR.RXFE.
 
 ---
 
-## Phase C — pagetable populate + MMU enable  (~250 LoC, ~1 session)
+## Phase C — pagetable populate + MMU enable — **DONE**
 
-Gate: `kvm: installed (ttbr0=...)` prints, kernel continues
-through subsequent prints. Validate `(SCTLR_EL1 & 1) == 1`.
+Verified:
+
+```
+rust kmain (hart 0, supervisor)
+kalloc: 32341 free frames (126 MiB)
+kvm: installed (satp=0x47fff000)           ← MMU on
+virtio_blk: ready (desc@0x401a7000 ...)    ← MMIO access works post-MMU
+PANIC: ... not implemented: aarch64 init_kernel_trap_vec   ← Phase D
+```
+
+The kernel survives `vm::init_and_install` (which now uses real
+4-level pagetable populate), continues fetching instructions past
+the SCTLR_EL1 MMU enable, and successfully reads/writes virtio
+MMIO through the identity-mapped descriptor. MMU is live.
+
+What landed:
+
+- `crates/hal-aarch64/src/csr.rs` — `mrs`/`msr` macros + helpers
+  for MAIR_EL1, TCR_EL1, TTBR0_EL1, SCTLR_EL1, ESR_EL1, FAR_EL1,
+  ELR_EL1, SPSR_EL1, VBAR_EL1, plus `dsb_ish` / `isb` /
+  `tlbi_vmalle1is`.
+- `crates/hal-aarch64/src/pagetable.rs` — real 4-level
+  long-descriptor populate (map/translate/unmap_page), descriptor
+  bit encoding for AP/AttrIndx/SH/AF/nG/PXN/UXN, `make_branch`/
+  `make_leaf` helpers, `Drop for PageTable` freeing user leaves
+  (identified by `nG = 1`) + every intermediate table.
+- Constants `MAIR_EL1_VAL = 0xFF00` and `TCR_EL1_VAL` (T0SZ=16,
+  EPD1=1, IPS=40-bit, 4 K granule, Inner Shareable).
+- `Hal::write_satp` now does the full MMU-on dance: write
+  MAIR/TCR/TTBR0 → `dsb ish` + `tlbi vmalle1is` + `dsb ish` +
+  `isb` → set SCTLR_EL1.{M, C, I} → `isb`. Idempotent across
+  subsequent calls (per-hart bring-up will re-issue the same
+  writes; SCTLR bits are already set).
+- `Hal::install_free_frame` now actually installs the callback.
+- `trampoline_pa` returns the `_trampoline` symbol from the
+  linker script (the page is mapped RX but currently empty —
+  Phase E will fill `.trampsec` with uservec/userret).
 
 ### C.1 4 K granule, 48-bit VA, single TTBR0
 
@@ -719,24 +754,32 @@ userret:
 
 ### E.7 Cross-toolchain
 
-**Recommended: Homebrew `aarch64-elf-gcc`**
+**Update from Phase D research: no Homebrew install needed on macOS.**
+Xcode's `clang` already targets `aarch64-none-elf`:
 
-```fish
-brew install aarch64-elf-gcc aarch64-elf-binutils aarch64-elf-newlib
+```
+$ clang --target=aarch64-none-elf -nostdlib -ffreestanding \
+        -c -o /tmp/t.o -xc <(echo 'int main(){return 0;}')
+$ file /tmp/t.o
+/tmp/t.o: ELF 64-bit LSB relocatable, ARM aarch64, version 1 (SYSV)
 ```
 
-Provides `aarch64-elf-{gcc,ld,objcopy}`. Bare-metal target — fine
-for `-nostdlib`.
+Asm files compile the same way. Link via `rust-lld` (Rust toolchain
+ships it). So `build.rs` only needs a per-arch toolchain dispatch
+— no `brew install` required.
 
 User-binary compile flags:
 ```
-aarch64-elf-gcc -march=armv8-a -mgeneral-regs-only \
-                -nostdlib -nostartfiles -static -fno-pie -fno-pic \
-                -ffreestanding -O2 -Wall \
-                -T user/user.ld user/<prog>.c -o target/user/aarch64/<prog>.elf
+clang --target=aarch64-none-elf -march=armv8-a -mgeneral-regs-only \
+      -nostdlib -nostartfiles -static -fno-pie -fno-pic \
+      -ffreestanding -O2 -Wall \
+      -c <prog>.c -o <prog>.o
+ld.lld -T user/user.ld <prog>.o ulib.o ... -o <prog>.elf
 ```
 
 `-mgeneral-regs-only` skips FP/SIMD lazy save (we're soft-float).
+Homebrew `aarch64-elf-gcc` remains an option if you want a more
+GCC-like build environment.
 
 ### E.8 build.rs dispatch
 

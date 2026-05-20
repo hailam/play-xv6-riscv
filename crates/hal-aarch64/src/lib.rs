@@ -12,14 +12,30 @@
 use hal::{Hal, UserTrapCause};
 
 mod csr;
+mod gic;
 pub mod memlayout;
 mod pagetable;
 mod start;
+mod trap;
 pub mod trapframe;
 pub mod uart;
 
-pub use pagetable::PageTable;
+core::arch::global_asm!(include_str!("../asm/kernelvec.S"));
+
+pub use pagetable::{install_free_frame, PageTable};
 pub use trapframe::TrapFrame;
+
+extern "C" {
+    fn _trampoline();
+}
+
+/// Physical address of the trampoline page (the kernel-resident page
+/// that hosts uservec/userret; mapped at fixed VA TRAMPOLINE in both
+/// kernel and user pagetables). Defined by `kernel-aarch64.ld`.
+#[inline]
+pub fn trampoline_pa() -> usize {
+    _trampoline as *const () as usize
+}
 
 pub struct AArch64;
 
@@ -40,22 +56,21 @@ impl Hal for AArch64 {
     const VIRTIO0: usize = memlayout::VIRTIO0;
     const VIRTIO0_SIZE: usize = memlayout::VIRTIO0_SIZE;
     const INTC_BASE: usize = memlayout::GICD;
-    const INTC_SIZE: usize = memlayout::GICD_SIZE;
+    const INTC_SIZE: usize = memlayout::INTC_RANGE_SIZE;
     const UART0_IRQ: usize = memlayout::UART0_IRQ;
     const VIRTIO0_IRQ: usize = memlayout::VIRTIO0_IRQ;
     /// Skeleton placeholder — real value comes from the ARM generic
     /// timer counter frequency once the boot path is wired.
     const TIMER_INTERVAL: u64 = 1_000_000;
 
-    /// Trampoline address resolution comes with the boot follow-up.
     fn trampoline_pa() -> usize {
-        0
+        trampoline_pa()
     }
     fn uservec_offset() -> usize {
-        0
+        0 // Phase E will fill in.
     }
     fn userret_offset() -> usize {
-        0
+        0 // Phase E will fill in.
     }
 
     #[inline(always)]
@@ -96,6 +111,9 @@ impl Hal for AArch64 {
     }
 
     unsafe fn install_pagetable(pt: &PageTable) {
+        // First-time MMU enable. Subsequent calls (e.g., per-hart
+        // bring-up, or pagetable swaps) just re-write TTBR0_EL1
+        // and flush. The MMU-on bit in SCTLR_EL1 is idempotent.
         unsafe { Self::write_satp(pagetable::ttbr0_value(pt)) };
     }
 
@@ -103,11 +121,29 @@ impl Hal for AArch64 {
         pagetable::ttbr0_value(pt)
     }
 
-    /// Named `write_satp` to match the trait — on aarch64 this writes
-    /// TTBR0_EL1. The riscv-flavoured name is a temporary quirk;
-    /// renaming the trait method is in the follow-up todo.
+    /// Trait method is named `write_satp` for parity with riscv. On
+    /// aarch64 this writes TTBR0_EL1 plus, on first call, brings the
+    /// MMU online by setting MAIR_EL1/TCR_EL1/SCTLR_EL1.
     unsafe fn write_satp(satp: usize) {
-        unsafe { csr::write_ttbr0_el1(satp) };
+        unsafe {
+            // Make sure MAIR and TCR are set before TTBR0 — writes
+            // to them are harmless if already set (idempotent).
+            csr::write_mair_el1(pagetable::MAIR_EL1_VAL);
+            csr::write_tcr_el1(pagetable::TCR_EL1_VAL);
+            csr::write_ttbr0_el1(satp as u64);
+            // Invalidate stale TLB entries from before the new
+            // mapping, then make the write globally visible.
+            csr::dsb_ish();
+            csr::tlbi_vmalle1is();
+            csr::dsb_ish();
+            csr::isb();
+            // Enable MMU + caches if not already on. SCTLR_EL1.M = bit 0,
+            // C = bit 2, I = bit 12. Writing already-set bits is fine.
+            let mut sctlr = csr::read_sctlr_el1();
+            sctlr |= (1 << 0) | (1 << 2) | (1 << 12);
+            csr::write_sctlr_el1(sctlr);
+            csr::isb();
+        }
     }
 
     // ----- trap surface — skeleton -----
@@ -123,23 +159,24 @@ impl Hal for AArch64 {
     }
 
     fn decode_user_trap(_tf: &mut Self::TrapFrame) -> UserTrapCause {
-        unimplemented!("aarch64 decode_user_trap — fill in with ESR_EL1 decode")
+        // Phase E will fill this in (read ESR_EL1, FAR_EL1, ELR_EL1).
+        unimplemented!("aarch64 decode_user_trap — Phase E")
     }
 
     fn arm_timer() {
-        unimplemented!("aarch64 arm_timer — program CNTV_TVAL_EL0 / CNTV_CTL_EL0")
+        trap::arm_timer();
     }
 
     fn handle_external_irq() {
-        unimplemented!("aarch64 handle_external_irq — claim from GICC, dispatch, EOI")
+        trap::handle_external_irq();
     }
 
     unsafe fn init_kernel_trap_vec() {
-        unimplemented!("aarch64 init_kernel_trap_vec — write VBAR_EL1 to kernel vector")
+        unsafe { trap::init_kernel_trap_vec() };
     }
 
     unsafe fn return_to_user(_tf: &mut Self::TrapFrame, _user_satp: usize) -> ! {
-        unimplemented!("aarch64 return_to_user — switch TTBR0_EL1, set ELR_EL1/SPSR_EL1, eret")
+        unimplemented!("aarch64 return_to_user — Phase E")
     }
 
     unsafe fn init_console() {
@@ -147,15 +184,14 @@ impl Hal for AArch64 {
     }
 
     unsafe fn init_intc_global() {
-        // GICv2 distributor setup lands with the boot follow-up.
+        unsafe { trap::init_intc_global() };
     }
 
     unsafe fn init_intc_per_hart() {
-        // GICv2 CPU-interface init.
+        unsafe { trap::init_intc_per_hart() };
     }
 
-    unsafe fn install_free_frame(_free: unsafe fn(usize)) {
-        // No-op for now — aarch64 pagetable populate isn't done yet,
-        // so the page reaper isn't reached.
+    unsafe fn install_free_frame(free: unsafe fn(usize)) {
+        pagetable::install_free_frame(free);
     }
 }

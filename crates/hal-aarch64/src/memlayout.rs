@@ -20,11 +20,16 @@ pub const UART0: usize = 0x0900_0000;
 pub const UART0_SIZE: usize = PGSIZE;
 pub const UART0_IRQ: usize = 33; // GIC SPI 1 (== PPI/SPI base 32 + 1)
 
-/// GIC v2 distributor + CPU interface.
+/// GIC v2 distributor + CPU interface. The kernel maps both via the
+/// single `INTC_BASE..INTC_BASE+INTC_SIZE` range, so `INTC_SIZE` is
+/// large enough to cover both regions back-to-back.
 pub const GICD: usize = 0x0800_0000;
 pub const GICD_SIZE: usize = 0x10000;
 pub const GICC: usize = 0x0801_0000;
 pub const GICC_SIZE: usize = 0x10000;
+/// `GICD + GICC` covered as one contiguous 128 KiB region — see
+/// `Hal::INTC_SIZE` consumer in `crate::kernel::vm`.
+pub const INTC_RANGE_SIZE: usize = 0x20000;
 
 /// virtio-mmio (first slot — QEMU virt has many; we use the same
 /// device the riscv64 path uses).

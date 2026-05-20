@@ -1,7 +1,4 @@
-//! Minimal ARMv8 system-register helpers. Just enough for `impl Hal`.
-//!
-//! Skeleton phase: stubs that return zero / no-op. Real implementations
-//! land with the follow-up boot todo.
+//! Minimal ARMv8 system-register helpers.
 
 #[inline]
 pub fn read_mpidr_el1() -> usize {
@@ -32,7 +29,7 @@ pub fn intr_get() -> bool {
     unsafe {
         core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack, preserves_flags));
     }
-    // I-bit is bit 7 (DAIF.I). When set, IRQs are masked.
+    // I-bit is bit 7. When set, IRQs are masked.
     (daif & (1 << 7)) == 0
 }
 
@@ -50,9 +47,77 @@ pub fn read_cntvct_el0() -> u64 {
     v
 }
 
-/// Install a translation-table root in TTBR0_EL1 + invalidate TLB.
-/// Skeleton — real impl will need ISB / TLBI VMALLE1IS.
-#[inline]
-pub unsafe fn write_ttbr0_el1(_root_pa: usize) {
-    // TODO: actual write + isb + tlbi
+// ---------- system-register accessors ----------
+
+macro_rules! sysreg_read {
+    ($fn_name:ident, $reg:ident) => {
+        #[inline]
+        pub fn $fn_name() -> u64 {
+            let v: u64;
+            unsafe {
+                core::arch::asm!(concat!("mrs {}, ", stringify!($reg)),
+                                 out(reg) v, options(nomem, nostack, preserves_flags));
+            }
+            v
+        }
+    };
 }
+
+macro_rules! sysreg_write {
+    ($fn_name:ident, $reg:ident) => {
+        #[inline]
+        pub unsafe fn $fn_name(v: u64) {
+            unsafe {
+                core::arch::asm!(concat!("msr ", stringify!($reg), ", {}"),
+                                 in(reg) v, options(nomem, nostack, preserves_flags));
+            }
+        }
+    };
+}
+
+sysreg_read!(read_sctlr_el1, sctlr_el1);
+sysreg_write!(write_sctlr_el1, sctlr_el1);
+
+sysreg_write!(write_ttbr0_el1, ttbr0_el1);
+sysreg_write!(write_mair_el1, mair_el1);
+sysreg_write!(write_tcr_el1, tcr_el1);
+
+sysreg_read!(read_esr_el1, esr_el1);
+sysreg_read!(read_far_el1, far_el1);
+sysreg_read!(read_elr_el1, elr_el1);
+sysreg_write!(write_elr_el1, elr_el1);
+sysreg_read!(read_spsr_el1, spsr_el1);
+sysreg_write!(write_spsr_el1, spsr_el1);
+
+sysreg_write!(write_vbar_el1, vbar_el1);
+
+// ---------- barriers + TLB invalidate ----------
+
+#[inline]
+pub unsafe fn isb() {
+    unsafe { core::arch::asm!("isb", options(nostack, preserves_flags)) }
+}
+
+#[inline]
+pub unsafe fn dsb_ish() {
+    unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) }
+}
+
+#[inline]
+pub unsafe fn dsb_ishst() {
+    unsafe { core::arch::asm!("dsb ishst", options(nostack, preserves_flags)) }
+}
+
+/// Invalidate all stage-1 EL1 TLB entries, broadcast to all PEs in the
+/// Inner Shareable domain.
+#[inline]
+pub unsafe fn tlbi_vmalle1is() {
+    unsafe { core::arch::asm!("tlbi vmalle1is", options(nostack, preserves_flags)) }
+}
+
+// ---------- ARM generic timer ----------
+
+sysreg_read!(read_cntfrq_el0, cntfrq_el0);
+sysreg_write!(write_cntv_tval_el0, cntv_tval_el0);
+sysreg_write!(write_cntv_ctl_el0, cntv_ctl_el0);
+sysreg_read!(read_cntv_ctl_el0, cntv_ctl_el0);
