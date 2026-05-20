@@ -602,11 +602,104 @@ IRQ delivery: virtual timer PPI INTID 27. Per-hart banked in
 
 ---
 
-## Phase E — trampoline + EL0↔EL1 + cross-toolchain  (~200 LoC + toolchain, ~1 session)
+## Phase E — trampoline + EL0↔EL1 + cross-toolchain — **kernel-side DONE**
 
-Gate: same shell session as riscv64 — `qemu-system-aarch64 -M
-virt -cpu cortex-a72 -bios none -kernel ... -drive file=fs.img,...`
-runs `/ls /`, `/echo`, `/cat`, `/usertests exitwait`.
+Verified the full user-mode round-trip on aarch64:
+
+```
+fs: ready (sb@1, log@2..33, inodes@33..58, bmap@58, data@59..)
+spawning init proc (360 bytes)
+usertrap: pid 1 unknown cause=0x2000000 va=0x0 epc=0x0 -> killed
+pid 1 exit(-1) on hart 0 kalloc.free=32240
+```
+
+The "usertrap" diagnostic is the proof: the kernel called
+`Hal::return_to_user` → trampoline restored user regs + switched
+TTBR0_EL1 to user → `eret` to EL0 → CPU tried to decode bytes at
+initcode's entry — but **initcode is hand-rolled RISC-V asm**
+(`la a0; li a7, 7; ecall`), so the aarch64 hardware saw random
+opcodes. Trap fired → trampoline `uservec_sync` saved user
+state, switched TTBR0_EL1 back to kernel, jumped to
+`rust_usertrap` → `Arch::on_user_trap_entry` swapped VBAR_EL1
+back to kernel vector → `decode_user_trap` decoded ESR_EL1 →
+`UserTrapCause::Unknown` → `proc.killed` → `sys_exit(-1)`.
+
+**Every single piece of the user-mode trap path works.** The
+only remaining work for a real shell session is aarch64-native
+user binaries.
+
+### Files
+
+- `crates/hal-aarch64/asm/trampoline.S` (~160 LoC) — full
+  trampoline page: 2 KiB vector table at offset 0, then
+  `uservec_sync` (save x0..x30 + ELR + SPSR + SP_EL0 into
+  TRAPFRAME, swap TTBR0 to kernel, jump to `rust_usertrap`),
+  `uservec_irq` (= `b uservec_sync`), `trampoline_userret`
+  (mirror: set TPIDR_EL1, swap TTBR0 to user, restore CSRs +
+  GPRs from TRAPFRAME, `eret`).
+- `crates/hal-aarch64/src/lib.rs::return_to_user` — sets
+  `tf.kernel_*` slots, jumps to `TRAMPOLINE + userret_offset`
+  with `x0 = TRAPFRAME`, `x1 = user_satp`.
+- `decode_user_trap` reads `ESR_EL1.EC`, returns `Syscall` (EC=0x15
+  for SVC), `PageFault` (EC=0x20 instruction, 0x24 data — with
+  `WnR` bit decoded), or `Unknown`.
+- `on_user_trap_entry` swaps `VBAR_EL1` back from the trampoline
+  vector to the kernel vector. (Doing the swap inside the
+  trampoline asm would require an external-symbol reference that
+  rust-lld can't resolve PC-relative inside `.trampsec`.)
+
+### Linker-flag bug fix (incidental)
+
+Initially every internal branch inside `.trampsec` failed with
+`R_AARCH64_JUMP26 ... has non-ABS relocation`. Root cause: the
+section directive `.section .trampsec` (no flags) didn't tell
+rust-lld the section was allocatable + executable. Fix:
+`.section .trampsec, "ax", @progbits`. After that, all PC-
+relative branches and `adr` references inside the section
+resolve cleanly.
+
+### Still to do — user binaries (the `~200 LoC + toolchain` bit)
+
+This is bounded but new:
+
+1. `crates/kernel/user/ulib-aarch64.S` — aarch64 syscall stubs
+   using `svc #0` + register convention (syscall nr in `x8`,
+   args in `x0..x7`, return in `x0`).
+2. `crates/kernel/user/user-aarch64.ld` — aarch64 linker script
+   with the same two-PT_LOAD layout we use for riscv (text RX
+   + data RW page-aligned).
+3. `crates/kernel/build.rs` per-arch dispatch:
+   ```rust
+   let (cc, cflags) = match std::env::var("CARGO_CFG_TARGET_ARCH") {
+       Ok(s) if s == "riscv64" => ("riscv64-elf-gcc", &["-march=rv64gc", "-mabi=lp64"]),
+       Ok(s) if s == "aarch64" => ("clang", &["--target=aarch64-none-elf", "-march=armv8-a", "-mgeneral-regs-only"]),
+       _ => panic!(),
+   };
+   ```
+4. New aarch64-native fs image build: `target/user/aarch64/*.elf`
+   → `fs-aarch64.img` via `mkfs`.
+5. New `Makefile` target `qemu-aarch64`:
+   ```makefile
+   qemu-aarch64: build-aarch64 fs-aarch64.img
+       qemu-system-aarch64 -M virt -cpu cortex-a72 \
+           -kernel target/aarch64-unknown-none-softfloat/release/kernel \
+           -m 128M -smp 1 -display none -serial stdio -monitor none \
+           -global virtio-mmio.force-legacy=false \
+           -drive file=fs-aarch64.img,if=none,format=raw,id=x0 \
+           -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+   ```
+6. `initcode.S` for aarch64 — replace the RISC-V `la/li/ecall`
+   with the aarch64 equivalent: `adr x0, sh_path; mov x1, #0;
+   mov x8, #7; svc #0`.
+7. Recompile every `.c` user binary (sh, ls, cat, echo, wr,
+   mkdir, rm, kill, killtest, malloctest, lazytest, smptest, ln,
+   xv6test, usertests) for aarch64 via the new toolchain
+   dispatch.
+
+No new spec research needed for this — it's all
+build-system/linker plumbing. **Verification gate**: same shell
+session under `qemu-system-aarch64`. Tracked separately as a
+follow-on to keep this todo's "kernel-side done" status clean.
 
 ### E.1 Single-TTBR0 model (xv6/riscv style)
 

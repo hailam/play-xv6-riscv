@@ -21,20 +21,29 @@ pub mod trapframe;
 pub mod uart;
 
 core::arch::global_asm!(include_str!("../asm/kernelvec.S"));
+core::arch::global_asm!(include_str!("../asm/trampoline.S"));
 
 pub use pagetable::{install_free_frame, PageTable};
 pub use trapframe::TrapFrame;
 
 extern "C" {
     fn _trampoline();
+    fn trampoline_vector_table();
+    fn trampoline_userret();
 }
 
-/// Physical address of the trampoline page (the kernel-resident page
-/// that hosts uservec/userret; mapped at fixed VA TRAMPOLINE in both
-/// kernel and user pagetables). Defined by `kernel-aarch64.ld`.
+/// Physical address of the trampoline page.
 #[inline]
 pub fn trampoline_pa() -> usize {
     _trampoline as *const () as usize
+}
+
+/// Offset of `userret` from the trampoline page base, used by
+/// `Hal::return_to_user` to construct a callable VA.
+#[inline]
+fn userret_offset_internal() -> usize {
+    trampoline_userret as *const () as usize
+        - trampoline_vector_table as *const () as usize
 }
 
 pub struct AArch64;
@@ -67,10 +76,12 @@ impl Hal for AArch64 {
         trampoline_pa()
     }
     fn uservec_offset() -> usize {
-        0 // Phase E will fill in.
+        // VBAR_EL1 vector slot for "Lower EL using AArch64,
+        // Synchronous" is at offset 0x400 within the table.
+        0x400
     }
     fn userret_offset() -> usize {
-        0 // Phase E will fill in.
+        userret_offset_internal()
     }
 
     #[inline(always)]
@@ -154,13 +165,46 @@ impl Hal for AArch64 {
     // actually run.
 
     unsafe fn on_user_trap_entry() {
-        // aarch64's single VBAR_EL1 handles dispatch by entry slot,
-        // so there's no per-entry vector swap. Real impl: nothing.
+        // Switch VBAR_EL1 back to the kernel-mode vector table
+        // now that we're running in kernel context. (Trampoline
+        // can't do this itself because that would require an
+        // external-symbol reference inside .trampsec, and the
+        // linker can't resolve a PC-relative reloc between the
+        // trampoline page's runtime VA — high in user space —
+        // and the kernel image VA.)
+        unsafe {
+            csr::write_vbar_el1(trap::vector_table_addr());
+            csr::isb();
+        }
     }
 
     fn decode_user_trap(_tf: &mut Self::TrapFrame) -> UserTrapCause {
-        // Phase E will fill this in (read ESR_EL1, FAR_EL1, ELR_EL1).
-        unimplemented!("aarch64 decode_user_trap — Phase E")
+        // The trampoline already saved ELR_EL1/SPSR_EL1/SP_EL0 into
+        // the trapframe before we got here. ESR_EL1 and FAR_EL1 are
+        // still live (interrupts are off across the dispatch).
+        let esr = csr::read_esr_el1();
+        let far = csr::read_far_el1();
+        let ec = (esr >> 26) & 0x3F;
+        match ec {
+            // SVC from AArch64 — syscall. ELR_EL1 already points
+            // PAST the SVC instruction (ARM ARM D1.10.5), so the
+            // trapframe's elr_el1 (= epc) is already correct.
+            0x15 => UserTrapCause::Syscall,
+            // Instruction abort from EL0.
+            0x20 => UserTrapCause::PageFault {
+                va: far as usize,
+                write: false,
+            },
+            // Data abort from EL0. ISS[6] = WnR (1 = write).
+            0x24 => UserTrapCause::PageFault {
+                va: far as usize,
+                write: (esr & (1 << 6)) != 0,
+            },
+            _ => UserTrapCause::Unknown {
+                code: esr as usize,
+                va: far as usize,
+            },
+        }
     }
 
     fn arm_timer() {
@@ -175,8 +219,16 @@ impl Hal for AArch64 {
         unsafe { trap::init_kernel_trap_vec() };
     }
 
-    unsafe fn return_to_user(_tf: &mut Self::TrapFrame, _user_satp: usize) -> ! {
-        unimplemented!("aarch64 return_to_user — Phase E")
+    unsafe fn return_to_user(_tf: &mut Self::TrapFrame, user_satp: usize) -> ! {
+        // The kernel filled in tf.kernel_{satp,sp,trap,hartid} and
+        // tf.{elr_el1,spsr_el1,sp_el0,x[..]} before calling us. Jump
+        // into the trampoline at userret_offset with:
+        //   x0 = TRAPFRAME VA (the fixed user VA; mapped in both PTs)
+        //   x1 = user_satp (TTBR0 value for the user pagetable)
+        let userret_va = memlayout::TRAMPOLINE + userret_offset_internal();
+        let userret_fn: extern "C" fn(usize, usize) -> ! =
+            unsafe { core::mem::transmute(userret_va) };
+        userret_fn(memlayout::TRAPFRAME, user_satp);
     }
 
     unsafe fn init_console() {

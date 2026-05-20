@@ -33,9 +33,16 @@ pub static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 
 pub unsafe fn init_kernel_trap_vec() {
     unsafe {
-        csr::write_vbar_el1(kernel_vector_table as *const () as u64);
+        csr::write_vbar_el1(vector_table_addr());
         csr::isb();
     }
+}
+
+/// Public so `Hal::on_user_trap_entry` can swap VBAR_EL1 back to the
+/// kernel vector table after a user trap. The address here is a
+/// kernel VA reachable only once TTBR0_EL1 has been switched back.
+pub fn vector_table_addr() -> u64 {
+    kernel_vector_table as *const () as u64
 }
 
 pub fn arm_timer() {
