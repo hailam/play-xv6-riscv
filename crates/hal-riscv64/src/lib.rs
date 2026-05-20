@@ -50,6 +50,22 @@ pub fn userret_offset() -> usize {
 impl Hal for Riscv64 {
     type PageTable = PageTable;
 
+    const PGSIZE: usize = memlayout::PGSIZE;
+    const PHYSTOP: usize = memlayout::PHYSTOP;
+    const TRAMPOLINE: usize = memlayout::TRAMPOLINE;
+    const TRAPFRAME: usize = memlayout::TRAPFRAME;
+    const TIMER_INTERVAL: u64 = trap::TIMER_INTERVAL;
+
+    fn trampoline_pa() -> usize {
+        trampoline_pa()
+    }
+    fn uservec_offset() -> usize {
+        uservec_offset()
+    }
+    fn userret_offset() -> usize {
+        userret_offset()
+    }
+
     #[inline(always)]
     fn hartid() -> usize {
         csr::read_tp()

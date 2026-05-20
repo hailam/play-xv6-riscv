@@ -19,11 +19,7 @@ use crate::arch::{Arch, Hal};
 use crate::elf;
 use crate::kalloc::KFRAMES;
 
-#[cfg(target_arch = "riscv64")]
-use hal_riscv64::{
-    memlayout::{PGSIZE, TRAMPOLINE, TRAPFRAME},
-    trampoline_pa,
-};
+use crate::arch::{trampoline_pa, PGSIZE, TRAMPOLINE, TRAPFRAME};
 
 pub const STACK_VA_TOP: usize = TRAPFRAME;
 pub const STACK_VA_BASE: usize = STACK_VA_TOP - PGSIZE;

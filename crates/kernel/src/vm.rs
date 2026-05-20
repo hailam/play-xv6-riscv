@@ -8,13 +8,16 @@ use hal::{PageTableOps, PtePerm};
 use crate::arch::{Arch, Hal};
 use crate::kalloc::KFRAMES;
 
+use crate::arch::{trampoline_pa, PGSIZE, PHYSTOP, TRAMPOLINE};
+
 #[cfg(target_arch = "riscv64")]
-use hal_riscv64::{
-    memlayout::{
-        KERNBASE, PGSIZE, PHYSTOP, PLIC, PLIC_SIZE, TRAMPOLINE, UART0, UART0_SIZE, VIRTIO0,
-        VIRTIO0_SIZE,
-    },
-    trampoline_pa,
+use hal_riscv64::memlayout::{
+    KERNBASE, PLIC, PLIC_SIZE, UART0, UART0_SIZE, VIRTIO0, VIRTIO0_SIZE,
+};
+#[cfg(target_arch = "aarch64")]
+use hal_aarch64::memlayout::{
+    KERNBASE, GICD as PLIC, GICD_SIZE as PLIC_SIZE, UART0, UART0_SIZE, VIRTIO0,
+    VIRTIO0_SIZE,
 };
 
 extern "C" {

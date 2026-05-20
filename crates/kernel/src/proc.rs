@@ -22,11 +22,12 @@ use crate::syscall;
 use crate::user_vm::{self, STACK_VA_BASE};
 use crate::wait::WakerCell;
 
+use crate::arch::{trampoline_pa, PGSIZE, TRAMPOLINE, TRAPFRAME};
+
+// `TrapFrame` is still arch-specific (struct fields differ per arch).
+// The full move-behind-trait is part of the aarch64 boot follow-up.
 #[cfg(target_arch = "riscv64")]
-use hal_riscv64::{
-    memlayout::{PGSIZE, TRAMPOLINE, TRAPFRAME},
-    trampoline_pa, TrapFrame,
-};
+use hal_riscv64::TrapFrame;
 
 pub const NOFILE: usize = 16;
 

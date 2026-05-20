@@ -8,8 +8,7 @@ use hal::{FrameAllocator, PageTableOps, PtePerm};
 use crate::arch::{Arch, Hal};
 use crate::kalloc::KFRAMES;
 
-#[cfg(target_arch = "riscv64")]
-use hal_riscv64::memlayout::PGSIZE;
+use crate::arch::PGSIZE;
 
 #[repr(C, packed)]
 struct Elf64Hdr {

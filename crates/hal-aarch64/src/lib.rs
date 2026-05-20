@@ -25,6 +25,25 @@ pub const MAX_CPUS: usize = 8;
 impl Hal for AArch64 {
     type PageTable = PageTable;
 
+    const PGSIZE: usize = memlayout::PGSIZE;
+    const PHYSTOP: usize = memlayout::PHYSTOP;
+    const TRAMPOLINE: usize = memlayout::TRAMPOLINE;
+    const TRAPFRAME: usize = memlayout::TRAPFRAME;
+    /// Skeleton placeholder — real value comes from the ARM generic
+    /// timer counter frequency once the boot path is wired.
+    const TIMER_INTERVAL: u64 = 1_000_000;
+
+    /// Trampoline address resolution comes with the boot follow-up.
+    fn trampoline_pa() -> usize {
+        0
+    }
+    fn uservec_offset() -> usize {
+        0
+    }
+    fn userret_offset() -> usize {
+        0
+    }
+
     #[inline(always)]
     fn hartid() -> usize {
         csr::read_mpidr_el1()

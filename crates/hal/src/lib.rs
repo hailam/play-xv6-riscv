@@ -7,6 +7,22 @@
 pub trait Hal: 'static {
     type PageTable: PageTableOps;
 
+    // ----- arch-specific constants -----
+    //
+    // Exposed here so kernel code can read them as
+    // `<Arch as Hal>::PGSIZE` etc., avoiding direct
+    // `use hal_riscv64::*` imports.
+    const PGSIZE: usize;
+    const PHYSTOP: usize;
+    const TRAMPOLINE: usize;
+    const TRAPFRAME: usize;
+    const TIMER_INTERVAL: u64;
+
+    // ----- arch helpers tied to constants -----
+    fn trampoline_pa() -> usize;
+    fn uservec_offset() -> usize;
+    fn userret_offset() -> usize;
+
     fn hartid() -> usize;
     fn ncpus() -> usize;
 

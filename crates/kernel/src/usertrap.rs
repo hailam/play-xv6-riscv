@@ -7,14 +7,13 @@ use crate::cpu;
 use crate::executor;
 use crate::proc::{Proc, TrapEvent};
 
+use crate::arch::{userret_offset, uservec_offset, TRAMPOLINE};
+
+// CSR / SSTATUS helpers are RISC-V-specific.
 #[cfg(target_arch = "riscv64")]
-use hal_riscv64::{
-    csr_api::{
-        read_scause, read_sepc, read_sstatus, read_stval, write_sepc, write_sstatus,
-        write_stvec, SSTATUS_SPIE, SSTATUS_SPP,
-    },
-    memlayout::TRAMPOLINE,
-    userret_offset, uservec_offset,
+use hal_riscv64::csr_api::{
+    read_scause, read_sepc, read_sstatus, read_stval, write_sepc, write_sstatus,
+    write_stvec, SSTATUS_SPIE, SSTATUS_SPP,
 };
 
 const SCAUSE_ECALL_FROM_U: usize = 8;

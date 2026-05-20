@@ -25,8 +25,12 @@ use crate::uapi::{
     SYS_WAIT, SYS_WRITE,
 };
 
+use crate::arch::{PGSIZE, TIMER_INTERVAL};
+
+// TrapFrame struct access stays arch-specific until field-level
+// helpers land (tracked with the aarch64 boot follow-up).
 #[cfg(target_arch = "riscv64")]
-use hal_riscv64::{memlayout::PGSIZE, TrapFrame, TIMER_INTERVAL};
+use hal_riscv64::TrapFrame;
 
 pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
     match nr {
