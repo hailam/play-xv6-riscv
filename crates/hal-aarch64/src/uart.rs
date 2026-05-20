@@ -1,16 +1,58 @@
-//! PL011 UART skeleton. QEMU virt aarch64 console.
-//!
-//! Real init wires up the FIFO, baud, control register, and the
-//! RX-interrupt enable. The `putc` here just spins on the TX-FIFO
-//! flag; that's the only path the skeleton needs for early prints.
+//! PL011 UART driver — QEMU virt aarch64 console.
 
 use core::ptr::{read_volatile, write_volatile};
 
 use crate::memlayout::UART0;
 
-const DR: usize = UART0 + 0x000; // data
-const FR: usize = UART0 + 0x018; // flag register
+// PL011 register offsets.
+const DR: usize = UART0 + 0x000; // data register
+const FR: usize = UART0 + 0x018; // flag register (RO)
+const IBRD: usize = UART0 + 0x024; // integer baud rate divisor
+const FBRD: usize = UART0 + 0x028; // fractional baud rate divisor
+const LCRH: usize = UART0 + 0x02C; // line control
+const CR: usize = UART0 + 0x030; // control register
+const IMSC: usize = UART0 + 0x038; // interrupt mask set/clear
+const ICR: usize = UART0 + 0x044; // interrupt clear register
+
+// FR (flag register) bits.
+const FR_RXFE: u8 = 1 << 4; // RX FIFO empty
 const FR_TXFF: u8 = 1 << 5; // TX FIFO full
+
+// CR (control register) bits.
+const CR_UARTEN: u32 = 1 << 0;
+const CR_TXE: u32 = 1 << 8;
+const CR_RXE: u32 = 1 << 9;
+
+// LCRH (line control) bits.
+const LCRH_FEN: u32 = 1 << 4; // FIFO enable
+const LCRH_WLEN_8: u32 = 3 << 5; // 8 bits per character
+
+// IMSC (interrupt mask).
+const IMSC_RXIM: u32 = 1 << 4; // RX interrupt enable
+
+/// One-time global init — defensive (QEMU usually leaves PL011
+/// enabled at boot, but doing the full sequence here matches what
+/// the riscv64 path does for NS16550 and works regardless of QEMU
+/// state).
+pub unsafe fn init() {
+    unsafe {
+        // 1) Disable while we configure.
+        write_volatile(CR as *mut u32, 0);
+        // 2) Clear pending interrupts (write 1 to all bits we care about).
+        write_volatile(ICR as *mut u32, 0x7FF);
+        // 3) Baud divisor for 115200 baud @ 24 MHz UARTCLK.
+        //    div = 24_000_000 / (16 * 115200) ≈ 13.0208
+        //    IBRD = 13, FBRD = round(0.0208 * 64) = 1
+        write_volatile(IBRD as *mut u32, 13);
+        write_volatile(FBRD as *mut u32, 1);
+        // 4) Line control: FIFO + 8N1.
+        write_volatile(LCRH as *mut u32, LCRH_FEN | LCRH_WLEN_8);
+        // 5) Unmask RX interrupt.
+        write_volatile(IMSC as *mut u32, IMSC_RXIM);
+        // 6) Enable UART (TX + RX).
+        write_volatile(CR as *mut u32, CR_UARTEN | CR_TXE | CR_RXE);
+    }
+}
 
 pub fn putc(c: u8) {
     unsafe {
@@ -21,6 +63,12 @@ pub fn putc(c: u8) {
     }
 }
 
-/// No-op init. Real impl: disable UART, set baud, enable RX+TX,
-/// program LCRH, enable UART. PL011 init is ~30 lines.
-pub fn init() {}
+pub fn try_getc() -> Option<u8> {
+    unsafe {
+        if (read_volatile(FR as *const u8) & FR_RXFE) != 0 {
+            None
+        } else {
+            Some(read_volatile(DR as *const u8))
+        }
+    }
+}

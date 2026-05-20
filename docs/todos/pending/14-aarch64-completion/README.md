@@ -44,10 +44,46 @@ verification gates. Citations use the short forms:
 
 ---
 
-## Phase B — first `kmain_aarch64` print  (~150 LoC, ~1 session)
+## Phase B — first `kmain_aarch64` print — **DONE**
 
-Gate: `qemu-system-aarch64 -M virt -cpu cortex-a72 -nographic -bios none -kernel <elf>`
-prints `rust kmain (hart 0, EL1)` over PL011.
+Verified:
+
+```
+$ qemu-system-aarch64 -machine virt -cpu cortex-a72 \
+    -kernel target/aarch64-unknown-none-softfloat/release/kernel \
+    -m 128M -smp 1 -display none -serial stdio -monitor none
+rust kmain (hart 0, supervisor)
+kalloc: 32341 free frames (126 MiB)
+kvm: installed (satp=0x47fff000)
+PANIC: ... virtio_blk: bad version 1     <- Phase D territory
+```
+
+What landed:
+
+- `crates/hal-aarch64/asm/entry.S` (~75 LoC) — full EL2→EL1 drop
+  with `CurrentEL` dispatch + per-hart-stack from MPIDR_EL1.Aff0
+  + `eret` into `kmain`.
+- `crates/hal-aarch64/src/start.rs` (~10 LoC) — `global_asm!`
+  includes the entry asm.
+- `crates/hal-aarch64/src/uart.rs` — real PL011 init (baud,
+  LCRH 8N1+FIFO, RXIM, CR.UARTEN|TXE|RXE) + `try_getc` reading
+  PL011_DR after checking PL011_FR.RXFE.
+- `crates/kernel/kernel-aarch64.ld` — linker script anchored at
+  `0x4008_0000` (DRAM + 1 MiB, matches QEMU's direct-kernel
+  boot convention).
+- `.cargo/config.toml` — aarch64 rustflags pointing at the new
+  linker script.
+- `crates/kernel/src/main.rs` — added `extern crate hal_aarch64
+  as _` so the entry asm gets linked in. Print phrase changed
+  from "S-mode" to neutral "supervisor".
+
+The kalloc count differs from riscv64 (32341 vs 32448) because of
+the aarch64-specific BSS + stack region layout. Free count is
+correct otherwise.
+
+Note QEMU aarch64 doesn't accept `-bios none` (treats "none" as
+a ROM filename); just leave the flag off. `-kernel` already
+implies no firmware.
 
 ### B.1 Boot environment facts (QEMU virt + cortex-a72)
 

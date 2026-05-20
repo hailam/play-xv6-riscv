@@ -14,6 +14,7 @@ use hal::{Hal, UserTrapCause};
 mod csr;
 pub mod memlayout;
 mod pagetable;
+mod start;
 pub mod trapframe;
 pub mod uart;
 
@@ -87,8 +88,7 @@ impl Hal for AArch64 {
     }
 
     fn console_try_getc() -> Option<u8> {
-        // PL011 RX path lands with the boot follow-up.
-        None
+        uart::try_getc()
     }
 
     fn now_ticks() -> u64 {

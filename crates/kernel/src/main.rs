@@ -37,6 +37,9 @@ use crate::proc::Proc;
 #[cfg(target_arch = "riscv64")]
 extern crate hal_riscv64 as _;
 
+#[cfg(target_arch = "aarch64")]
+extern crate hal_aarch64 as _;
+
 static STARTED: AtomicBool = AtomicBool::new(false);
 
 #[no_mangle]
@@ -44,7 +47,10 @@ pub extern "C" fn kmain() -> ! {
     let id = Arch::hartid();
     if id == 0 {
         println!();
-        println!("rust kmain (hart 0, S-mode)");
+        // "S-mode" on riscv, "EL1" on aarch64 — same semantic level
+        // (supervisor). Print a neutral phrase so the line is
+        // useful as a milestone on either arch.
+        println!("rust kmain (hart 0, supervisor)");
         kalloc::init();
         println!(
             "kalloc: {} free frames ({} MiB)",
