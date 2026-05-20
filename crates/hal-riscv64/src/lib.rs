@@ -2,7 +2,7 @@
 
 //! `Hal` impl for QEMU `-machine virt` riscv64.
 
-use hal::Hal;
+use hal::{Hal, TrapFrameAccess, UserTrapCause};
 
 mod csr;
 pub mod memlayout;
@@ -64,6 +64,8 @@ impl Hal for Riscv64 {
     const VIRTIO0_SIZE: usize = memlayout::VIRTIO0_SIZE;
     const INTC_BASE: usize = memlayout::PLIC;
     const INTC_SIZE: usize = memlayout::PLIC_SIZE;
+    const UART0_IRQ: usize = memlayout::UART0_IRQ;
+    const VIRTIO0_IRQ: usize = memlayout::VIRTIO0_IRQ;
 
     fn trampoline_pa() -> usize {
         trampoline_pa()
@@ -102,6 +104,10 @@ impl Hal for Riscv64 {
         uart::putc(c);
     }
 
+    fn console_try_getc() -> Option<u8> {
+        uart::try_getc()
+    }
+
     fn now_ticks() -> u64 {
         csr::read_time() as u64
     }
@@ -117,6 +123,104 @@ impl Hal for Riscv64 {
     unsafe fn write_satp(satp: usize) {
         csr::write_satp(satp);
         csr::sfence_vma();
+    }
+
+    unsafe fn on_user_trap_entry() {
+        // Redirect stvec away from `uservec` (the user-mode entry) and
+        // back to `kernelvec` so that any kernel-mode trap from now on
+        // doesn't bounce through the user-mode save path.
+        extern "C" {
+            fn kernelvec();
+        }
+        unsafe { csr::write_stvec(kernelvec as *const () as usize) };
+    }
+
+    fn decode_user_trap(tf: &mut Self::TrapFrame) -> UserTrapCause {
+        // Save the trapping PC into the trapframe so the kernel can
+        // inspect it / advance it for syscalls.
+        let raw_sepc = csr::read_sepc();
+        tf.set_epc(raw_sepc as u64);
+
+        const SCAUSE_ECALL_FROM_U: usize = 8;
+        const SCAUSE_LOAD_PAGE_FAULT: usize = 13;
+        const SCAUSE_STORE_PAGE_FAULT: usize = 15;
+        const SCAUSE_INTERRUPT: usize = 1usize << 63;
+        const SCAUSE_TIMER: usize = 5;
+        const SCAUSE_EXTERNAL: usize = 9;
+
+        let scause = csr::read_scause();
+        if scause == SCAUSE_ECALL_FROM_U {
+            // Advance past the 4-byte `ecall`.
+            tf.set_epc(tf.epc() + 4);
+            return UserTrapCause::Syscall;
+        }
+        if scause & SCAUSE_INTERRUPT != 0 {
+            let code = scause & !SCAUSE_INTERRUPT;
+            return match code {
+                SCAUSE_TIMER => UserTrapCause::Timer,
+                SCAUSE_EXTERNAL => UserTrapCause::Devintr,
+                _ => UserTrapCause::Unknown { code: scause, va: 0 },
+            };
+        }
+        // Synchronous exception.
+        let va = csr::read_stval();
+        match scause {
+            SCAUSE_LOAD_PAGE_FAULT => UserTrapCause::PageFault { va, write: false },
+            SCAUSE_STORE_PAGE_FAULT => UserTrapCause::PageFault { va, write: true },
+            _ => UserTrapCause::Unknown { code: scause, va },
+        }
+    }
+
+    fn arm_timer() {
+        trap::arm_timer();
+    }
+
+    fn handle_external_irq() {
+        trap::handle_external_irq();
+    }
+
+    unsafe fn init_kernel_trap_vec() {
+        unsafe { trap::init_kernel_trap_vec() };
+    }
+
+    unsafe fn init_console() {
+        uart::init();
+    }
+
+    unsafe fn init_intc_global() {
+        plic::init();
+    }
+
+    unsafe fn init_intc_per_hart() {
+        plic::init_for_hart();
+    }
+
+    unsafe fn install_free_frame(free: unsafe fn(usize)) {
+        pagetable::install_free_frame(free);
+    }
+
+    unsafe fn return_to_user(tf: &mut Self::TrapFrame, user_satp: usize) -> !{
+        // sstatus: clear SPP (return to U-mode), set SPIE (re-enable
+        // SIE on sret).
+        const SSTATUS_SPP: usize = 1 << 8;
+        const SSTATUS_SPIE: usize = 1 << 5;
+        let mut sstatus = csr::read_sstatus();
+        sstatus &= !SSTATUS_SPP;
+        sstatus |= SSTATUS_SPIE;
+        unsafe { csr::write_sstatus(sstatus) };
+
+        unsafe { csr::write_sepc(tf.epc() as usize) };
+
+        // Switch stvec to uservec — the trampoline page's user entry.
+        let uservec_va = memlayout::TRAMPOLINE + uservec_offset();
+        unsafe { csr::write_stvec(uservec_va) };
+
+        // Jump into userret in the trampoline. It does the satp swap
+        // + register restore + sret.
+        let userret_va = memlayout::TRAMPOLINE + userret_offset();
+        let userret_fn: extern "C" fn(usize) -> ! =
+            unsafe { core::mem::transmute(userret_va) };
+        userret_fn(user_satp);
     }
 }
 

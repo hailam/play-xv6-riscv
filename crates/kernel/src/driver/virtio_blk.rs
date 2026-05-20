@@ -19,7 +19,6 @@ use crate::arch::Arch;
 use crate::sync::SpinLock;
 use crate::wait::WakerCell;
 
-#[cfg(target_arch = "riscv64")]
 use crate::arch::VIRTIO0;
 
 pub const SECTOR_SIZE: usize = 512;

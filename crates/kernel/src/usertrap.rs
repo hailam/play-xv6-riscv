@@ -1,31 +1,17 @@
 //! Trap-from-user dispatch + the noreturn user-mode entry path.
+//!
+//! Arch-independent: every CSR / cause-register read goes through
+//! the `Hal::decode_user_trap` and `Hal::return_to_user` surface.
 
-use hal::{Hal, TrapFrameAccess};
+use hal::{Hal, TrapFrameAccess, UserTrapCause};
 
 use crate::arch::Arch;
 use crate::cpu;
 use crate::executor;
 use crate::proc::{Proc, TrapEvent};
 
-use crate::arch::{userret_offset, uservec_offset, TRAMPOLINE};
-
-// CSR / SSTATUS helpers are RISC-V-specific.
-#[cfg(target_arch = "riscv64")]
-use hal_riscv64::csr_api::{
-    read_scause, read_sepc, read_sstatus, read_stval, write_sepc, write_sstatus,
-    write_stvec, SSTATUS_SPIE, SSTATUS_SPP,
-};
-
-const SCAUSE_ECALL_FROM_U: usize = 8;
-const SCAUSE_LOAD_PAGE_FAULT: usize = 13;
-const SCAUSE_STORE_PAGE_FAULT: usize = 15;
-const SCAUSE_INTERRUPT: usize = 1usize << 63;
-const SCAUSE_TIMER: usize = 5;
-const SCAUSE_EXTERNAL: usize = 9;
-
 extern "C" {
     static _stack0: u8;
-    fn kernelvec();
 }
 
 const STACK_PER_HART: usize = 16 * 1024;
@@ -37,65 +23,61 @@ fn kernel_stack_top(hartid: usize) -> usize {
 
 #[no_mangle]
 pub extern "C" fn rust_usertrap() -> ! {
-    unsafe { write_stvec(kernelvec as *const () as usize) };
+    unsafe { Arch::on_user_trap_entry() };
 
     let proc = cpu::current_proc().expect("rust_usertrap: no current proc");
     let tf = proc.trapframe();
-    tf.set_epc(read_sepc() as u64);
 
-    let scause = read_scause();
-    let event = if scause == SCAUSE_ECALL_FROM_U {
-        tf.set_epc(tf.epc() + 4);
-        TrapEvent::Syscall {
+    let cause = Arch::decode_user_trap(tf);
+
+    let event = match cause {
+        UserTrapCause::Syscall => TrapEvent::Syscall {
             nr: tf.syscall_nr() as usize,
+        },
+        UserTrapCause::Timer => {
+            crate::trap::TICKS
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            crate::time::drain_expired();
+            Arch::arm_timer();
+            TrapEvent::Timer
         }
-    } else if scause & SCAUSE_INTERRUPT != 0 {
-        let code = scause & !SCAUSE_INTERRUPT;
-        match code {
-            SCAUSE_TIMER => {
-                crate::trap::TICKS
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                crate::time::drain_expired();
-                hal_riscv64::arm_timer();
+        UserTrapCause::Devintr => {
+            Arch::handle_external_irq();
+            TrapEvent::Devintr
+        }
+        UserTrapCause::PageFault { va, write: _ } => {
+            // Lazy-sbrk region? Map a fresh zero frame and re-run
+            // the trapping instruction (don't advance epc).
+            let proc_arc = unsafe {
+                let raw = proc as *const Proc;
+                alloc::sync::Arc::increment_strong_count(raw);
+                alloc::sync::Arc::from_raw(raw)
+            };
+            let mapped = crate::syscall::lazy_map_page(&proc_arc, va);
+            if mapped {
+                TrapEvent::Timer
+            } else {
+                crate::println!(
+                    "usertrap: pid {} page fault va={:#x} epc={:#x} -> killed",
+                    proc.pid,
+                    va,
+                    tf.epc(),
+                );
+                proc.killed
+                    .store(true, core::sync::atomic::Ordering::Release);
                 TrapEvent::Timer
             }
-            SCAUSE_EXTERNAL => {
-                hal_riscv64::handle_external_irq();
-                TrapEvent::Devintr
-            }
-            _ => panic!("usertrap: unknown intr code {code}"),
         }
-    } else {
-        let stval = read_stval();
-
-        // First: is this a lazy-sbrk-allocated page? If so, map it
-        // and resume the trapping instruction by NOT advancing epc.
-        if (scause == SCAUSE_LOAD_PAGE_FAULT || scause == SCAUSE_STORE_PAGE_FAULT)
-            && {
-                // Reconstruct an Arc so `lazy_map_page` gets the same
-                // `&Arc<Proc>` shape the syscall layer uses.
-                let proc_arc = unsafe {
-                    let raw = proc as *const Proc;
-                    alloc::sync::Arc::increment_strong_count(raw);
-                    alloc::sync::Arc::from_raw(raw)
-                };
-                let ok = crate::syscall::lazy_map_page(&proc_arc, stval as usize);
-                // `proc_arc` drops here, restoring the strong count.
-                ok
-            }
-        {
-            TrapEvent::Timer
-        } else {
-            // Unknown / illegal fault. xv6 prints a diagnostic and
-            // calls `setkilled(p)`; match that, no panic.
+        UserTrapCause::Unknown { code, va } => {
             crate::println!(
-                "usertrap: pid {} scause={:#x} sepc={:#x} stval={:#x} -> killed",
+                "usertrap: pid {} unknown cause={:#x} va={:#x} epc={:#x} -> killed",
                 proc.pid,
-                scause,
+                code,
+                va,
                 tf.epc(),
-                stval,
             );
-            proc.killed.store(true, core::sync::atomic::Ordering::Release);
+            proc.killed
+                .store(true, core::sync::atomic::Ordering::Release);
             TrapEvent::Timer
         }
     };
@@ -107,37 +89,23 @@ pub extern "C" fn rust_usertrap() -> ! {
     executor::run()
 }
 
+/// Set up the proc's trapframe for a return-to-user and jump
+/// through the trampoline. Noreturn.
 pub fn return_to_user(proc: &Proc) -> ! {
-    // CRITICAL: turn off S-mode interrupts before we switch `stvec`
-    // to `uservec`. If a trap (e.g. timer) fires in the window
-    // between the `stvec` write and `sret`, it would dispatch to
-    // `uservec` from S-mode — which then writes kernel register
-    // state into the user trapframe, corrupting epc/sp/a0/etc.
-    // (Spent a session chasing this; it manifests as a fault to
-    // a high-VA garbage PC after ~thousands of trap cycles.) sret
-    // re-enables interrupts via `sstatus.SPIE -> SIE`.
+    // CRITICAL: interrupts must be off across the trap-vector swap
+    // until `sret`/`eret` re-enables them. Without this, a timer
+    // firing in the window between vector swap and the actual
+    // return would dispatch via the user-trap path from kernel
+    // mode, corrupting the trapframe.
     unsafe { Arch::intr_off() };
 
     let hartid = Arch::hartid();
-
     let tf = proc.trapframe();
     tf.set_kernel_satp(crate::vm::kernel_satp() as u64);
     tf.set_kernel_sp(kernel_stack_top(hartid) as u64);
     tf.set_kernel_trap(rust_usertrap as *const () as u64);
     tf.set_kernel_hartid(hartid as u64);
 
-    let mut sstatus = read_sstatus();
-    sstatus &= !SSTATUS_SPP;
-    sstatus |= SSTATUS_SPIE;
-    unsafe { write_sstatus(sstatus) };
-    unsafe { write_sepc(tf.epc() as usize) };
-
-    let uservec_va = TRAMPOLINE + uservec_offset();
-    unsafe { write_stvec(uservec_va) };
-
     let user_satp = proc.satp();
-    let userret_va = TRAMPOLINE + userret_offset();
-    let userret_fn: extern "C" fn(usize) -> ! =
-        unsafe { core::mem::transmute(userret_va) };
-    userret_fn(user_satp);
+    unsafe { Arch::return_to_user(tf, user_satp) }
 }

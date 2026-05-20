@@ -14,7 +14,6 @@ use hal::FrameAllocator;
 
 use crate::sync::SpinLock;
 
-#[cfg(target_arch = "riscv64")]
 use crate::arch::{PGSIZE, PHYSTOP};
 
 struct Run {

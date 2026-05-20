@@ -20,40 +20,33 @@ populate, interrupt controller, timer, user-mode trampoline.
 ## What's already done (since this todo was first written)
 
 - ✅ Trait widening: `PGSIZE/KERNBASE/PHYSTOP/TRAMPOLINE/`
-  `TRAPFRAME/TIMER_INTERVAL/UART0/VIRTIO0/INTC_BASE` are all
-  `Hal` consts. AArch64 impl provides real values.
+  `TRAPFRAME/TIMER_INTERVAL/UART0/VIRTIO0/INTC_BASE/UART0_IRQ/`
+  `VIRTIO0_IRQ` are all `Hal` consts. AArch64 impl provides real
+  values.
 - ✅ `TrapFrameAccess` trait: `epc/sp/arg/syscall_nr/set_*`. AArch64
   impl uses `ELR_EL1/SP_EL0/x0..x7/x8`.
-- ✅ Kernel scrubbed of arch-specific imports except in 3 files:
-  `arch.rs` (the selector, correct), `usertrap.rs` (S-mode CSRs),
-  `trap.rs` (riscv stvec + timer arm).
-- ✅ `hal-aarch64` compiles standalone for
-  `aarch64-unknown-none-softfloat`.
+- ✅ **Phase A done**: `cargo build --target
+  aarch64-unknown-none-softfloat -p kernel` succeeds (1 expected
+  linker warning — `_start` not defined yet).
+- ✅ `Hal` trait now exposes:
+  - `decode_user_trap(tf) -> UserTrapCause`
+  - `arm_timer`, `handle_external_irq`, `init_kernel_trap_vec`,
+    `on_user_trap_entry`
+  - `return_to_user(tf, user_satp) -> !` (noreturn; handles all
+    arch-specific CSR setup + trampoline jump)
+  - `init_console`, `init_intc_global`, `init_intc_per_hart`
+  - `console_try_getc`
+  - `install_free_frame`
+- ✅ Kernel scrubbed of ALL arch-specific imports except in
+  `arch.rs` (the selector, correct).
+- ✅ AArch64 impls provide real values for the trait consts +
+  unimplemented!()-style stubs for the trap path methods.
 
 ## Concrete remaining checklist
 
 Each item has an LoC estimate (rough) and a verification gate.
 
-### Phase A: kernel compiles for aarch64  (~120 LoC, gate: `cargo build`)
-
-The 3 remaining `hal_riscv64` direct imports need aarch64
-equivalents accessible through the trait or a per-arch alias
-module:
-
-- **`usertrap.rs`** currently does
-  `use hal_riscv64::csr_api::{read_scause, write_sepc, …, SSTATUS_SPP, SSTATUS_SPIE}`.
-  Aarch64 has no such CSRs — it has `ESR_EL1`, `ELR_EL1`,
-  `SPSR_EL1`. Best path: define a `TrapPlumbing` trait on `Hal`
-  with `decode_trap(tf) -> TrapCause`, `prepare_user_return(tf)`,
-  arch-specific. Then `usertrap.rs` is arch-independent.
-- **`trap.rs`** uses `hal_riscv64::{arm_timer, init_kernel_trap_vec, TIMER_INTERVAL}`.
-  Add `Hal::init_kernel_trap_vec()` and `Hal::arm_timer()`.
-  TIMER_INTERVAL is already on Hal.
-- **`arch.rs`** stays per-cfg (correct — it picks `Arch`).
-
-After this phase: `cargo build --target aarch64-unknown-none-softfloat -p kernel`
-succeeds with the aarch64 impls as stubs. Kernel won't boot
-(stubs `panic!`), but the build is honest.
+### Phase A: kernel compiles for aarch64 — **DONE**
 
 ### Phase B: first PL011 print  (~150 LoC, gate: "rust kmain" appears under qemu-system-aarch64)
 

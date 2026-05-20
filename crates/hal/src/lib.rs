@@ -4,6 +4,23 @@
 //! kernel sees. Each supported architecture provides a single zero-sized
 //! type that implements `Hal`.
 
+/// Arch-neutral classification of a user-mode trap that just fired.
+/// Each impl decodes its arch's cause register (scause on RISC-V,
+/// ESR_EL1 on aarch64) into one of these.
+#[derive(Debug, Clone, Copy)]
+pub enum UserTrapCause {
+    /// System call (RISC-V `ecall` from U-mode, aarch64 `svc`).
+    Syscall,
+    /// Timer interrupt — the Hal already re-armed the timer.
+    Timer,
+    /// External device interrupt — the Hal has *not* yet ack'd.
+    Devintr,
+    /// Load / store fault. `write = true` for store-side faults.
+    PageFault { va: usize, write: bool },
+    /// Anything else; kernel should kill the proc.
+    Unknown { code: usize, va: usize },
+}
+
 /// Portable view of a saved trap frame. Lets the arch-independent
 /// kernel read syscall args + tweak the return-to-user fields
 /// without knowing the arch's actual struct layout.
@@ -58,6 +75,13 @@ pub trait Hal: 'static {
     const INTC_BASE: usize;
     const INTC_SIZE: usize;
 
+    /// External-IRQ numbers the kernel dispatches on. The platform's
+    /// IRQ controller delivers these IDs as a `u32` source through
+    /// `kernel_on_external` after Hal::handle_external_irq has
+    /// claimed them.
+    const UART0_IRQ: usize;
+    const VIRTIO0_IRQ: usize;
+
     // ----- arch helpers tied to constants -----
     fn trampoline_pa() -> usize;
     fn uservec_offset() -> usize;
@@ -74,6 +98,9 @@ pub trait Hal: 'static {
 
     fn console_putc(c: u8);
 
+    /// Non-blocking console input — `None` if no byte available.
+    fn console_try_getc() -> Option<u8>;
+
     fn now_ticks() -> u64;
 
     /// Install the given pagetable on this hart (set `satp` + flush TLB).
@@ -88,6 +115,59 @@ pub trait Hal: 'static {
     /// install the same pagetable as hart 0 without owning the
     /// `PageTable` value themselves.
     unsafe fn write_satp(satp: usize);
+
+    // ----- trap-handling surface -----
+    //
+    // Used by the kernel's `usertrap.rs` so it doesn't need to read
+    // arch-specific CSRs (scause, ESR_EL1, etc.) directly.
+
+    /// Called at the top of the kernel's user-trap dispatcher. The
+    /// HAL gets a chance to redirect the trap-vector register back
+    /// to the kernel-mode vector (RISC-V's `stvec`, etc.). aarch64's
+    /// single VBAR_EL1 dispatches by entry slot, so this is a no-op
+    /// there.
+    unsafe fn on_user_trap_entry();
+
+    /// Decode the most recent user-mode trap. On entry, the
+    /// trapframe's saved register state is already in place; this
+    /// reads the arch cause register, may advance `tf.epc` past
+    /// the syscall instruction, and returns a portable cause.
+    fn decode_user_trap(tf: &mut Self::TrapFrame) -> UserTrapCause;
+
+    /// Re-arm the per-hart timer for the next tick. Called from
+    /// the timer-interrupt arm of the user-trap dispatcher and from
+    /// the kernel-timer hook.
+    fn arm_timer();
+
+    /// Dispatch an external (device) interrupt to the right driver
+    /// (UART, virtio-blk, etc.). The HAL knows which IRQ controller
+    /// to query (PLIC on RISC-V, GIC on aarch64).
+    fn handle_external_irq();
+
+    /// Install the kernel-mode trap vector. Called once per hart.
+    unsafe fn init_kernel_trap_vec();
+
+    /// Set up `tf` and arch CSRs for a return-to-user, then jump
+    /// through the trampoline. Noreturn — control resumes in U-mode
+    /// at `tf.epc()` with the given `user_satp`.
+    unsafe fn return_to_user(tf: &mut Self::TrapFrame, user_satp: usize) -> !;
+
+    // ----- platform init (hart 0 + per-hart, called from `kmain`) -----
+
+    /// One-time global UART init (baud, FIFO, RX-IRQ enable on RISC-V).
+    unsafe fn init_console();
+
+    /// One-time global IRQ-controller init.
+    unsafe fn init_intc_global();
+
+    /// Per-hart IRQ-controller init (PLIC context / GIC CPU interface).
+    unsafe fn init_intc_per_hart();
+
+    /// Install the kernel's frame-free callback used by
+    /// `Drop for PageTable` to reclaim user pages. Stored in a static
+    /// inside the HAL so the pagetable destructor (which has no
+    /// reference to KFRAMES) can find it.
+    unsafe fn install_free_frame(free: unsafe fn(usize));
 }
 
 #[derive(Clone, Copy, Debug)]

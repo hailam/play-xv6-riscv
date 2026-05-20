@@ -53,11 +53,11 @@ pub extern "C" fn kmain() -> ! {
         );
         // Register the global frame-free callback used by
         // `Drop for PageTable` to reclaim user pages on exec/exit.
-        hal_riscv64::install_free_frame(kernel_free_frame);
+        unsafe { Arch::install_free_frame(kernel_free_frame) };
         vm::init_and_install();
         println!("kvm: installed (satp={:#x})", vm::kernel_satp());
-        hal_riscv64::uart::init();
-        hal_riscv64::plic::init();
+        unsafe { Arch::init_console() };
+        unsafe { Arch::init_intc_global() };
         driver::virtio_blk::init();
         driver::bio::init();
         STARTED.store(true, Ordering::Release);
@@ -69,7 +69,7 @@ pub extern "C" fn kmain() -> ! {
     }
     cpu::init_this_hart();
     trap::init_this_hart();
-    hal_riscv64::plic::init_for_hart();
+    unsafe { Arch::init_intc_per_hart() };
     println!("hart {} up, paging on", id);
 
     if id == 0 {

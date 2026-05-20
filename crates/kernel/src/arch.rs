@@ -30,11 +30,8 @@ pub const INTC_SIZE: usize = <Arch as Hal>::INTC_SIZE;
 pub fn trampoline_pa() -> usize {
     <Arch as Hal>::trampoline_pa()
 }
-#[inline]
-pub fn uservec_offset() -> usize {
-    <Arch as Hal>::uservec_offset()
-}
-#[inline]
-pub fn userret_offset() -> usize {
-    <Arch as Hal>::userret_offset()
-}
+
+// `uservec_offset` / `userret_offset` are only needed inside
+// each Hal impl's `return_to_user`; the kernel doesn't read them
+// directly, so we don't re-export them here. They live as
+// hal-private helpers.
