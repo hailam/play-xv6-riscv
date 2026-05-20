@@ -29,9 +29,17 @@ impl Hal for AArch64 {
     type TrapFrame = TrapFrame;
 
     const PGSIZE: usize = memlayout::PGSIZE;
+    const KERNBASE: usize = memlayout::KERNBASE;
     const PHYSTOP: usize = memlayout::PHYSTOP;
     const TRAMPOLINE: usize = memlayout::TRAMPOLINE;
     const TRAPFRAME: usize = memlayout::TRAPFRAME;
+
+    const UART0: usize = memlayout::UART0;
+    const UART0_SIZE: usize = memlayout::UART0_SIZE;
+    const VIRTIO0: usize = memlayout::VIRTIO0;
+    const VIRTIO0_SIZE: usize = memlayout::VIRTIO0_SIZE;
+    const INTC_BASE: usize = memlayout::GICD;
+    const INTC_SIZE: usize = memlayout::GICD_SIZE;
     /// Skeleton placeholder — real value comes from the ARM generic
     /// timer counter frequency once the boot path is wired.
     const TIMER_INTERVAL: u64 = 1_000_000;

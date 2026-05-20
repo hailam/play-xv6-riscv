@@ -43,10 +43,20 @@ pub trait Hal: 'static {
     // `<Arch as Hal>::PGSIZE` etc., avoiding direct
     // `use hal_riscv64::*` imports.
     const PGSIZE: usize;
+    const KERNBASE: usize;
     const PHYSTOP: usize;
     const TRAMPOLINE: usize;
     const TRAPFRAME: usize;
     const TIMER_INTERVAL: u64;
+
+    // MMIO. Names are arch-generic; the riscv64 impl maps INTC_BASE
+    // to PLIC, the aarch64 impl maps it to the GICv2 distributor.
+    const UART0: usize;
+    const UART0_SIZE: usize;
+    const VIRTIO0: usize;
+    const VIRTIO0_SIZE: usize;
+    const INTC_BASE: usize;
+    const INTC_SIZE: usize;
 
     // ----- arch helpers tied to constants -----
     fn trampoline_pa() -> usize;

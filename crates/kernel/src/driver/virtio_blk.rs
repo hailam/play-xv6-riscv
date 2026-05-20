@@ -20,7 +20,7 @@ use crate::sync::SpinLock;
 use crate::wait::WakerCell;
 
 #[cfg(target_arch = "riscv64")]
-use hal_riscv64::memlayout::VIRTIO0;
+use crate::arch::VIRTIO0;
 
 pub const SECTOR_SIZE: usize = 512;
 pub const NUM: usize = 8;

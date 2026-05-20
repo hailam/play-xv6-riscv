@@ -8,16 +8,9 @@ use hal::{PageTableOps, PtePerm};
 use crate::arch::{Arch, Hal};
 use crate::kalloc::KFRAMES;
 
-use crate::arch::{trampoline_pa, PGSIZE, PHYSTOP, TRAMPOLINE};
-
-#[cfg(target_arch = "riscv64")]
-use hal_riscv64::memlayout::{
-    KERNBASE, PLIC, PLIC_SIZE, UART0, UART0_SIZE, VIRTIO0, VIRTIO0_SIZE,
-};
-#[cfg(target_arch = "aarch64")]
-use hal_aarch64::memlayout::{
-    KERNBASE, GICD as PLIC, GICD_SIZE as PLIC_SIZE, UART0, UART0_SIZE, VIRTIO0,
-    VIRTIO0_SIZE,
+use crate::arch::{
+    trampoline_pa, INTC_BASE, INTC_SIZE, KERNBASE, PGSIZE, PHYSTOP, TRAMPOLINE, UART0,
+    UART0_SIZE, VIRTIO0, VIRTIO0_SIZE,
 };
 
 extern "C" {
@@ -37,8 +30,8 @@ pub fn init_and_install() {
         .expect("map UART0");
     pt.map(VIRTIO0, VIRTIO0, VIRTIO0_SIZE, PtePerm::RW, &KFRAMES)
         .expect("map VIRTIO0");
-    pt.map(PLIC, PLIC, PLIC_SIZE, PtePerm::RW, &KFRAMES)
-        .expect("map PLIC");
+    pt.map(INTC_BASE, INTC_BASE, INTC_SIZE, PtePerm::RW, &KFRAMES)
+        .expect("map interrupt controller");
 
     // Kernel text RX (includes trampoline page since it's inside .text),
     // kernel data + free physmem RW.
