@@ -53,7 +53,9 @@ fs.img: build $(MKFS)
 		smptest:$(USER_DIR)/smptest.elf \
 		ln:$(USER_DIR)/ln.elf \
 		faulttest:$(USER_DIR)/faulttest.elf \
-		xv6test:$(USER_DIR)/xv6test.elf
+		xv6test:$(USER_DIR)/xv6test.elf \
+		lazytest:$(USER_DIR)/lazytest.elf \
+		usertests:$(USER_DIR)/usertests.elf
 
 qemu: build fs.img
 	$(QEMU) $(QEMUOPTS)

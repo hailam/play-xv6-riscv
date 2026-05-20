@@ -95,8 +95,10 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             sys_kill(proc, pid).await
         }
         SYS_SBRK => {
-            let n = proc.trapframe().arg(0) as i64;
-            sys_sbrk(proc, n).await
+            let tf = proc.trapframe();
+            let n = tf.arg(0) as i64;
+            let lazy = tf.arg(1) as i64;
+            sys_sbrk(proc, n, lazy).await
         }
         SYS_MKDIR => {
             let path_va = proc.trapframe().arg(0) as usize;
@@ -130,15 +132,17 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
     }
 }
 
-/// Grow (or shrink) the user data segment by `n` bytes. Returns the
-/// OLD break (matches xv6 / classic `sbrk` semantics). On error
-/// returns `-1`.
+/// `char* sys_sbrk(int n, int lazy)` — xv6-compatible semantics:
+///   * Always returns the OLD break (the byte at the start of the
+///     freshly-allocated region).
+///   * `lazy == 0` (SBRK_EAGER) **or** `n < 0` → grow/shrink eagerly,
+///     allocating real frames now (or just updating size on shrink).
+///   * `lazy != 0` and `n >= 0` → just bump `proc.size`; the next
+///     access fault inside the grown range triggers `lazy_map_page`
+///     in `usertrap` which maps a zero frame on demand.
 ///
-/// Growth allocates fresh zero-filled frames and maps them URW
-/// starting at `ceil(old_break / PGSIZE)`. Shrink is currently a
-/// metadata-only update — pages aren't unmapped or freed. Reclaiming
-/// pages on shrink is tracked in `pending/09-vm-reaping`.
-async fn sys_sbrk(proc: &Arc<Proc>, n: i64) -> i64 {
+/// Returns `-1` on error (OOM, would-exceed-stack-guard, etc.).
+async fn sys_sbrk(proc: &Arc<Proc>, n: i64, lazy: i64) -> i64 {
     let old = proc.size.load(Ordering::Acquire);
     if n == 0 {
         return old as i64;
@@ -148,20 +152,42 @@ async fn sys_sbrk(proc: &Arc<Proc>, n: i64) -> i64 {
         if shrink > old {
             return -1;
         }
-        proc.size.store(old - shrink, Ordering::Release);
+        let new_size = old - shrink;
+        // Unmap every fully-shrunk page and return its frame to the
+        // pool. Without this, a subsequent `sbrk(+n)` for the same
+        // VA range would hit `VmError::Remap` and fail. xv6 does the
+        // same via `uvmdealloc` -> `uvmunmap`.
+        let start = (new_size + PGSIZE - 1) & !(PGSIZE - 1);
+        let end = (old + PGSIZE - 1) & !(PGSIZE - 1);
+        {
+            let mut pt = proc.pagetable.lock();
+            let mut va = start;
+            while va < end {
+                if let Some(pa) = pt.unmap_page(va) {
+                    unsafe { KFRAMES.free(pa) };
+                }
+                va += PGSIZE;
+            }
+        }
+        proc.size.store(new_size, Ordering::Release);
         return old as i64;
     }
     let new = match old.checked_add(n as usize) {
         Some(x) => x,
         None => return -1,
     };
-    // Reserve one page of guard between the heap top and the user
-    // stack so an overflowing malloc can't silently scribble on
-    // argv / the trapframe.
     let heap_top = STACK_VA_BASE.saturating_sub(PGSIZE);
     if new > heap_top {
         return -1;
     }
+    if lazy != 0 {
+        // Lazy path: just bump size. Pages get mapped on first
+        // access via `usertrap`'s lazy-fault handler.
+        proc.size.store(new, Ordering::Release);
+        return old as i64;
+    }
+
+    // Eager path.
     let start = (old + PGSIZE - 1) & !(PGSIZE - 1);
     let end = (new + PGSIZE - 1) & !(PGSIZE - 1);
     {
@@ -169,7 +195,6 @@ async fn sys_sbrk(proc: &Arc<Proc>, n: i64) -> i64 {
         let mut va = start;
         while va < end {
             let Some(pa) = KFRAMES.alloc_zeroed() else {
-                // Partial allocation leaks until vm-reaping lands.
                 return -1;
             };
             if pt.map(va, pa, PGSIZE, PtePerm::URW, &KFRAMES).is_err() {
@@ -180,6 +205,37 @@ async fn sys_sbrk(proc: &Arc<Proc>, n: i64) -> i64 {
     }
     proc.size.store(new, Ordering::Release);
     old as i64
+}
+
+/// Called from `usertrap` on a load/store page fault. Returns true
+/// if the fault was a "lazy region" miss and we mapped a fresh
+/// zero page (caller should resume the trapping instr by not
+/// advancing epc); false if the fault is genuinely illegal.
+pub fn lazy_map_page(proc: &Arc<Proc>, fault_va: usize) -> bool {
+    let size = proc.size.load(Ordering::Acquire);
+    if fault_va >= size {
+        return false;
+    }
+    let page = fault_va & !(PGSIZE - 1);
+    // Already mapped? Could happen if two harts faulted at once;
+    // bail rather than double-map.
+    {
+        let pt = proc.pagetable.lock();
+        if pt.translate(page).is_some() {
+            return true;
+        }
+    }
+    let Some(pa) = KFRAMES.alloc_zeroed() else {
+        return false;
+    };
+    let mut pt = proc.pagetable.lock();
+    if pt.map(page, pa, PGSIZE, PtePerm::URW, &KFRAMES).is_err() {
+        // Free the frame if mapping fails (only happens on Remap,
+        // which our check above already filtered).
+        unsafe { KFRAMES.free(pa) };
+        return false;
+    }
+    true
 }
 
 async fn sys_kill(_proc: &Arc<Proc>, pid: i32) -> i64 {

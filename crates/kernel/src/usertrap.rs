@@ -17,6 +17,8 @@ use hal_riscv64::csr_api::{
 };
 
 const SCAUSE_ECALL_FROM_U: usize = 8;
+const SCAUSE_LOAD_PAGE_FAULT: usize = 13;
+const SCAUSE_STORE_PAGE_FAULT: usize = 15;
 const SCAUSE_INTERRUPT: usize = 1usize << 63;
 const SCAUSE_TIMER: usize = 5;
 const SCAUSE_EXTERNAL: usize = 9;
@@ -64,22 +66,38 @@ pub extern "C" fn rust_usertrap() -> ! {
             _ => panic!("usertrap: unknown intr code {code}"),
         }
     } else {
-        // Unknown / faulting trap from user mode. xv6 prints a
-        // diagnostic and calls `setkilled(p)` rather than panicking
-        // the kernel — match that. `proc_main` notices `killed` after
-        // the next dispatch and routes through `sys_exit(-1)`.
         let stval = read_stval();
-        crate::println!(
-            "usertrap: pid {} scause={:#x} sepc={:#x} stval={:#x} -> killed",
-            proc.pid,
-            scause,
-            tf.epc(),
-            stval,
-        );
-        proc.killed.store(true, core::sync::atomic::Ordering::Release);
-        // Treat the trap as a timer event so `proc_main`'s post-event
-        // killed check runs.
-        TrapEvent::Timer
+
+        // First: is this a lazy-sbrk-allocated page? If so, map it
+        // and resume the trapping instruction by NOT advancing epc.
+        if (scause == SCAUSE_LOAD_PAGE_FAULT || scause == SCAUSE_STORE_PAGE_FAULT)
+            && {
+                // Reconstruct an Arc so `lazy_map_page` gets the same
+                // `&Arc<Proc>` shape the syscall layer uses.
+                let proc_arc = unsafe {
+                    let raw = proc as *const Proc;
+                    alloc::sync::Arc::increment_strong_count(raw);
+                    alloc::sync::Arc::from_raw(raw)
+                };
+                let ok = crate::syscall::lazy_map_page(&proc_arc, stval as usize);
+                // `proc_arc` drops here, restoring the strong count.
+                ok
+            }
+        {
+            TrapEvent::Timer
+        } else {
+            // Unknown / illegal fault. xv6 prints a diagnostic and
+            // calls `setkilled(p)`; match that, no panic.
+            crate::println!(
+                "usertrap: pid {} scause={:#x} sepc={:#x} stval={:#x} -> killed",
+                proc.pid,
+                scause,
+                tf.epc(),
+                stval,
+            );
+            proc.killed.store(true, core::sync::atomic::Ordering::Release);
+            TrapEvent::Timer
+        }
     };
 
     *proc.pending_trap.lock() = Some(event);

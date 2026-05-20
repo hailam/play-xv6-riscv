@@ -52,8 +52,13 @@ int   chdir(const char*);
 int   dup(int);
 int   getpid(void);
 char* sbrk(int);
+char* sbrklazy(int);
+char* sys_sbrk(int n, int lazy);   // raw syscall — prefer sbrk/sbrklazy
 int   sleep(int);
 int   uptime(void);
+
+#define SBRK_EAGER 0
+#define SBRK_LAZY  1
 
 // ulib.c
 char* strcpy(char*, const char*);

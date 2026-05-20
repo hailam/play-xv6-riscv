@@ -52,6 +52,8 @@ fn main() {
         ("ln", "LN_BIN_PATH", Lang::C, true),
         ("faulttest", "FAULTTEST_BIN_PATH", Lang::C, true),
         ("xv6test", "XV6TEST_BIN_PATH", Lang::C, true),
+        ("lazytest", "LAZYTEST_BIN_PATH", Lang::C, true),
+        ("usertests", "USERTESTS_BIN_PATH", Lang::C, true),
     ];
 
     for (name, env_var, lang, with_ulib) in programs {

@@ -230,6 +230,20 @@ impl PageTableOps for PageTable {
         Ok(())
     }
 
+    fn unmap_page(&mut self, va: usize) -> Option<usize> {
+        if va >= MAXVA || va & (PGSIZE - 1) != 0 {
+            return None;
+        }
+        let pte_ptr = self.walk(va, None)?;
+        let pte = unsafe { core::ptr::read(pte_ptr) };
+        if !pte.is_valid() || !pte.is_leaf() {
+            return None;
+        }
+        let pa = pte.pa() as usize;
+        unsafe { core::ptr::write(pte_ptr, Pte::empty()) };
+        Some(pa)
+    }
+
     fn translate(&self, va: usize) -> Option<(usize, PtePerm)> {
         if va >= MAXVA {
             return None;

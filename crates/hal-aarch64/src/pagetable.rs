@@ -45,6 +45,11 @@ impl PageTableOps for PageTable {
     fn translate(&self, _va: usize) -> Option<(usize, PtePerm)> {
         None
     }
+
+    fn unmap_page(&mut self, _va: usize) -> Option<usize> {
+        // Skeleton — real impl pairs with the populate path.
+        None
+    }
 }
 
 /// TTBR0_EL1 value for a given root. Skeleton — real impl encodes

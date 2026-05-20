@@ -133,6 +133,13 @@ pub trait PageTableOps: Sized {
 
     /// Translate a VA to (PA, perm), or None if unmapped.
     fn translate(&self, va: usize) -> Option<(usize, PtePerm)>;
+
+    /// Remove the leaf PTE at `va`. Returns the previously-mapped PA
+    /// (the caller decides whether to free it), or `None` if the VA
+    /// wasn't mapped to a leaf. Intermediate tables are left in
+    /// place — `Drop for PageTable` reclaims them on the next
+    /// teardown.
+    fn unmap_page(&mut self, va: usize) -> Option<usize>;
 }
 
 /// Trait for allocating page-table frames. The kernel owns the allocator;
