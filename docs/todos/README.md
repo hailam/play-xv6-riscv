@@ -10,13 +10,13 @@ directory contains a `README.md` with the plan/summary, plus optional
 
 | Bucket | Count | What's in it |
 |---|---|---|
-| `done/` | 27 | Through SMP — user procs visibly run on hart 0, 1, 2 |
-| `pending/` | 2 | Portability + phase-2 |
+| `done/` | 28 | Through aarch64-HAL skeleton — trait surface proven on a second arch |
+| `pending/` | 2 | Real aarch64 boot + phase-2 GUI |
 | `revisit/` | 3 | Decisions to potentially revisit later |
 
 ## Pending — priority order
 
-1. [11-aarch64-hal](pending/11-aarch64-hal/) — second HAL impl; prove the trait surface holds
+1. [14-aarch64-completion](pending/14-aarch64-completion/) — fill the skeleton, scrub kernel #[cfg]s, boot a shell under `qemu-system-aarch64`
 2. [12-phase2-gui](pending/12-phase2-gui/) — minimal framebuffer-backed display
 
 ## Done — chronological
@@ -50,10 +50,12 @@ directory contains a `README.md` with the plan/summary, plus optional
 | 24 | [sbrk-and-malloc](done/24-sbrk-and-malloc/) | +50 (+160 user) |
 | 25 | [vm-reaping](done/25-vm-reaping/) | +130 |
 | 26 | [smp-user-procs](done/26-smp-user-procs/) | +150 (+25 user) |
+| 27 | [aarch64-hal-skeleton](done/27-aarch64-hal-skeleton/) | +210 (hal-aarch64) |
 
 Current kernel totals: **~6,375 LoC, ~158 unsafe-ish lines** (~2.5%,
 well inside the 700-line budget). Plus ~270 LoC host code in `mkfs/`,
-~40 LoC in the shared `xv6-fs-layout` crate, and ~495 LoC user code.
+~40 LoC in the shared `xv6-fs-layout` crate, ~495 LoC user code, and
+~210 LoC in `hal-aarch64` (skeleton).
 
 ## Revisit
 

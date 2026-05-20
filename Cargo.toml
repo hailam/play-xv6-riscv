@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/hal", "crates/hal-riscv64", "crates/kernel", "crates/xv6-fs-layout", "mkfs"]
+members = ["crates/hal", "crates/hal-aarch64", "crates/hal-riscv64", "crates/kernel", "crates/xv6-fs-layout", "mkfs"]
 # `cargo build` from workspace root only builds the kernel; `mkfs` must
 # be built with `cargo build -p mkfs --target=<host>` (see Makefile) so
 # it doesn't pick up the riscv64 default target.
