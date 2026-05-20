@@ -10,15 +10,14 @@ directory contains a `README.md` with the plan/summary, plus optional
 
 | Bucket | Count | What's in it |
 |---|---|---|
-| `done/` | 26 | Through vm-reaping — free-frame count flat across 20× fork/exec/exit |
-| `pending/` | 3 | Portability + perf |
+| `done/` | 27 | Through SMP — user procs visibly run on hart 0, 1, 2 |
+| `pending/` | 2 | Portability + phase-2 |
 | `revisit/` | 3 | Decisions to potentially revisit later |
 
 ## Pending — priority order
 
-1. [10-smp-user-procs](pending/10-smp-user-procs/) — per-CPU executors with sticky `home_cpu`
-2. [11-aarch64-hal](pending/11-aarch64-hal/) — second HAL impl; prove the trait surface holds
-3. [12-phase2-gui](pending/12-phase2-gui/) — minimal framebuffer-backed display
+1. [11-aarch64-hal](pending/11-aarch64-hal/) — second HAL impl; prove the trait surface holds
+2. [12-phase2-gui](pending/12-phase2-gui/) — minimal framebuffer-backed display
 
 ## Done — chronological
 
@@ -50,10 +49,11 @@ directory contains a `README.md` with the plan/summary, plus optional
 | 23 | [sys-kill-cancellation](done/23-sys-kill-cancellation/) | +150 (+70 user) |
 | 24 | [sbrk-and-malloc](done/24-sbrk-and-malloc/) | +50 (+160 user) |
 | 25 | [vm-reaping](done/25-vm-reaping/) | +130 |
+| 26 | [smp-user-procs](done/26-smp-user-procs/) | +150 (+25 user) |
 
-Current kernel totals: **~6,225 LoC, ~158 unsafe-ish lines** (~2.5%,
+Current kernel totals: **~6,375 LoC, ~158 unsafe-ish lines** (~2.5%,
 well inside the 700-line budget). Plus ~270 LoC host code in `mkfs/`,
-~40 LoC in the shared `xv6-fs-layout` crate, and ~470 LoC user code.
+~40 LoC in the shared `xv6-fs-layout` crate, and ~495 LoC user code.
 
 ## Revisit
 

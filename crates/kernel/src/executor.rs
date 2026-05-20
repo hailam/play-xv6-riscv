@@ -1,14 +1,19 @@
-//! Single global async executor — Phase 4b/5a scope. Per-CPU sticky
-//! executors land in Phase 7 when SMP user procs come online.
+//! Per-CPU async executor with sticky `home_cpu`.
 //!
 //! Model:
-//!   * Each `Task` owns an `Arc<Proc>` and a heap-pinned `dyn Future`.
-//!   * `run()` is the kernel's main loop. It pops ready task ids, polls,
-//!     and after each poll checks `cpu::take_user_target()`. If set, it
-//!     transfers control to user mode (noreturn).
-//!   * `UserMode::poll` is the only place that sets `user_target`. It
-//!     returns `Pending` so the executor can `return_to_user` *outside*
-//!     of `poll` — leaving the task safely back in its slot.
+//!   * Each CPU owns a `PerCpuExec` (tasks Vec + ready VecDeque).
+//!   * `TaskId` encodes `(cpu, slot)` as one `u32`. The high 8 bits
+//!     are the home CPU, the low 24 bits index into that CPU's
+//!     `tasks` Vec. The encoding lets `wake(id)` and the RawWaker
+//!     find the right per-CPU queue without a global task table.
+//!   * `run()` is the kernel's main loop, one instance per hart. It
+//!     drains the local ready queue, polls each task, and after each
+//!     poll checks `cpu::take_user_target()` — if set, transfers
+//!     control to user mode (noreturn) on this hart.
+//!   * Cross-CPU wake: `wake(id)` decodes the home CPU and pushes
+//!     to that CPU's ready queue. If the home is a remote hart, the
+//!     remote hart picks it up on its next timer tick. (Proper IPI
+//!     plumbing is a follow-on — see [[ipi-plumbing]].)
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -21,7 +26,7 @@ use core::task::{Context, RawWaker, RawWakerVTable, Waker};
 
 use hal::Hal;
 
-use crate::arch::Arch;
+use crate::arch::{Arch, MAX_CPUS};
 use crate::cpu;
 use crate::proc::Proc;
 use crate::sync::SpinLock;
@@ -29,69 +34,129 @@ use crate::sync::SpinLock;
 pub type TaskId = u32;
 pub type FutureBox = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
+const CPU_BITS: u32 = 8;
+const SLOT_MASK: u32 = (1u32 << (32 - CPU_BITS)) - 1;
+
+#[inline]
+fn make_tid(cpu: usize, slot: u32) -> TaskId {
+    debug_assert!(cpu < MAX_CPUS);
+    debug_assert!(slot <= SLOT_MASK);
+    ((cpu as u32) << (32 - CPU_BITS)) | slot
+}
+
+#[inline]
+fn tid_cpu(tid: TaskId) -> usize {
+    (tid >> (32 - CPU_BITS)) as usize
+}
+
+#[inline]
+fn tid_slot(tid: TaskId) -> usize {
+    (tid & SLOT_MASK) as usize
+}
+
 struct Task {
     /// `None` for kernel-only tasks (no return-to-user, no current_proc).
     proc: Option<Arc<Proc>>,
     future: FutureBox,
 }
 
-struct Executor {
+struct PerCpuExec {
     tasks: SpinLock<Vec<Option<Task>>>,
     ready: SpinLock<VecDeque<TaskId>>,
-    next_id: AtomicU32,
+    next_slot: AtomicU32,
 }
 
-static EXECUTOR: Executor = Executor {
-    tasks: SpinLock::new(Vec::new()),
-    ready: SpinLock::new(VecDeque::new()),
-    next_id: AtomicU32::new(1),
-};
+impl PerCpuExec {
+    const fn new() -> Self {
+        Self {
+            tasks: SpinLock::new(Vec::new()),
+            ready: SpinLock::new(VecDeque::new()),
+            next_slot: AtomicU32::new(0),
+        }
+    }
+}
+
+static EXECUTORS: [PerCpuExec; MAX_CPUS] = [const { PerCpuExec::new() }; MAX_CPUS];
+
+fn current_exec() -> &'static PerCpuExec {
+    &EXECUTORS[Arch::hartid()]
+}
+
+/// Pick the home CPU for a new task: the one with the shortest
+/// ready queue right now. Cheap because forks are rare and
+/// `MAX_CPUS` is tiny.
+fn pick_home_cpu() -> usize {
+    let n = Arch::ncpus();
+    let mut best = 0usize;
+    let mut best_len = usize::MAX;
+    for c in 0..n {
+        let l = EXECUTORS[c].ready.lock().len();
+        if l < best_len {
+            best_len = l;
+            best = c;
+        }
+    }
+    best
+}
 
 pub fn spawn<F>(proc: Arc<Proc>, future_fn: F) -> TaskId
 where
     F: FnOnce(Arc<Proc>) -> FutureBox,
 {
-    let id = EXECUTOR.next_id.fetch_add(1, Ordering::Relaxed);
-    proc.task_id.store(id, Ordering::Relaxed);
+    let home = pick_home_cpu();
     let future = future_fn(proc.clone());
-    insert_task(id, Task { proc: Some(proc), future });
-    id
+    let tid = insert_task(home, Task { proc: Some(proc.clone()), future });
+    proc.task_id.store(tid, Ordering::Relaxed);
+    tid
 }
 
-/// Spawn a kernel-only task — no Proc, no return-to-user.
+/// Spawn a kernel-only task on a specific CPU — no Proc, no
+/// return-to-user. Used at boot (bringup pinned to hart 0).
+pub fn spawn_kernel_on<F>(cpu: usize, future_fn: F) -> TaskId
+where
+    F: FnOnce() -> FutureBox,
+{
+    insert_task(cpu, Task { proc: None, future: future_fn() })
+}
+
+/// Spawn a kernel-only task; picks the least-loaded CPU.
 pub fn spawn_kernel<F>(future_fn: F) -> TaskId
 where
     F: FnOnce() -> FutureBox,
 {
-    let id = EXECUTOR.next_id.fetch_add(1, Ordering::Relaxed);
-    let future = future_fn();
-    insert_task(id, Task { proc: None, future });
-    id
+    spawn_kernel_on(pick_home_cpu(), future_fn)
 }
 
-fn insert_task(id: TaskId, task: Task) {
+fn insert_task(home: usize, task: Task) -> TaskId {
+    let exec = &EXECUTORS[home];
+    let slot = exec.next_slot.fetch_add(1, Ordering::Relaxed);
+    let tid = make_tid(home, slot);
     {
-        let mut tasks = EXECUTOR.tasks.lock();
-        while tasks.len() <= id as usize {
+        let mut tasks = exec.tasks.lock();
+        while tasks.len() <= slot as usize {
             tasks.push(None);
         }
-        tasks[id as usize] = Some(task);
+        tasks[slot as usize] = Some(task);
     }
-    EXECUTOR.ready.lock().push_back(id);
+    exec.ready.lock().push_back(tid);
+    tid
 }
 
 pub fn wake(id: TaskId) {
-    EXECUTOR.ready.lock().push_back(id);
+    EXECUTORS[tid_cpu(id)].ready.lock().push_back(id);
+    // No cross-hart IPI yet — a remote hart picks it up on its
+    // next timer tick. [[ipi-plumbing]]
 }
 
-/// Linear scan of all live tasks for one whose proc has `pid`. Used
-/// by `sys_kill`; N is tiny.
+/// Linear scan over all per-CPU task tables for a proc with `pid`.
 pub fn find_proc_by_pid(pid: usize) -> Option<Arc<Proc>> {
-    let tasks = EXECUTOR.tasks.lock();
-    for t in tasks.iter().flatten() {
-        if let Some(p) = t.proc.as_ref() {
-            if p.pid == pid {
-                return Some(Arc::clone(p));
+    for c in 0..MAX_CPUS {
+        let tasks = EXECUTORS[c].tasks.lock();
+        for t in tasks.iter().flatten() {
+            if let Some(p) = t.proc.as_ref() {
+                if p.pid == pid {
+                    return Some(Arc::clone(p));
+                }
             }
         }
     }
@@ -99,22 +164,25 @@ pub fn find_proc_by_pid(pid: usize) -> Option<Arc<Proc>> {
 }
 
 pub fn run() -> ! {
-    // We enter `run` at the top of a kernel stack with no locks held —
-    // either from kmain (where intr_on was already called) or from
-    // `rust_usertrap` (where the hardware cleared sstatus.SIE on trap
-    // entry). Force interrupts on so a wfi here can be woken by the
-    // timer.
     unsafe { Arch::intr_on() };
+    let exec = current_exec();
     loop {
-        let tid = EXECUTOR.ready.lock().pop_front();
+        let tid = exec.ready.lock().pop_front();
         let Some(tid) = tid else {
             unsafe { Arch::wfi() };
             continue;
         };
+        // A foreign hart may have enqueued a tid whose home is us,
+        // or — defensively — a stale tid for us. Drop tids that
+        // aren't ours.
+        if tid_cpu(tid) != Arch::hartid() {
+            // Forward to the rightful owner.
+            EXECUTORS[tid_cpu(tid)].ready.lock().push_back(tid);
+            continue;
+        }
 
-        // Take the task out of the slot for exclusive ownership during poll
-        // (so e.g. sys_fork can safely re-enter `spawn`, which locks tasks).
-        let mut task = match EXECUTOR.tasks.lock().get_mut(tid as usize).and_then(|o| o.take()) {
+        let slot = tid_slot(tid);
+        let mut task = match exec.tasks.lock().get_mut(slot).and_then(|o| o.take()) {
             Some(t) => t,
             None => continue,
         };
@@ -130,16 +198,12 @@ pub fn run() -> ! {
         let poll = task.future.as_mut().poll(&mut cx);
 
         if poll.is_pending() {
-            // Put the task back BEFORE potentially noreturning into
-            // user mode. If it completed, just leave the slot empty;
-            // a stale waker firing later will then find `None` and
-            // skip the task.
-            EXECUTOR.tasks.lock()[tid as usize] = Some(task);
+            exec.tasks.lock()[slot] = Some(task);
         }
 
         if let Some(target) = cpu::take_user_target() {
             // SAFETY: target points into a `Proc` owned by an `Arc` in
-            // `EXECUTOR.tasks`. Procs live forever in Phase 4b/5a.
+            // the per-CPU `tasks` table; Procs live until parent reaps.
             unsafe {
                 crate::usertrap::return_to_user(&*target);
             }
@@ -149,8 +213,6 @@ pub fn run() -> ! {
 
 fn task_waker(tid: TaskId) -> Waker {
     let raw = RawWaker::new(tid as usize as *const (), &VTABLE);
-    // SAFETY: VTABLE matches RawWaker contract (clone/wake idempotent,
-    // wake_by_ref does not free, drop is a no-op since data is an integer).
     unsafe { Waker::from_raw(raw) }
 }
 

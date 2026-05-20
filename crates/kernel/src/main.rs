@@ -73,15 +73,17 @@ pub extern "C" fn kmain() -> ! {
     println!("hart {} up, paging on", id);
 
     if id == 0 {
-        executor::spawn_kernel(|| alloc::boxed::Box::pin(bringup_then_init()));
-        unsafe { Arch::intr_on() };
-        executor::run();
+        // Pin bringup to hart 0 so the load-balanced fork later can't
+        // accidentally land it on a hart whose plumbing isn't up yet.
+        executor::spawn_kernel_on(0, || {
+            alloc::boxed::Box::pin(bringup_then_init())
+        });
     }
-
+    // Every hart runs its own executor loop. Tasks are assigned a
+    // sticky home_cpu at spawn time; this loop drains only the local
+    // ready queue.
     unsafe { Arch::intr_on() };
-    loop {
-        unsafe { Arch::wfi() }
-    }
+    executor::run();
 }
 
 async fn bringup_then_init() {

@@ -236,8 +236,9 @@ async fn sys_exit_inner(proc: &Arc<Proc>, code: i32) -> i64 {
         p.wait_waker.wake();
     }
     crate::println!(
-        "pid {} exit({code}) kalloc.free={}",
+        "pid {} exit({code}) on hart {} kalloc.free={}",
         proc.pid,
+        Arch::hartid(),
         KFRAMES.free_count(),
     );
     0
