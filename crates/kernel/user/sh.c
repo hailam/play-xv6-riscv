@@ -12,7 +12,7 @@
 
 extern int   fork(void);
 extern __attribute__((noreturn)) void exit(int);
-extern int   wait(void);
+extern int   wait(int* status);
 extern int   pipe(int*);
 extern int   read(int, void*, int);
 extern int   exec(const char*, char* const argv[]);
@@ -124,7 +124,7 @@ static void run_simple(char* line) {
         write(2, "exec failed\n", 12);
         exit(-1);
     }
-    wait();
+    wait(0);
 }
 
 static void run_pipeline(char* left, char* right) {
@@ -154,7 +154,7 @@ static void run_pipeline(char* left, char* right) {
         exit(-1);
     }
     close(p[0]); close(p[1]);
-    wait(); wait();
+    wait(0); wait(0);
 }
 
 int main(void) {

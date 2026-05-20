@@ -3,7 +3,7 @@
 
 extern int fork(void);
 extern void exit(int);
-extern int wait(void);
+extern int wait(int* status);
 extern int sleep(int);
 extern int kill(int);
 extern int write(int, const void*, int);
@@ -43,10 +43,12 @@ int main(void) {
     write(1, "\n", 1);
     if (kill(pid) < 0) {
         write(1, "killtest: kill syscall failed\n", 30);
-        wait();
+        wait(0);
         return -1;
     }
-    int code = wait();
+    int status = 0;
+    int reaped = wait(&status);
+    int code = (reaped == pid) ? status : -1;
     write(1, "killtest: child reaped, exit=", 29);
     put_int(code);
     write(1, "\n", 1);

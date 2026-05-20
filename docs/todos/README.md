@@ -11,13 +11,23 @@ directory contains a `README.md` with the plan/summary, plus optional
 | Bucket | Count | What's in it |
 |---|---|---|
 | `done/` | 29 | Through fs polish — cwd, chdir, hard links, sh `>` redirect |
-| `pending/` | 2 | Real aarch64 boot + phase-2 GUI |
+| `pending/` | 4 | xv6 compat + aarch64 boot + POSIX track + phase-2 GUI |
 | `revisit/` | 3 | Decisions to potentially revisit later |
 
 ## Pending — priority order
 
-1. [14-aarch64-completion](pending/14-aarch64-completion/) — fill the skeleton, scrub kernel #[cfg]s, boot a shell under `qemu-system-aarch64`
-2. [12-phase2-gui](pending/12-phase2-gui/) — minimal framebuffer-backed display
+1. [15-xv6-compat](pending/15-xv6-compat/) — **NEXT** — close the
+   real ABI gaps (BSIZE, stat layout, LOGSIZE, wait sig, user
+   faults), port xv6's `ulib.c` + `printf.c`, then run xv6's
+   `usertests` as a real stress harness.
+2. [14-aarch64-completion](pending/14-aarch64-completion/) — fill
+   the skeleton, scrub remaining `#[cfg]`s behind a
+   `TrapPlumbing` trait, boot a shell under `qemu-system-aarch64`.
+3. [16-posix-compat](pending/16-posix-compat/) — POSIX-ish track:
+   permissions, signals, env/argv, libc port (newlib/musl). Index
+   of multiple sub-todos; not a single deliverable.
+4. [12-phase2-gui](pending/12-phase2-gui/) — minimal
+   framebuffer-backed display.
 
 ## Done — chronological
 

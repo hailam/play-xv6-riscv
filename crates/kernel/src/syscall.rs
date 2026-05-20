@@ -36,7 +36,10 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let code = proc.trapframe().arg(0) as i32;
             sys_exit_inner(proc, code).await
         }
-        SYS_WAIT => sys_wait(proc).await,
+        SYS_WAIT => {
+            let status_va = proc.trapframe().arg(0) as usize;
+            sys_wait(proc, status_va).await
+        }
         SYS_WRITE => {
             let tf = proc.trapframe();
             let fd = tf.arg(0) as i32;
@@ -250,8 +253,22 @@ async fn sys_exit_inner(proc: &Arc<Proc>, code: i32) -> i64 {
     0
 }
 
-async fn sys_wait(proc: &Arc<Proc>) -> i64 {
-    Wait { proc }.await
+/// xv6 `int wait(int *status)` semantics: returns the reaped
+/// child's pid (or -1 if there are no children / killed). If
+/// `status_va != 0`, the child's exit code is written through that
+/// user pointer.
+async fn sys_wait(proc: &Arc<Proc>, status_va: usize) -> i64 {
+    let (pid, code) = match (Wait { proc }).await {
+        Some(t) => t,
+        None => return -1,
+    };
+    if status_va != 0 {
+        let Some(kva) = proc.translate_user(status_va) else {
+            return -1;
+        };
+        unsafe { *(kva as *mut i32) = code };
+    }
+    pid as i64
 }
 
 struct Wait<'a> {
@@ -259,11 +276,11 @@ struct Wait<'a> {
 }
 
 impl Future for Wait<'_> {
-    type Output = i64;
+    type Output = Option<(usize, i32)>; // (pid, exit_code) or None on error / killed
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i64> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<(usize, i32)>> {
         if self.proc.killed.load(Ordering::Acquire) {
-            return Poll::Ready(-1);
+            return Poll::Ready(None);
         }
         self.proc.wait_waker.register(cx.waker());
         let mut children = self.proc.children.lock();
@@ -276,11 +293,12 @@ impl Future for Wait<'_> {
         }
         if let Some(i) = zombie_idx {
             let dead = children.remove(i);
-            let code = dead.exit_code.load(Ordering::Relaxed) as i64;
-            return Poll::Ready(code);
+            let pid = dead.pid;
+            let code = dead.exit_code.load(Ordering::Relaxed);
+            return Poll::Ready(Some((pid, code)));
         }
         if children.is_empty() {
-            return Poll::Ready(-1);
+            return Poll::Ready(None);
         }
         Poll::Pending
     }

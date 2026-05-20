@@ -24,9 +24,11 @@ fn main() {
         let _ = std::fs::create_dir_all(ud);
     }
 
-    let ulib_obj    = compile_to_obj(&out_dir, "ulib", Lang::Asm);
-    let umalloc_obj = compile_to_obj(&out_dir, "umalloc", Lang::C);
-    let user_objs   = vec![ulib_obj, umalloc_obj];
+    let ulib_asm_obj = compile_to_obj(&out_dir, "ulib", Lang::Asm);
+    let ulib_c_obj   = compile_to_obj(&out_dir, "ulib", Lang::C);
+    let umalloc_obj  = compile_to_obj(&out_dir, "umalloc", Lang::C);
+    let printf_obj   = compile_to_obj(&out_dir, "printf", Lang::C);
+    let user_objs    = vec![ulib_asm_obj, ulib_c_obj, umalloc_obj, printf_obj];
 
     // Only `initcode` is `include_bytes!`'d into the kernel; every
     // other binary now lives on disk and is loaded via `sys_exec`.
@@ -48,6 +50,8 @@ fn main() {
         ("malloctest", "MALLOCTEST_BIN_PATH", Lang::C, true),
         ("smptest", "SMPTEST_BIN_PATH", Lang::C, true),
         ("ln", "LN_BIN_PATH", Lang::C, true),
+        ("faulttest", "FAULTTEST_BIN_PATH", Lang::C, true),
+        ("xv6test", "XV6TEST_BIN_PATH", Lang::C, true),
     ];
 
     for (name, env_var, lang, with_ulib) in programs {
@@ -61,12 +65,12 @@ fn main() {
 }
 
 fn compile_to_obj(out_dir: &Path, name: &str, lang: Lang) -> PathBuf {
-    let src = match lang {
-        Lang::Asm => format!("user/{name}.S"),
-        Lang::C => format!("user/{name}.c"),
+    let (src, obj_name) = match lang {
+        Lang::Asm => (format!("user/{name}.S"), format!("{name}-S.o")),
+        Lang::C => (format!("user/{name}.c"), format!("{name}-c.o")),
     };
     println!("cargo:rerun-if-changed={src}");
-    let obj = out_dir.join(format!("{name}.o"));
+    let obj = out_dir.join(obj_name);
     match lang {
         Lang::Asm => run("riscv64-elf-gcc", &[
             "-march=rv64gc", "-mabi=lp64",

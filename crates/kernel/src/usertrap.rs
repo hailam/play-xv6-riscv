@@ -64,13 +64,22 @@ pub extern "C" fn rust_usertrap() -> ! {
             _ => panic!("usertrap: unknown intr code {code}"),
         }
     } else {
+        // Unknown / faulting trap from user mode. xv6 prints a
+        // diagnostic and calls `setkilled(p)` rather than panicking
+        // the kernel — match that. `proc_main` notices `killed` after
+        // the next dispatch and routes through `sys_exit(-1)`.
         let stval = read_stval();
-        panic!(
-            "usertrap: scause={:#x} sepc={:#x} stval={:#x}",
+        crate::println!(
+            "usertrap: pid {} scause={:#x} sepc={:#x} stval={:#x} -> killed",
+            proc.pid,
             scause,
             tf.epc(),
-            stval
+            stval,
         );
+        proc.killed.store(true, core::sync::atomic::Ordering::Release);
+        // Treat the trap as a timer event so `proc_main`'s post-event
+        // killed check runs.
+        TrapEvent::Timer
     };
 
     *proc.pending_trap.lock() = Some(event);

@@ -6,7 +6,7 @@
 
 extern int  fork(void);
 extern void exit(int);
-extern int  wait(void);
+extern int  wait(int* status);
 extern int  sleep(int);
 extern int  write(int, const void*, int);
 
@@ -23,7 +23,7 @@ int main(void) {
             exit(0);
         }
     }
-    for (int i = 0; i < N; i++) wait();
+    for (int i = 0; i < N; i++) wait(0);
     const char* msg = "smptest: all done\n";
     int n = 0; while (msg[n]) n++;
     write(1, msg, n);
