@@ -34,6 +34,11 @@ pub const NOFILE: usize = 16;
 #[repr(i32)]
 pub enum ProcState {
     Runnable = 0,
+    // `Running` is not written today — the async executor knows
+    // which proc is being polled via `cpu::current_proc`, and
+    // procs are otherwise `Runnable` or `Zombie`. Kept around for
+    // ABI parity with xv6 / future tooling.
+    #[allow(dead_code)]
     Running = 1,
     Zombie = 2,
 }

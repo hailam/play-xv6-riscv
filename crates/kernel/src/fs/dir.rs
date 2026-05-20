@@ -168,8 +168,10 @@ pub async fn dir_is_empty(dir: &LockedInode<'_>) -> bool {
     true
 }
 
-/// Helper for iterating directory entries (used by the boot smoke test
-/// to list `/`).
+/// Helper for iterating directory entries. Currently only the
+/// boot-time smoke test calls it; the userspace `/ls` does its own
+/// iteration via `readi`. Kept available for kernel-side debug.
+#[allow(dead_code)]
 pub async fn for_each_entry<F: FnMut(u32, &str)>(
     dir: &LockedInode<'_>,
     mut visit: F,

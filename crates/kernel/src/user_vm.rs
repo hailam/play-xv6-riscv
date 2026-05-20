@@ -39,6 +39,8 @@ pub struct UserImage {
 pub enum UserVmError {
     Oom,
     MapFailed,
+    // ElfError payload is for `Debug` output on exec failure.
+    #[allow(dead_code)]
     Elf(elf::ElfError),
 }
 

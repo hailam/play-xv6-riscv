@@ -88,6 +88,7 @@ impl<'a> LockedInode<'a> {
         // `&InodeState` is live through `state()`.
         unsafe { &mut *self.inode.state.get() }
     }
+    #[allow(dead_code)] // exposed for completeness; current callers use `inum`/`dev`
     pub fn inode(&self) -> &Arc<Inode> {
         self.inode
     }

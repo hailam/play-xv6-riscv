@@ -128,13 +128,10 @@ where
     insert_task(cpu, Task { proc: None, future: future_fn() })
 }
 
-/// Spawn a kernel-only task; picks the least-loaded CPU.
-pub fn spawn_kernel<F>(future_fn: F) -> TaskId
-where
-    F: FnOnce() -> FutureBox,
-{
-    spawn_kernel_on(pick_home_cpu(), future_fn)
-}
+// `spawn_kernel` (auto-balanced) was used in the original
+// single-executor design. With per-CPU executors, every current
+// caller knows which hart it wants — they all use `spawn_kernel_on`.
+// Re-add this if a future task genuinely doesn't care.
 
 fn insert_task(home: usize, task: Task) -> TaskId {
     let exec = &EXECUTORS[home];

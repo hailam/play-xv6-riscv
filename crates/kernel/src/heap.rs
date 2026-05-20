@@ -9,8 +9,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 const HEAP_SIZE: usize = 1024 * 1024;
 
+// The buffer is only accessed through the bump allocator's
+// `core::ptr::write` path; the inner field is intentionally unread.
 #[repr(align(16))]
-struct HeapBuf([u8; HEAP_SIZE]);
+struct HeapBuf(#[allow(dead_code)] [u8; HEAP_SIZE]);
 
 static mut HEAP_BUF: HeapBuf = HeapBuf([0; HEAP_SIZE]);
 

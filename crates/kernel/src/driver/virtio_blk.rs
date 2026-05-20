@@ -188,6 +188,9 @@ pub static IO_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[derive(Debug)]
 pub enum DiskError {
     NoFreeDescriptor,
+    // Status payload is for `Debug`-printing on panic; it intentionally
+    // isn't read by code so silence the dead-code warning.
+    #[allow(dead_code)]
     Status(u8),
 }
 
@@ -257,9 +260,9 @@ pub fn init() {
 
     crate::println!(
         "virtio_blk: ready (desc@{:#x} avail@{:#x} used@{:#x})",
-        unsafe { addr_of!(DESC) as usize },
-        unsafe { addr_of!(AVAIL) as usize },
-        unsafe { addr_of!(USED) as usize },
+        addr_of!(DESC) as usize,
+        addr_of!(AVAIL) as usize,
+        addr_of!(USED) as usize,
     );
 }
 
@@ -310,6 +313,9 @@ fn free_chain(state: &mut DiskState, head: usize) {
 
 // ---------- read / write --------------------------------------------------
 
+// Kept as an early-boot diagnostic fallback (see `revisit/sync-virtio-fallback`).
+// No live callers in the async path.
+#[allow(dead_code)]
 pub fn sync_read_block(sector: u64, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), DiskError> {
     let head = submit_chain(sector, buf.as_mut_ptr(), false)?;
     // Spin-with-wfi until IRQ flips our completion flag.
