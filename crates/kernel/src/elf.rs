@@ -46,9 +46,17 @@ const PF_W: u32 = 2;
 const PF_R: u32 = 4;
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 
+// e_machine value we accept on this build. ELF spec, "Machine
+// architecture": EM_RISCV=243, EM_AARCH64=183.
+#[cfg(target_arch = "riscv64")]
+const EXPECTED_MACHINE: u16 = 243;
+#[cfg(target_arch = "aarch64")]
+const EXPECTED_MACHINE: u16 = 183;
+
 #[derive(Debug)]
 pub enum ElfError {
     NotElf,
+    WrongArch,
     Truncated,
     Oom,
     MapFailed,
@@ -73,6 +81,10 @@ pub fn load_program(
     let hdr: Elf64Hdr = unsafe {
         core::ptr::read_unaligned(elf.as_ptr() as *const Elf64Hdr)
     };
+    let e_machine = hdr.e_machine;
+    if e_machine != EXPECTED_MACHINE {
+        return Err(ElfError::WrongArch);
+    }
     let entry = hdr.e_entry as usize;
     let phoff = hdr.e_phoff as usize;
     let phentsize = hdr.e_phentsize as usize;

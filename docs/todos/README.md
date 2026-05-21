@@ -10,23 +10,20 @@ directory contains a `README.md` with the plan/summary, plus optional
 
 | Bucket | Count | What's in it |
 |---|---|---|
-| `done/` | 29 | Through fs polish — cwd, chdir, hard links, sh `>` redirect |
-| `pending/` | 4 | xv6 compat + aarch64 boot + POSIX track + phase-2 GUI |
+| `done/` | 30 | Through aarch64 SMP — Phase A-F complete, interactive shell on -smp 4 |
+| `pending/` | 3 | xv6 compat tail + POSIX track + phase-2 GUI |
 | `revisit/` | 3 | Decisions to potentially revisit later |
 
 ## Pending — priority order
 
-1. [15-xv6-compat](pending/15-xv6-compat/) — **NEXT** — close the
-   real ABI gaps (BSIZE, stat layout, LOGSIZE, wait sig, user
-   faults), port xv6's `ulib.c` + `printf.c`, then run xv6's
-   `usertests` as a real stress harness.
-2. [14-aarch64-completion](pending/14-aarch64-completion/) — fill
-   the skeleton, scrub remaining `#[cfg]`s behind a
-   `TrapPlumbing` trait, boot a shell under `qemu-system-aarch64`.
-3. [16-posix-compat](pending/16-posix-compat/) — POSIX-ish track:
-   permissions, signals, env/argv, libc port (newlib/musl). Index
-   of multiple sub-todos; not a single deliverable.
-4. [12-phase2-gui](pending/12-phase2-gui/) — minimal
+1. [15-xv6-compat](pending/15-xv6-compat/) — close remaining
+   cross-mount gaps (G1/G3/G9) and the lost-free-pages soft check
+   under `usertests`.
+2. [16-posix-compat](pending/16-posix-compat/) — **NEXT** —
+   POSIX-ish track: permissions, signals, env/argv, libc port
+   (newlib/musl). Index of multiple sub-todos; not a single
+   deliverable.
+3. [12-phase2-gui](pending/12-phase2-gui/) — minimal
    framebuffer-backed display.
 
 ## Done — chronological
@@ -62,6 +59,7 @@ directory contains a `README.md` with the plan/summary, plus optional
 | 26 | [smp-user-procs](done/26-smp-user-procs/) | +150 (+25 user) |
 | 27 | [aarch64-hal-skeleton](done/27-aarch64-hal-skeleton/) | +210 (hal-aarch64) |
 | 28 | [fs-polish](done/28-fs-polish/) | +180 (+80 user) |
+| 29 | [aarch64-completion](done/14-aarch64-completion/) | +1500 (hal-aarch64 + user-aarch64) — boots interactive shell under qemu-system-aarch64 -smp 4 |
 
 Current kernel totals: **~6,555 LoC, ~158 unsafe-ish lines** (~2.4%,
 well inside the 700-line budget). Plus ~270 LoC host code in `mkfs/`,

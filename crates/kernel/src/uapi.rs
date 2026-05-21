@@ -22,6 +22,14 @@ pub const SYS_UNLINK: usize = 18;
 pub const SYS_LINK: usize = 19;
 pub const SYS_MKDIR: usize = 20;
 pub const SYS_CLOSE: usize = 21;
+pub const SYS_LSEEK: usize = 22;
+pub const SYS_PREAD: usize = 23;
+pub const SYS_PWRITE: usize = 24;
+
+// lseek "whence" values — POSIX-standard.
+pub const SEEK_SET: i32 = 0; // absolute offset
+pub const SEEK_CUR: i32 = 1; // current + offset
+pub const SEEK_END: i32 = 2; // EOF + offset
 
 // open() flags (matches xv6 `kernel/fcntl.h`).
 pub const O_RDONLY: u32 = 0x000;

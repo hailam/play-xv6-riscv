@@ -63,6 +63,10 @@ pub unsafe fn init_for_hart(uart_irq: usize, virtio_irq: usize, timer_ppi: usize
         enable_irq(uart_irq);
         enable_irq(virtio_irq);
         enable_irq(timer_ppi);
+        // SGI #0 is our IPI. SGIs are banked per-hart in the same
+        // ISENABLER0 (low 16 bits); every hart needs to enable its
+        // own copy to actually receive cross-hart wakers.
+        enable_irq(0);
     }
 }
 

@@ -46,6 +46,11 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 pub extern "C" fn kmain() -> ! {
     let id = Arch::hartid();
     if id == 0 {
+        // Bring the UART up before the first println — otherwise the
+        // boot banner is emitted while the device is disabled and
+        // (on aarch64 PL011) QEMU spews "data written to disabled
+        // UART" warnings into the trace.
+        unsafe { Arch::init_console() };
         println!();
         // "S-mode" on riscv, "EL1" on aarch64 — same semantic level
         // (supervisor). Print a neutral phrase so the line is
@@ -62,11 +67,14 @@ pub extern "C" fn kmain() -> ! {
         unsafe { Arch::install_free_frame(kernel_free_frame) };
         vm::init_and_install();
         println!("kvm: installed (satp={:#x})", vm::kernel_satp());
-        unsafe { Arch::init_console() };
         unsafe { Arch::init_intc_global() };
         driver::virtio_blk::init();
         driver::bio::init();
         STARTED.store(true, Ordering::Release);
+        // Now that paging + interrupts + drivers are up on hart 0,
+        // ask secondary harts to come online (no-op on platforms
+        // where firmware already started them at `_entry`).
+        unsafe { Arch::start_secondary_harts(Arch::ncpus()) };
     } else {
         while !STARTED.load(Ordering::Acquire) {
             core::hint::spin_loop();

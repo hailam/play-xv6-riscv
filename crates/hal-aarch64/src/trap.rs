@@ -78,7 +78,13 @@ pub extern "C" fn rust_kerneltrap_irq() {
     if gic::is_spurious(intid) {
         return;
     }
-    if (intid as usize) == VIRT_TIMER_PPI {
+    if intid < 16 {
+        // SGI (Software-Generated Interrupt) — our cross-hart IPI.
+        // The recipient doesn't need to *do* anything explicit; the
+        // ack here exits `wfi` and the executor's run loop picks up
+        // any newly-queued tasks on its next iteration. Just claim
+        // and complete.
+    } else if (intid as usize) == VIRT_TIMER_PPI {
         // Push the deadline far out so we don't re-fire inside the
         // hook. The kernel's `kernel_on_timer` (and `arm_timer`) will
         // re-program the proper next tick.

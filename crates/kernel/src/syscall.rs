@@ -21,10 +21,10 @@ use crate::user_vm::STACK_VA_BASE;
 
 type TrapFrame = <Arch as Hal>::TrapFrame;
 use crate::uapi::{
-    Stat, O_CREATE, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SYS_CHDIR, SYS_CLOSE, SYS_DUP,
-    SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FSTAT, SYS_GETPID, SYS_KILL, SYS_LINK, SYS_MKDIR,
-    SYS_MKNOD, SYS_OPEN, SYS_PIPE, SYS_READ, SYS_SBRK, SYS_SLEEP, SYS_UNLINK, SYS_UPTIME,
-    SYS_WAIT, SYS_WRITE,
+    Stat, O_CREATE, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_END, SEEK_SET,
+    SYS_CHDIR, SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FSTAT, SYS_GETPID,
+    SYS_KILL, SYS_LINK, SYS_LSEEK, SYS_MKDIR, SYS_MKNOD, SYS_OPEN, SYS_PIPE, SYS_PREAD,
+    SYS_PWRITE, SYS_READ, SYS_SBRK, SYS_SLEEP, SYS_UNLINK, SYS_UPTIME, SYS_WAIT, SYS_WRITE,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -96,8 +96,13 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
         }
         SYS_SBRK => {
             let tf = proc.trapframe();
-            let n = tf.arg(0) as i64;
-            let lazy = tf.arg(1) as i64;
+            // sbrk takes `int` in C — must sign-extend from the lower
+            // 32 bits because AArch64's AAPCS64 leaves the upper half
+            // of an argument register unspecified for 32-bit args.
+            // (On RISC-V the calling convention sign-extends already,
+            // so this is a no-op there.)
+            let n = tf.arg(0) as i32 as i64;
+            let lazy = tf.arg(1) as i32 as i64;
             sys_sbrk(proc, n, lazy).await
         }
         SYS_MKDIR => {
@@ -124,6 +129,32 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let old_va = tf.arg(0) as usize;
             let new_va = tf.arg(1) as usize;
             sys_link(proc, old_va, new_va).await
+        }
+        SYS_LSEEK => {
+            let tf = proc.trapframe();
+            let fd = tf.arg(0) as i32;
+            // off_t is 64-bit. AAPCS64 / RISC-V both pass it whole
+            // in a single 64-bit register, so no sign-extension dance
+            // here — unlike the 32-bit `int n` in sbrk.
+            let offset = tf.arg(1) as i64;
+            let whence = tf.arg(2) as i32;
+            sys_lseek(proc, fd, offset, whence).await
+        }
+        SYS_PREAD => {
+            let tf = proc.trapframe();
+            let fd = tf.arg(0) as i32;
+            let buf_va = tf.arg(1) as usize;
+            let len = tf.arg(2) as usize;
+            let offset = tf.arg(3) as i64;
+            sys_pread(proc, fd, buf_va, len, offset).await
+        }
+        SYS_PWRITE => {
+            let tf = proc.trapframe();
+            let fd = tf.arg(0) as i32;
+            let buf_va = tf.arg(1) as usize;
+            let len = tf.arg(2) as usize;
+            let offset = tf.arg(3) as i64;
+            sys_pwrite(proc, fd, buf_va, len, offset).await
         }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
@@ -195,9 +226,26 @@ async fn sys_sbrk(proc: &Arc<Proc>, n: i64, lazy: i64) -> i64 {
         let mut va = start;
         while va < end {
             let Some(pa) = KFRAMES.alloc_zeroed() else {
+                // Roll back any pages we've successfully mapped so far
+                // in this call, so a failed grow doesn't leak.
+                let mut rb = start;
+                while rb < va {
+                    if let Some(p) = pt.unmap_page(rb) {
+                        unsafe { KFRAMES.free(p) };
+                    }
+                    rb += PGSIZE;
+                }
                 return -1;
             };
             if pt.map(va, pa, PGSIZE, PtePerm::URW, &KFRAMES).is_err() {
+                unsafe { KFRAMES.free(pa) };
+                let mut rb = start;
+                while rb < va {
+                    if let Some(p) = pt.unmap_page(rb) {
+                        unsafe { KFRAMES.free(p) };
+                    }
+                    rb += PGSIZE;
+                }
                 return -1;
             }
             va += PGSIZE;
@@ -571,6 +619,128 @@ async fn sys_pipe(proc: &Arc<Proc>, pipefd_va: usize) -> i64 {
 
 async fn sys_close(proc: &Arc<Proc>, fd: i32) -> i64 {
     proc.close_fd(fd)
+}
+
+/// POSIX `pread(fd, buf, len, off)`. Reads `len` bytes from the
+/// inode backing `fd` starting at `off`, **without** advancing the
+/// file's offset. Only valid on `File::Inode` (pipes/console: -1).
+async fn sys_pread(
+    proc: &Arc<Proc>,
+    fd: i32,
+    buf_va: usize,
+    len: usize,
+    offset: i64,
+) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+    if offset < 0 || offset > u32::MAX as i64 {
+        return -1;
+    }
+    let Some(file) = proc.get_file(fd) else {
+        return -1;
+    };
+    let File::Inode {
+        ip, readable, ..
+    } = &*file
+    else {
+        return -1;
+    };
+    if !*readable {
+        return -1;
+    }
+    let cur = offset as u32;
+    let mut tmp = alloc::vec![0u8; len];
+    let li = fs::inode::ilock(ip).await;
+    let n = fs::inode::readi(&li, &mut tmp, cur).await;
+    drop(li);
+    if n == 0 {
+        return 0;
+    }
+    let mut copied = 0usize;
+    while copied < n {
+        let Some(kva) = proc.translate_user_write(buf_va + copied) else {
+            return -1;
+        };
+        unsafe { *(kva as *mut u8) = tmp[copied] };
+        copied += 1;
+    }
+    n as i64
+}
+
+/// POSIX `pwrite(fd, buf, len, off)`. Writes at explicit offset
+/// without touching the file's position. Inode-backed fds only.
+async fn sys_pwrite(
+    proc: &Arc<Proc>,
+    fd: i32,
+    buf_va: usize,
+    len: usize,
+    offset: i64,
+) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+    if offset < 0 || offset > u32::MAX as i64 {
+        return -1;
+    }
+    let Some(file) = proc.get_file(fd) else {
+        return -1;
+    };
+    let File::Inode {
+        ip, writable, ..
+    } = &*file
+    else {
+        return -1;
+    };
+    if !*writable {
+        return -1;
+    }
+    let mut tmp = alloc::vec![0u8; len];
+    for i in 0..len {
+        let Some(kva) = proc.translate_user(buf_va + i) else {
+            return -1;
+        };
+        tmp[i] = unsafe { *(kva as *const u8) };
+    }
+    let cur = offset as u32;
+    fs::log::begin_op().await;
+    let mut li = fs::inode::ilock(ip).await;
+    let n = fs::inode::writei(&mut li, &tmp, cur).await;
+    drop(li);
+    fs::log::end_op().await;
+    n as i64
+}
+
+/// POSIX `lseek(int fd, off_t offset, int whence)`. Supports
+/// SEEK_SET/SEEK_CUR/SEEK_END on `File::Inode`. Pipes and the
+/// console don't support seeking; we return -1 for those.
+///
+/// Returns the new absolute offset on success, or -1 on error. We
+/// model the offset as a u32 (matches xv6's inode size). Negative
+/// resulting offsets are rejected.
+async fn sys_lseek(proc: &Arc<Proc>, fd: i32, offset: i64, whence: i32) -> i64 {
+    let Some(file) = proc.get_file(fd) else {
+        return -1;
+    };
+    let File::Inode { ip, off, .. } = &*file else {
+        return -1;
+    };
+    let cur = off.load(Ordering::Acquire) as i64;
+    let end = {
+        let li = fs::inode::ilock(ip).await;
+        li.state().size as i64
+    };
+    let new = match whence {
+        x if x == SEEK_SET => offset,
+        x if x == SEEK_CUR => cur + offset,
+        x if x == SEEK_END => end + offset,
+        _ => return -1,
+    };
+    if new < 0 || new > u32::MAX as i64 {
+        return -1;
+    }
+    off.store(new as u32, Ordering::Release);
+    new
 }
 
 async fn sys_dup(proc: &Arc<Proc>, fd: i32) -> i64 {

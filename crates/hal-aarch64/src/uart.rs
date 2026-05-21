@@ -45,8 +45,14 @@ pub unsafe fn init() {
         //    IBRD = 13, FBRD = round(0.0208 * 64) = 1
         write_volatile(IBRD as *mut u32, 13);
         write_volatile(FBRD as *mut u32, 1);
-        // 4) Line control: FIFO + 8N1.
-        write_volatile(LCRH as *mut u32, LCRH_FEN | LCRH_WLEN_8);
+        // 4) Line control: 8N1 *without* the FIFO. PL011 RX IRQ only
+        //    fires when the FIFO crosses its trigger level (default
+        //    1/8 ≈ 4 bytes); typed characters get stuck waiting for
+        //    enough buddies to arrive. Disabling FEN makes the
+        //    receiver behave as a 1-deep holding register, firing an
+        //    IRQ on every byte — same behaviour as our NS16550 path
+        //    on riscv.
+        write_volatile(LCRH as *mut u32, LCRH_WLEN_8);
         // 5) Unmask RX interrupt.
         write_volatile(IMSC as *mut u32, IMSC_RXIM);
         // 6) Enable UART (TX + RX).

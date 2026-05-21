@@ -56,13 +56,56 @@ fs.img: build $(MKFS)
 		faulttest:$(USER_DIR)/faulttest.elf \
 		xv6test:$(USER_DIR)/xv6test.elf \
 		lazytest:$(USER_DIR)/lazytest.elf \
-		usertests:$(USER_DIR)/usertests.elf
+		usertests:$(USER_DIR)/usertests.elf \
+		seektest:$(USER_DIR)/seektest.elf
 
 qemu: build fs.img
 	$(QEMU) $(QEMUOPTS)
 
 qemu-gdb: build fs.img
 	$(QEMU) $(QEMUOPTS) -S -s
+
+# ---- aarch64 ----
+AARCH64_TARGET   = aarch64-unknown-none-softfloat
+AARCH64_KERNEL   = target/$(AARCH64_TARGET)/$(TARGET_SUBDIR)/kernel
+AARCH64_USER_DIR = target/user-aarch64
+QEMU_AARCH64     = qemu-system-aarch64
+AARCH64_QEMUOPTS  = -machine virt -cpu cortex-a72 -kernel $(AARCH64_KERNEL)
+AARCH64_QEMUOPTS += -m 128M -smp $(CPUS) -nographic
+AARCH64_QEMUOPTS += -global virtio-mmio.force-legacy=false
+AARCH64_QEMUOPTS += -drive file=fs-aarch64.img,if=none,format=raw,id=x0
+AARCH64_QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+
+build-aarch64:
+	cargo build $(CARGO_FLAGS) -p kernel --target $(AARCH64_TARGET)
+
+fs-aarch64.img: build-aarch64 $(MKFS)
+	$(MKFS) $@ \
+		README:crates/kernel/user/README \
+		init:$(AARCH64_USER_DIR)/initcode.elf \
+		echo:$(AARCH64_USER_DIR)/echo.elf \
+		sh:$(AARCH64_USER_DIR)/sh.elf \
+		cat:$(AARCH64_USER_DIR)/cat.elf \
+		ls:$(AARCH64_USER_DIR)/ls.elf \
+		mkdir:$(AARCH64_USER_DIR)/mkdir.elf \
+		rm:$(AARCH64_USER_DIR)/rm.elf \
+		wr:$(AARCH64_USER_DIR)/wr.elf \
+		kill:$(AARCH64_USER_DIR)/kill.elf \
+		killtest:$(AARCH64_USER_DIR)/killtest.elf \
+		malloctest:$(AARCH64_USER_DIR)/malloctest.elf \
+		smptest:$(AARCH64_USER_DIR)/smptest.elf \
+		ln:$(AARCH64_USER_DIR)/ln.elf \
+		faulttest:$(AARCH64_USER_DIR)/faulttest.elf \
+		xv6test:$(AARCH64_USER_DIR)/xv6test.elf \
+		lazytest:$(AARCH64_USER_DIR)/lazytest.elf \
+		usertests:$(AARCH64_USER_DIR)/usertests.elf \
+		seektest:$(AARCH64_USER_DIR)/seektest.elf
+
+qemu-aarch64: build-aarch64 fs-aarch64.img
+	$(QEMU_AARCH64) $(AARCH64_QEMUOPTS)
+
+qemu-aarch64-gdb: build-aarch64 fs-aarch64.img
+	$(QEMU_AARCH64) $(AARCH64_QEMUOPTS) -S -s
 
 clean:
 	cargo clean

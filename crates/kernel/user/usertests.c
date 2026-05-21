@@ -54,7 +54,13 @@ static inline int pause(int n) { return sleep(n); }
 // an invalid SP. Inline asm; valid in user mode.
 static inline unsigned long r_sp(void) {
     unsigned long sp;
+#if defined(__riscv)
     asm volatile("mv %0, sp" : "=r"(sp));
+#elif defined(__aarch64__)
+    asm volatile("mov %0, sp" : "=r"(sp));
+#else
+#error "unsupported architecture for stack-pointer read"
+#endif
     return sp;
 }
 

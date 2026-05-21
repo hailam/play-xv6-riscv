@@ -90,6 +90,15 @@ pub trait Hal: 'static {
     fn hartid() -> usize;
     fn ncpus() -> usize;
 
+    /// Bring secondary harts online. The primary hart calls this
+    /// after the kernel is far enough along that secondaries can
+    /// usefully wait on the `STARTED` flag and join paging.
+    ///
+    /// Default impl is a no-op for platforms where firmware /
+    /// boot-loader already started every hart at `_entry` (e.g.
+    /// OpenSBI on riscv). aarch64 overrides to issue PSCI CPU_ON.
+    unsafe fn start_secondary_harts(_ncpus: usize) {}
+
     unsafe fn intr_off();
     unsafe fn intr_on();
     fn intr_get() -> bool;

@@ -602,31 +602,47 @@ IRQ delivery: virtual timer PPI INTID 27. Per-hart banked in
 
 ---
 
-## Phase E — trampoline + EL0↔EL1 + cross-toolchain — **kernel-side DONE**
+## Phase E — trampoline + EL0↔EL1 + cross-toolchain — **DONE**
 
-Verified the full user-mode round-trip on aarch64:
+Boots an interactive aarch64 shell under `qemu-system-aarch64 -M virt
+-cpu cortex-a72`:
 
 ```
+rust kmain (hart 0, supervisor)
+kalloc: 32316 free frames (126 MiB)
+kvm: installed (satp=0x47fff000)
+virtio_blk: ready (desc@0x401c0000 avail@0x401c2000 used@0x401c1000)
+hart 0 up, paging on
 fs: ready (sb@1, log@2..33, inodes@33..58, bmap@58, data@59..)
-spawning init proc (360 bytes)
-usertrap: pid 1 unknown cause=0x2000000 va=0x0 epc=0x0 -> killed
-pid 1 exit(-1) on hart 0 kalloc.free=32240
+spawning init proc (504 bytes)
+hello from aarch64 init (svc dispatched)
+$ echo hello aarch64 shell
+hello aarch64 shell
+$ ls
+.       1   320
+..      1   320
+README  2   263
+init    3   504
+echo    4   3848
+sh      5   5096
+cat     6   4024
+ls      7   4936
+... (all 19 entries)
+$
 ```
 
-The "usertrap" diagnostic is the proof: the kernel called
-`Hal::return_to_user` → trampoline restored user regs + switched
-TTBR0_EL1 to user → `eret` to EL0 → CPU tried to decode bytes at
-initcode's entry — but **initcode is hand-rolled RISC-V asm**
-(`la a0; li a7, 7; ecall`), so the aarch64 hardware saw random
-opcodes. Trap fired → trampoline `uservec_sync` saved user
-state, switched TTBR0_EL1 back to kernel, jumped to
-`rust_usertrap` → `Arch::on_user_trap_entry` swapped VBAR_EL1
-back to kernel vector → `decode_user_trap` decoded ESR_EL1 →
-`UserTrapCause::Unknown` → `proc.killed` → `sys_exit(-1)`.
+The user-mode trap path was end-to-end-validated even before user
+binaries existed: with the riscv `initcode` baked in, the aarch64
+hardware decoded its riscv bytes as garbage, raised an undefined-
+instruction trap, vectored through `trampoline_vector_table+0x400`
+into `uservec_sync` → kernel TTBR0 swap → `rust_usertrap` →
+`decode_user_trap(ESR_EL1)` → `UserTrapCause::Unknown` →
+`proc.killed` → clean `sys_exit(-1)`.
 
-**Every single piece of the user-mode trap path works.** The
-only remaining work for a real shell session is aarch64-native
-user binaries.
+After producing aarch64-native user binaries (below) the same path
+now runs real syscalls: `sys_write`, `sys_exec` (with `e_machine`
+validation), `sys_fork`, `sys_wait`, `sys_open`, `sys_read`,
+`sys_close`, etc. all verified via the interactive `sh` session.
 
 ### Files
 
@@ -658,48 +674,69 @@ rust-lld the section was allocatable + executable. Fix:
 relative branches and `adr` references inside the section
 resolve cleanly.
 
-### Still to do — user binaries (the `~200 LoC + toolchain` bit)
+### User-binary toolchain — **DONE**
 
-This is bounded but new:
+- `crates/kernel/user/ulib-aarch64.S` — aarch64 syscall stubs
+  (`mov x8, #nr; svc #0; ret`).
+- `crates/kernel/user/user-aarch64.ld` — two-PT_LOAD layout
+  (text RX, data RW page-aligned).
+- `crates/kernel/build.rs` — dispatches on
+  `CARGO_CFG_TARGET_ARCH`: `clang --target=aarch64-none-elf -march=armv8-a
+  -mgeneral-regs-only`, links with `rust-lld` (from the host
+  rustlib), strips with the host `llvm-objcopy`. No host package
+  install required on macOS — clang + rust-lld + llvm-objcopy
+  ship with Xcode + rustup.
+- `crates/kernel/user/initcode-aarch64.S` — `adr x0, sh_path; mov
+  x1, #0; mov x8, #7; svc #0` (plus a self-test `sys_write` of a
+  hello banner before exec).
+- `crates/kernel/src/elf.rs` — validates `e_machine == EM_AARCH64`
+  on aarch64 builds (returns `ElfError::WrongArch` for foreign
+  binaries instead of jumping into garbage and trapping at PC=0).
+- `usertests.c` — guarded the lone bit of arch-specific inline asm
+  (`mv %0, sp` vs `mov %0, sp`) with `#if defined(__riscv) /
+  #elif defined(__aarch64__)`.
 
-1. `crates/kernel/user/ulib-aarch64.S` — aarch64 syscall stubs
-   using `svc #0` + register convention (syscall nr in `x8`,
-   args in `x0..x7`, return in `x0`).
-2. `crates/kernel/user/user-aarch64.ld` — aarch64 linker script
-   with the same two-PT_LOAD layout we use for riscv (text RX
-   + data RW page-aligned).
-3. `crates/kernel/build.rs` per-arch dispatch:
-   ```rust
-   let (cc, cflags) = match std::env::var("CARGO_CFG_TARGET_ARCH") {
-       Ok(s) if s == "riscv64" => ("riscv64-elf-gcc", &["-march=rv64gc", "-mabi=lp64"]),
-       Ok(s) if s == "aarch64" => ("clang", &["--target=aarch64-none-elf", "-march=armv8-a", "-mgeneral-regs-only"]),
-       _ => panic!(),
-   };
-   ```
-4. New aarch64-native fs image build: `target/user/aarch64/*.elf`
-   → `fs-aarch64.img` via `mkfs`.
-5. New `Makefile` target `qemu-aarch64`:
-   ```makefile
-   qemu-aarch64: build-aarch64 fs-aarch64.img
-       qemu-system-aarch64 -M virt -cpu cortex-a72 \
-           -kernel target/aarch64-unknown-none-softfloat/release/kernel \
-           -m 128M -smp 1 -display none -serial stdio -monitor none \
-           -global virtio-mmio.force-legacy=false \
-           -drive file=fs-aarch64.img,if=none,format=raw,id=x0 \
-           -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
-   ```
-6. `initcode.S` for aarch64 — replace the RISC-V `la/li/ecall`
-   with the aarch64 equivalent: `adr x0, sh_path; mov x1, #0;
-   mov x8, #7; svc #0`.
-7. Recompile every `.c` user binary (sh, ls, cat, echo, wr,
-   mkdir, rm, kill, killtest, malloctest, lazytest, smptest, ln,
-   xv6test, usertests) for aarch64 via the new toolchain
-   dispatch.
+`make qemu-aarch64` builds the kernel, the aarch64 user suite into
+`target/user-aarch64/`, runs `mkfs fs-aarch64.img`, and launches
+QEMU with the virtio-mmio drive attached. All 19 user binaries are
+present on the aarch64 image.
 
-No new spec research needed for this — it's all
-build-system/linker plumbing. **Verification gate**: same shell
-session under `qemu-system-aarch64`. Tracked separately as a
-follow-on to keep this todo's "kernel-side done" status clean.
+### Outstanding (longer tail)
+
+- **Phase F** (below) — aarch64 SMP via PSCI CPU_ON + GIC SGI IPI.
+- **usertests** on aarch64 — 4 of the 8 canonical canaries
+  pass cleanly under non-interactive scripted runs:
+  `copyin` (ALL TESTS PASSED), `copyout`, `bsstest`, `createtest`
+  all complete with `OK` on the test body. Three of those four
+  still trip the user-side `FAILED -- lost some free pages`
+  sanity check (some kernel state grows between the test's two
+  `countfree` calls — buffer cache warming or 4-level intermediate
+  PT pages from sbrk growth, not a real leak per se). Investigating
+  whether to reap empty intermediate L3/L2/L1 tables on `unmap_page`
+  is the obvious next step.
+
+### Resolved
+
+- **PL011 init** — was writing `DR` before setting `CR.UARTEN`;
+  fixed by calling `Arch::init_console()` at the very top of
+  `kmain` before any `println!`.
+- **PL011 RX FIFO race** — disabled `LCRH.FEN`. PL011's RX
+  interrupt only fires when the FIFO crosses a trigger level
+  (default 1/8 of 32 bytes); typed characters got stuck waiting
+  for buddies. Disabling the FIFO makes the receiver a 1-deep
+  holding register that IRQs on every byte (same behaviour as
+  the NS16550 path on riscv).
+- **`exit: dummy pt: Oom` panic** under `usertests copyout` was
+  not a kernel leak — `sbrk` is declared as `char* sbrk(int)`,
+  so the `int` argument arrives in `w0` on AArch64 with the
+  upper 32 bits of `x0` unspecified per AAPCS64. The kernel was
+  reading `tf.arg(0) as i64` which sometimes pulled garbage from
+  the high half, making `sbrk(-N)` look like `sbrk(+huge)`. Fixed
+  by sign-extending: `tf.arg(0) as i32 as i64`. RISC-V's calling
+  convention sign-extends 32-bit values into 64-bit regs already,
+  which is why the bug only showed on aarch64. Also added rollback
+  in the sbrk-grow eager path so a partial map() failure doesn't
+  leak the data frame.
 
 ### E.1 Single-TTBR0 model (xv6/riscv style)
 
@@ -887,30 +924,46 @@ let user_out = format!("target/user/{arch}");
 
 ---
 
-## Phase F — aarch64 SMP + IPI (optional, defer)  (~100 LoC)
+## Phase F — aarch64 SMP + IPI — **DONE**
 
-- PSCI `CPU_ON` to release secondaries.
-- GIC SGI for cross-CPU wakeups (write GICD_SGIR with target list
-  + INTID 0..15).
-- The riscv64 path also defers real IPI to timer-tick polling;
-  both arches can land this together as a separate todo.
+`make qemu-aarch64 CPUS=4` lands 4 harts and runs `smptest`
+with child procs landing on hart 0/1/2/3:
 
-PSCI call convention (SMCCC):
 ```
-HVC #0   ; or SMC #0 depending on EL of caller
-  x0 = function ID (0xC400_0003 for CPU_ON)
-  x1 = target affinity (MPIDR-style)
-  x2 = entry PA
-  x3 = context ID
+hart 1 up, paging on
+hart 2 up, paging on
+hart 0 up, paging on
+hart 3 up, paging on
+...
+$ smptest
+smptest child done
+pid 4 exit(0) on hart 1 ...
+pid 6 exit(0) on hart 2 ...
+pid 8 exit(0) on hart 3 ...
+smptest: all done
 ```
 
-GIC SGI:
-```rust
-fn sgi_all_except_self(intid: u32) {
-    let val = (0b01u32 << 24) | (intid & 0xF);
-    unsafe { write_u32(GICD + 0xF00, val); }
-}
-```
+### Pieces
+
+- `crates/hal-aarch64/src/psci.rs` — PSCI 0.2+ client over HVC.
+  Implements `CPU_ON` (function ID `0x8400_0003`). QEMU `-machine
+  virt` exposes PSCI at EL2; we boot at EL2 → drop to EL1 → call
+  HVC from EL1, which traps to EL2 where QEMU's stub handles it.
+- `Hal::start_secondary_harts(ncpus)` — new HAL method called by
+  `kmain` on hart 0 after primary init. Default is no-op (riscv:
+  OpenSBI/QEMU already started everyone at `_entry`). aarch64
+  overrides to PSCI-CPU_ON each hart 1..ncpus, all landing at
+  `_entry` where the existing MPIDR-based stack setup + EL2→EL1
+  drop runs unchanged.
+- `gic::init_for_hart` now enables SGI #0 (the IPI INTID).
+- `Hal::send_ipi` calls `gic::sgi_all_except_self(0)`. The
+  `rust_kerneltrap_irq` dispatcher recognises INTID < 16 as an
+  SGI and just claim+EOI's it — the IPI's job is to exit `wfi`
+  on the recipient hart, not to deliver work directly.
+
+PSCI return value of −2 (INVALID_PARAMETERS) for a non-existent
+hart is benign; we walk 1..MAX_CPUS (=8) regardless of QEMU's
+actual `-smp` and ignore failures.
 
 ---
 

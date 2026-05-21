@@ -15,6 +15,7 @@ mod csr;
 mod gic;
 pub mod memlayout;
 mod pagetable;
+mod psci;
 mod start;
 mod trap;
 pub mod trapframe;
@@ -93,6 +94,23 @@ impl Hal for AArch64 {
         MAX_CPUS
     }
 
+    unsafe fn start_secondary_harts(ncpus: usize) {
+        // QEMU virt parks secondary harts at boot — they need
+        // PSCI CPU_ON to start. Walk 1..ncpus, each gets dispatched
+        // to `_entry` so it reruns the normal MPIDR-based stack
+        // setup and EL2→EL1 drop. We may walk past the actual
+        // -smp count when MAX_CPUS > smp; PSCI returns
+        // INVALID_PARAMETERS for those, which is benign.
+        extern "C" {
+            fn _entry();
+        }
+        let entry = _entry as usize;
+        for hart in 1..ncpus {
+            let mpidr = hart as u64;
+            let _ = unsafe { psci::cpu_on(mpidr, entry, 0) };
+        }
+    }
+
     unsafe fn intr_off() {
         unsafe { csr::intr_off() };
     }
@@ -106,7 +124,12 @@ impl Hal for AArch64 {
         unsafe { csr::wfi() };
     }
     unsafe fn send_ipi(_hart_mask: u64) {
-        // TODO: GIC SGI write. Skeleton no-op (mirrors riscv64).
+        // SGI #0 is our IPI INTID. Broadcasting to "all except self"
+        // is a superset of the precise hart_mask the caller asked
+        // for — fine because the recipients re-check their local
+        // ready queue on receipt. Refining to a true mask requires
+        // splitting the SGIR write per target bit; defer.
+        unsafe { gic::sgi_all_except_self(0) };
     }
 
     fn console_putc(c: u8) {

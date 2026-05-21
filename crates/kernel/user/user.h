@@ -40,6 +40,14 @@ int   pipe(int*);
 int   write(int, const void*, int);
 int   read(int, void*, int);
 int   close(int);
+// POSIX lseek. off_t is 64-bit; xv6's inode size is u32 so the kernel
+// rejects any new offset > 2^32 - 1.
+long  lseek(int fd, long offset, int whence);
+int   pread(int fd, void* buf, int len, long offset);
+int   pwrite(int fd, const void* buf, int len, long offset);
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
 int   kill(int);
 int   exec(const char*, char* const argv[]);
 int   open(const char*, int);
