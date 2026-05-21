@@ -77,6 +77,8 @@ DEFINE_SYSCALL rename,   43
 DEFINE_SYSCALL waitpid,  44
 DEFINE_SYSCALL pause,    45
 DEFINE_SYSCALL alarm,    46
+DEFINE_SYSCALL clock_gettime, 47
+DEFINE_SYSCALL getdents,      48
 
 // _sigret — POSIX signal restorer trampoline. Same role as the
 // riscv version: linked into every C user binary, used as the

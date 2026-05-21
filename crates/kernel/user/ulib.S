@@ -73,6 +73,8 @@ DEFINE_SYSCALL rename,   43
 DEFINE_SYSCALL waitpid,  44
 DEFINE_SYSCALL pause,    45
 DEFINE_SYSCALL alarm,    46
+DEFINE_SYSCALL clock_gettime, 47
+DEFINE_SYSCALL getdents,      48
 
 // _sigret — POSIX signal restorer trampoline. The kernel writes
 // `ra := &_sigret` into the trapframe before delivering a signal,

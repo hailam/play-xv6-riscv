@@ -32,6 +32,8 @@ use crate::uapi::{
     SYS_TRUNCATE, SYS_UMASK, SYS_UNLINK, SYS_UPTIME, SYS_WAIT, SYS_WRITE,
     SYS_DUP2, SYS_GETCWD, SYS_RENAME,
     SYS_WAITPID, SYS_PAUSE, SYS_ALARM, WNOHANG,
+    SYS_CLOCK_GETTIME, SYS_GETDENTS, CLOCK_MONOTONIC, CLOCK_REALTIME,
+    Timespec, UserDirent,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -280,6 +282,19 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
         SYS_ALARM => {
             let secs = proc.trapframe().arg(0) as u32;
             sys_alarm(proc, secs)
+        }
+        SYS_CLOCK_GETTIME => {
+            let tf = proc.trapframe();
+            let clk = tf.arg(0) as i32;
+            let ts_va = tf.arg(1) as usize;
+            sys_clock_gettime(proc, clk, ts_va)
+        }
+        SYS_GETDENTS => {
+            let tf = proc.trapframe();
+            let fd = tf.arg(0) as i32;
+            let buf_va = tf.arg(1) as usize;
+            let len = tf.arg(2) as usize;
+            sys_getdents(proc, fd, buf_va, len).await
         }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
@@ -678,6 +693,137 @@ impl Future for Pause<'_> {
         }
         Poll::Pending
     }
+}
+
+/// POSIX `clock_gettime(clk, &ts)` — fills `ts` with the current
+/// time. Only `CLOCK_MONOTONIC` is supported (we have no RTC); we
+/// alias `CLOCK_REALTIME` to MONOTONIC so portable code at least
+/// gets monotonic semantics for both.
+///
+/// Time source: `Arch::now_ticks()`. Per the comment in `stattime`,
+/// the tick rate differs per arch (riscv ~10 MHz, aarch64 generic
+/// timer typ. 62.5 MHz). We compute (sec, nsec) using TIMER_INTERVAL
+/// as the conversion divisor that matches our timer-IRQ rate — the
+/// resulting values are monotonic-correct even if the absolute
+/// "seconds" doesn't track wall time precisely.
+fn sys_clock_gettime(proc: &Arc<Proc>, clk: i32, ts_va: usize) -> i64 {
+    if clk != CLOCK_MONOTONIC && clk != CLOCK_REALTIME {
+        return -1;
+    }
+    let ticks = Arch::now_ticks();
+    // ticks per second is roughly TIMER_INTERVAL * 10 (we fire the
+    // timer ~10× per second by convention). Compute seconds + ns
+    // using the timer-IRQ tick as the unit.
+    let ts_per_sec = TIMER_INTERVAL * 10;
+    let tv_sec = (ticks / ts_per_sec) as i64;
+    let rem = ticks % ts_per_sec;
+    let tv_nsec = ((rem as u128 * 1_000_000_000) / ts_per_sec as u128) as i64;
+    let ts = Timespec { tv_sec, tv_nsec };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &ts as *const _ as *const u8,
+            core::mem::size_of::<Timespec>(),
+        )
+    };
+    for (i, b) in bytes.iter().enumerate() {
+        let Some(kva) = proc.translate_user_write(ts_va + i) else {
+            return -1;
+        };
+        unsafe { *(kva as *mut u8) = *b };
+    }
+    0
+}
+
+/// POSIX-ish `getdents(fd, buf, len)` — reads directory entries into
+/// a user buffer as packed `UserDirent` records. Returns the number
+/// of bytes written, 0 at EOF, -1 on error. `fd` must be a dir
+/// opened for read.
+async fn sys_getdents(
+    proc: &Arc<Proc>,
+    fd: i32,
+    buf_va: usize,
+    len: usize,
+) -> i64 {
+    use xv6_fs_layout::{Dirent, DIRSIZ, T_DIR};
+    let entry_size = core::mem::size_of::<Dirent>();
+    let out_size = core::mem::size_of::<UserDirent>();
+    if len < out_size {
+        return -1;
+    }
+    let Some(file) = proc.get_file(fd) else {
+        return -1;
+    };
+    let File::Inode {
+        ip, off, readable, ..
+    } = &*file
+    else {
+        return -1;
+    };
+    if !*readable {
+        return -1;
+    }
+    let (typ, size) = {
+        let li = fs::inode::ilock(ip).await;
+        (li.state().typ, li.state().size)
+    };
+    if typ != T_DIR {
+        return -1;
+    }
+    let mut copied: usize = 0;
+    let mut cur_off = off.load(Ordering::Acquire);
+    while copied + out_size <= len && cur_off < size {
+        let mut entry = Dirent::default();
+        let n = {
+            let li = fs::inode::ilock(ip).await;
+            let bytes = unsafe {
+                core::slice::from_raw_parts_mut(
+                    &mut entry as *mut _ as *mut u8,
+                    entry_size,
+                )
+            };
+            fs::inode::readi(&li, bytes, cur_off).await
+        };
+        if n != entry_size {
+            break;
+        }
+        cur_off += entry_size as u32;
+        if entry.inum == 0 {
+            continue;
+        }
+        // Build the user dirent.
+        let mut ud = UserDirent {
+            d_ino: entry.inum as u64,
+            d_reclen: out_size as u16,
+            d_namelen: 0,
+            d_name: [0; 14],
+            _pad: [0; 2],
+        };
+        let mut nl = 0u16;
+        for i in 0..DIRSIZ {
+            if entry.name[i] == 0 {
+                break;
+            }
+            ud.d_name[i] = entry.name[i];
+            nl += 1;
+        }
+        ud.d_namelen = nl;
+        // Copy out.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &ud as *const _ as *const u8,
+                out_size,
+            )
+        };
+        for (i, b) in bytes.iter().enumerate() {
+            let Some(kva) = proc.translate_user_write(buf_va + copied + i) else {
+                return -1;
+            };
+            unsafe { *(kva as *mut u8) = *b };
+        }
+        copied += out_size;
+    }
+    off.store(cur_off, Ordering::Release);
+    copied as i64
 }
 
 /// POSIX `alarm(seconds)` — schedule SIGALRM for the calling proc

@@ -141,6 +141,28 @@ unsigned int alarm(unsigned int seconds);
 
 #define WNOHANG 1
 
+// POSIX clock_gettime — only MONOTONIC is meaningful (no RTC).
+#define CLOCK_REALTIME  0
+#define CLOCK_MONOTONIC 1
+
+struct timespec {
+    long long tv_sec;
+    long long tv_nsec;
+};
+
+int clock_gettime(int clk, struct timespec* ts);
+
+// POSIX-ish getdents — packed 24-byte records.
+struct dirent_p {
+    unsigned long long d_ino;
+    unsigned short     d_reclen;
+    unsigned short     d_namelen;
+    char               d_name[14];
+    char               _pad[2];
+};
+
+int getdents(int fd, void* buf, unsigned int len);
+
 #define O_CLOEXEC  0x4000
 #define O_NONBLOCK 0x8000
 

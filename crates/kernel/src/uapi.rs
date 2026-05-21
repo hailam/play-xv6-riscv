@@ -47,9 +47,36 @@ pub const SYS_RENAME: usize = 43;
 pub const SYS_WAITPID: usize = 44;
 pub const SYS_PAUSE: usize = 45;
 pub const SYS_ALARM: usize = 46;
+pub const SYS_CLOCK_GETTIME: usize = 47;
+pub const SYS_GETDENTS: usize = 48;
 
 // waitpid options
 pub const WNOHANG: i32 = 1;
+
+// clock_gettime ids.
+pub const CLOCK_REALTIME: i32 = 0;  // not supported (no RTC); we alias to MONOTONIC
+pub const CLOCK_MONOTONIC: i32 = 1;
+
+/// POSIX `struct timespec` — 16 bytes (s:i64, ns:i64).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Timespec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
+/// User-visible `struct dirent` (subset). 24 bytes: u64 ino + u16
+/// reclen + u16 namelen + u8 name[14] (no trailing NUL guarantee
+/// for full-length names; user code uses namelen).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct UserDirent {
+    pub d_ino: u64,
+    pub d_reclen: u16,
+    pub d_namelen: u16,
+    pub d_name: [u8; 14],
+    pub _pad: [u8; 2],
+}
 
 // POSIX signal numbers (subset). Values match Linux for portability
 // of user-space code (so a port of `signal.h` reads naturally).
