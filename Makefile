@@ -63,7 +63,8 @@ fs.img: build $(MKFS)
 		cloexectest:$(USER_DIR)/cloexectest.elf \
 		trunctest:$(USER_DIR)/trunctest.elf \
 		stattime:$(USER_DIR)/stattime.elf \
-		sigtest:$(USER_DIR)/sigtest.elf
+		sigtest:$(USER_DIR)/sigtest.elf \
+		sigactest:$(USER_DIR)/sigactest.elf
 
 qemu: build fs.img
 	$(QEMU) $(QEMUOPTS)
@@ -111,7 +112,8 @@ fs-aarch64.img: build-aarch64 $(MKFS)
 		cloexectest:$(AARCH64_USER_DIR)/cloexectest.elf \
 		trunctest:$(AARCH64_USER_DIR)/trunctest.elf \
 		stattime:$(AARCH64_USER_DIR)/stattime.elf \
-		sigtest:$(AARCH64_USER_DIR)/sigtest.elf
+		sigtest:$(AARCH64_USER_DIR)/sigtest.elf \
+		sigactest:$(AARCH64_USER_DIR)/sigactest.elf
 
 qemu-aarch64: build-aarch64 fs-aarch64.img
 	$(QEMU_AARCH64) $(AARCH64_QEMUOPTS)

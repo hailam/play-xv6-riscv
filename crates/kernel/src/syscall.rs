@@ -28,8 +28,8 @@ use crate::uapi::{
     SYS_GETEUID,
     SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_LSEEK, SYS_MKDIR,
     SYS_MKNOD, SYS_OPEN, SYS_PIPE, SYS_PREAD, SYS_PWRITE, SYS_READ, SYS_SBRK, SYS_SETGID,
-    SYS_SETUID, SYS_SLEEP, SYS_STAT, SYS_TRUNCATE, SYS_UMASK, SYS_UNLINK, SYS_UPTIME,
-    SYS_WAIT, SYS_WRITE,
+    SYS_SETUID, SYS_SIGACTION, SYS_SIGRETURN, SYS_SLEEP, SYS_STAT, SYS_TRUNCATE,
+    SYS_UMASK, SYS_UNLINK, SYS_UPTIME, SYS_WAIT, SYS_WRITE,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -233,6 +233,15 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let length = tf.arg(1) as i64;
             sys_truncate(proc, path_va, length).await
         }
+        SYS_SIGACTION => {
+            let tf = proc.trapframe();
+            let signum = tf.arg(0) as i32;
+            let handler = tf.arg(1) as usize;
+            let restorer = tf.arg(2) as usize;
+            let mask = tf.arg(3) as u32;
+            sys_sigaction(proc, signum, handler, restorer, mask)
+        }
+        SYS_SIGRETURN => sys_sigreturn(proc),
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
             -1
@@ -398,18 +407,46 @@ async fn sys_kill(proc: &Arc<Proc>, pid: i32, sig: i32) -> i64 {
         // capability pass).
         return 0;
     }
-    if !crate::uapi::sig_default_kills(sig) {
-        // Ignored / unimplemented disposition (CHLD/CONT/STOP) —
-        // accept but don't actually do anything.
+    use crate::uapi::{SIGKILL, SIGSTOP, SIG_DFL, SIG_IGN};
+    // SIGKILL is uncatchable — always proc.killed. Skip the handler
+    // table lookup.
+    if sig == SIGKILL {
+        target.killed.store(true, Ordering::Release);
+        target.wait_waker.wake();
+        crate::console_in::wake();
+        executor::wake(target.task_id.load(Ordering::Relaxed));
         return 0;
     }
-    target.killed.store(true, Ordering::Release);
-    // Boot every blocking future this proc may be parked on. Each
-    // poll checks `killed` and returns a cancellation sentinel.
-    target.wait_waker.wake();
-    crate::console_in::wake();
-    executor::wake(target.task_id.load(Ordering::Relaxed));
-    0
+    if sig == SIGSTOP {
+        // No job control yet — accept-but-ignore (real SIGSTOP would
+        // suspend the proc until SIGCONT).
+        return 0;
+    }
+    let action = target.sig_actions.lock()[sig as usize];
+    match action.handler {
+        SIG_DFL => {
+            if crate::uapi::sig_default_kills(sig) {
+                target.killed.store(true, Ordering::Release);
+                target.wait_waker.wake();
+                crate::console_in::wake();
+                executor::wake(target.task_id.load(Ordering::Relaxed));
+            }
+            // else: default-ignore signals (CHLD/CONT) are no-ops.
+            0
+        }
+        SIG_IGN => 0,
+        _ => {
+            // User installed a handler — queue the signal as pending
+            // and wake any blocking await so delivery happens at the
+            // next return-to-user.
+            let bit = 1u32 << sig;
+            target.sig_pending.fetch_or(bit, Ordering::AcqRel);
+            target.wait_waker.wake();
+            crate::console_in::wake();
+            executor::wake(target.task_id.load(Ordering::Relaxed));
+            0
+        }
+    }
 }
 
 /// Helper for futures: is the currently-polling proc killed?
@@ -1505,6 +1542,64 @@ async fn sys_ftruncate(proc: &Arc<Proc>, fd: i32, length: i64) -> i64 {
 
 /// POSIX `truncate(path, length)` — path-based variant. Requires
 /// write permission on the file.
+/// POSIX `sigaction(signum, handler, restorer, mask)` — install or
+/// query a handler. The kernel keeps handler+restorer+mask in
+/// `Proc::sig_actions[signum]`. SIGKILL and SIGSTOP can't be caught.
+///
+/// Caller convention (matches our slim 4-arg syscall):
+///   handler  = user-VA function pointer, SIG_DFL, or SIG_IGN
+///   restorer = user-VA "sigreturn" trampoline (ulib's `_sigret`)
+///   mask     = signals to block while handler runs
+///
+/// Returns the previous handler VA, or -1 on error. Slim — we don't
+/// support querying restorer/mask back (Slice 3 if needed).
+fn sys_sigaction(
+    proc: &Arc<Proc>,
+    signum: i32,
+    handler: usize,
+    restorer: usize,
+    mask: u32,
+) -> i64 {
+    use crate::uapi::{SigAction, SIGKILL, SIGSTOP, SIG_DFL};
+    if signum <= 0 || signum >= 32 {
+        return -1;
+    }
+    if signum == SIGKILL || signum == SIGSTOP {
+        // POSIX: SIGKILL/SIGSTOP can never be caught, blocked, or
+        // ignored. Installing a handler on these is an error.
+        return -1;
+    }
+    let mut tbl = proc.sig_actions.lock();
+    let prev = tbl[signum as usize].handler;
+    tbl[signum as usize] = SigAction { handler, restorer, mask };
+    // Caller can detect "was previously default" by checking
+    // returned value against SIG_DFL.
+    let _ = SIG_DFL;
+    prev as i64
+}
+
+/// POSIX `sigreturn()` — restore the trapframe the kernel saved
+/// when it dispatched the current handler. The user-space restorer
+/// stub (`_sigret` in ulib) calls this with no args; we just swap
+/// the saved frame back into `proc.trapframe()` and let the normal
+/// return-to-user path resume the original PC/SP/etc.
+fn sys_sigreturn(proc: &Arc<Proc>) -> i64 {
+    let Some(saved) = proc.sig_saved_frame.lock().take() else {
+        // Called without a pending dispatch — kill the process; it's
+        // either confused or attacking us.
+        return -1;
+    };
+    let tf = proc.trapframe();
+    *tf = saved;
+    // sys_sigreturn must NOT clobber the restored a0/x0. The
+    // syscall dispatch wraps our return value into the trapframe's
+    // arg 0 slot, so we have to make sure we return what was in a0
+    // before signal dispatch. The simplest correct thing is to
+    // return the freshly-restored a0 — proc_main will write it
+    // back, no-op.
+    tf.arg(0) as i64
+}
+
 async fn sys_truncate(proc: &Arc<Proc>, path_va: usize, length: i64) -> i64 {
     if length < 0 || length > u32::MAX as i64 {
         return -1;

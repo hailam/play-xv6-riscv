@@ -82,6 +82,19 @@ pub struct Proc {
     /// Per-proc file-creation mask. Bits set here are cleared from
     /// the mode passed to `create_at_path`. Default 0o022.
     pub umask: AtomicU32,
+    /// POSIX signal state. `pending` is set by `sys_kill`; the
+    /// return-to-user path consults `pending & !blocked` and
+    /// delivers the lowest-numbered pending signal.
+    pub sig_pending: AtomicU32,
+    pub sig_blocked: AtomicU32,
+    /// Handler table — one entry per signal number (we index 0..32).
+    pub sig_actions: SpinLock<[crate::uapi::SigAction; 32]>,
+    /// Per-proc save slot used during signal delivery: the kernel
+    /// snapshots the live `TrapFrame` here before redirecting to the
+    /// handler. `sys_sigreturn` copies it back. Only one signal in
+    /// flight per process — no nesting.
+    pub sig_saved_frame:
+        SpinLock<Option<<crate::arch::Arch as hal::Hal>::TrapFrame>>,
 }
 
 impl Proc {
@@ -174,6 +187,15 @@ impl Proc {
         child.uid.store(parent.uid.load(Ordering::Acquire), Ordering::Release);
         child.gid.store(parent.gid.load(Ordering::Acquire), Ordering::Release);
         child.umask.store(parent.umask.load(Ordering::Acquire), Ordering::Release);
+        // Inherit signal blocked mask + handler table. Pending bits
+        // are NOT copied — POSIX semantics. (A child needs to start
+        // with a clean pending mask so it doesn't immediately handle
+        // a signal the parent had queued.)
+        child.sig_blocked.store(
+            parent.sig_blocked.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        *child.sig_actions.lock() = *parent.sig_actions.lock();
         Some(child)
     }
 
@@ -201,6 +223,12 @@ impl Proc {
             uid: AtomicU32::new(0),
             gid: AtomicU32::new(0),
             umask: AtomicU32::new(0o022),
+            sig_pending: AtomicU32::new(0),
+            sig_blocked: AtomicU32::new(0),
+            sig_actions: SpinLock::new(
+                [crate::uapi::SigAction::default_action(); 32],
+            ),
+            sig_saved_frame: SpinLock::new(None),
         }
     }
 
@@ -244,6 +272,12 @@ impl Proc {
     pub fn replace_image(&self, new_pt: <Arch as Hal>::PageTable, new_size: usize) {
         *self.pagetable.lock() = new_pt;
         self.size.store(new_size, Ordering::Release);
+        // POSIX: handlers set to SIG_DFL across exec (the new image
+        // doesn't know about the old image's handler addresses).
+        // Pending stays — the new program may still want to learn
+        // about queued signals. Blocked mask carries over.
+        *self.sig_actions.lock() = [crate::uapi::SigAction::default_action(); 32];
+        *self.sig_saved_frame.lock() = None;
     }
 
     pub fn is_zombie(&self) -> bool {

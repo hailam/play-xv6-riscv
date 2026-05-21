@@ -38,6 +38,8 @@ pub const SYS_UMASK: usize = 34;
 pub const SYS_FCNTL: usize = 35;
 pub const SYS_FTRUNCATE: usize = 36;
 pub const SYS_TRUNCATE: usize = 37;
+pub const SYS_SIGACTION: usize = 38;
+pub const SYS_SIGRETURN: usize = 39;
 
 // POSIX signal numbers (subset). Values match Linux for portability
 // of user-space code (so a port of `signal.h` reads naturally).
@@ -76,6 +78,36 @@ pub fn sig_default_kills(sig: i32) -> bool {
             | SIGTERM
     )
 }
+
+/// Special handler values for `SigAction::handler`. Anything else is
+/// a user-space function-pointer VA.
+pub const SIG_DFL: usize = 0;
+pub const SIG_IGN: usize = 1;
+
+/// POSIX-ish sigaction record. Slim — no sa_flags, no SA_SIGINFO; we
+/// just carry the handler entry point, the user-space restorer (a
+/// tiny stub ulib provides that issues SYS_SIGRETURN), and the mask
+/// of signals to block while the handler runs.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SigAction {
+    pub handler: usize,
+    pub restorer: usize,
+    pub mask: u32,
+}
+
+impl SigAction {
+    pub const fn default_action() -> Self {
+        Self { handler: SIG_DFL, restorer: 0, mask: 0 }
+    }
+}
+
+pub const SIGSET_SIZE: usize = 32;
+
+// fcntl-style "how" for sigprocmask (Slice 3).
+pub const SIG_BLOCK: i32 = 0;
+pub const SIG_UNBLOCK: i32 = 1;
+pub const SIG_SETMASK: i32 = 2;
 
 // lseek "whence" values — POSIX-standard.
 pub const SEEK_SET: i32 = 0; // absolute offset

@@ -99,6 +99,12 @@ pub fn return_to_user(proc: &Proc) -> ! {
     // mode, corrupting the trapframe.
     unsafe { Arch::intr_off() };
 
+    // POSIX signal dispatch hook. If there's a pending unblocked
+    // signal with a user handler installed, divert the upcoming
+    // user-mode return: save the live trapframe to `proc.sig_saved_frame`,
+    // rewrite epc/sp/a0/ra so eret lands in the handler.
+    maybe_deliver_signal(proc);
+
     let hartid = Arch::hartid();
     let tf = proc.trapframe();
     tf.set_kernel_satp(crate::vm::kernel_satp() as u64);
@@ -108,4 +114,71 @@ pub fn return_to_user(proc: &Proc) -> ! {
 
     let user_satp = proc.satp();
     unsafe { Arch::return_to_user(tf, user_satp) }
+}
+
+/// Pick the lowest-numbered pending, unblocked signal whose handler
+/// is non-default/non-ignored. Atomically dequeue it (clear the
+/// pending bit), snapshot the trapframe into `proc.sig_saved_frame`,
+/// then rewrite the trapframe so the next eret lands in the
+/// handler with:
+///   * arg0 = signum
+///   * pc   = handler VA
+///   * ra   = restorer VA  (so `ret` from the handler hits sigreturn)
+///
+/// If a signal is already in flight (`sig_saved_frame.is_some()`) we
+/// skip — no nesting.
+fn maybe_deliver_signal(proc: &Proc) {
+    use crate::uapi::{SIG_DFL, SIG_IGN};
+    if proc.sig_saved_frame.lock().is_some() {
+        return;
+    }
+    let blocked = proc.sig_blocked.load(core::sync::atomic::Ordering::Acquire);
+    let pending = proc.sig_pending.load(core::sync::atomic::Ordering::Acquire);
+    let runnable = pending & !blocked;
+    if runnable == 0 {
+        return;
+    }
+    let sig = runnable.trailing_zeros() as i32;
+    let action = proc.sig_actions.lock()[sig as usize];
+    if action.handler == SIG_DFL || action.handler == SIG_IGN {
+        // Disposition changed between sys_kill queuing and now —
+        // just clear the pending bit and continue (no delivery).
+        proc.sig_pending.fetch_and(!(1u32 << sig), core::sync::atomic::Ordering::AcqRel);
+        return;
+    }
+    if action.restorer == 0 {
+        // No restorer installed — user code would never return
+        // from the handler. Refuse to deliver; this keeps the proc
+        // from disappearing into a never-returning handler.
+        return;
+    }
+    // Dequeue the bit before any side effect that might wake the
+    // proc again (so we don't double-deliver).
+    proc.sig_pending.fetch_and(!(1u32 << sig), core::sync::atomic::Ordering::AcqRel);
+    let tf = proc.trapframe();
+    *proc.sig_saved_frame.lock() = Some(*tf);
+    // Rewrite the trapframe for the handler invocation. arg0 = sig,
+    // pc = handler, return address = restorer. sp untouched — the
+    // handler runs on the same user stack (no separate signal stack).
+    tf.set_arg(0, sig as u64);
+    tf.set_epc(action.handler as u64);
+    set_return_addr(tf, action.restorer);
+}
+
+#[cfg(target_arch = "riscv64")]
+fn set_return_addr(tf: &mut <Arch as Hal>::TrapFrame, va: usize) {
+    // riscv: link register is ra (x1) — there's no
+    // `TrapFrameAccess::set_ra` so we go through the concrete type.
+    use hal_riscv64::trapframe::TrapFrame;
+    let rv_tf: &mut TrapFrame = unsafe { &mut *(tf as *mut _ as *mut TrapFrame) };
+    rv_tf.ra = va as u64;
+}
+
+#[cfg(target_arch = "aarch64")]
+fn set_return_addr(tf: &mut <Arch as Hal>::TrapFrame, va: usize) {
+    // aarch64: link register is x30. The TrapFrame stores all GPRs
+    // in a `[u64; 31]` (x0..x30), so x30 is index 30.
+    use hal_aarch64::trapframe::TrapFrame;
+    let a64_tf: &mut TrapFrame = unsafe { &mut *(tf as *mut _ as *mut TrapFrame) };
+    a64_tf.x[30] = va as u64;
 }

@@ -69,3 +69,14 @@ DEFINE_SYSCALL umask,    34
 DEFINE_SYSCALL fcntl,    35
 DEFINE_SYSCALL ftruncate,36
 DEFINE_SYSCALL truncate, 37
+DEFINE_SYSCALL _sys_sigaction, 38
+
+// _sigret — POSIX signal restorer trampoline. Same role as the
+// riscv version: linked into every C user binary, used as the
+// handler's link register so its `ret` falls into SYS_SIGRETURN.
+.section .text, "ax"
+.global _sigret
+_sigret:
+        mov     x8, #39          // SYS_SIGRETURN
+        svc     #0
+1:      b       1b

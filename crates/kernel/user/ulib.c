@@ -108,6 +108,28 @@ memcpy(void *dst, const void *src, uint n)
     return memmove(dst, src, n);
 }
 
+// sigaction(2) — user-facing wrapper that auto-fills the restorer
+// from ulib's `_sigret` stub. The kernel never sees the C-struct
+// shape; we explode `act` into individual syscall args.
+extern int  _sys_sigaction(int signum, void* handler,
+                           void* restorer, unsigned int mask);
+extern void _sigret(void);
+
+int
+sigaction(int signum, const struct sigaction* act,
+          struct sigaction* oldact)
+{
+    void* handler = (act != 0) ? (void*)act->sa_handler : (void*)0;
+    unsigned int mask = (act != 0) ? act->sa_mask : 0u;
+    int prev = _sys_sigaction(signum, handler, (void*)_sigret, mask);
+    if (prev < 0) return -1;
+    if (oldact) {
+        oldact->sa_handler = (sighandler_t)(long)prev;
+        oldact->sa_mask = 0;  // we don't round-trip mask in this slice
+    }
+    return 0;
+}
+
 extern char* sys_sbrk(int n, int lazy);
 
 char*

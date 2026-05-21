@@ -107,6 +107,21 @@ int   fcntl(int fd, int cmd, long arg);
 int   ftruncate(int fd, long length);
 int   truncate(const char* path, long length);
 
+// POSIX-ish sigaction. Slim — we don't expose sa_flags or
+// SA_SIGINFO. `handler` is a function pointer (or SIG_DFL/SIG_IGN);
+// `mask` is the set of signals to block while it runs.
+typedef void (*sighandler_t)(int);
+#define SIG_DFL ((sighandler_t)0)
+#define SIG_IGN ((sighandler_t)1)
+
+struct sigaction {
+    sighandler_t sa_handler;
+    unsigned int sa_mask;
+};
+
+int sigaction(int signum, const struct sigaction* act,
+              struct sigaction* oldact);
+
 #define O_CLOEXEC  0x4000
 #define O_NONBLOCK 0x8000
 
