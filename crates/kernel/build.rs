@@ -155,6 +155,7 @@ fn main() {
         ("chmodtest", "CHMODTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
         ("credtest", "CREDTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
         ("cloexectest", "CLOEXECTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
+        ("trunctest", "TRUNCTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
     ];
     for (name, env_var, lang, with_ulib, supported_archs) in programs {
         if supported_archs.contains(&arch) {

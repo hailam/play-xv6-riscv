@@ -36,6 +36,8 @@ pub const SYS_GETEUID: usize = 32;
 pub const SYS_GETEGID: usize = 33;
 pub const SYS_UMASK: usize = 34;
 pub const SYS_FCNTL: usize = 35;
+pub const SYS_FTRUNCATE: usize = 36;
+pub const SYS_TRUNCATE: usize = 37;
 
 // lseek "whence" values — POSIX-standard.
 pub const SEEK_SET: i32 = 0; // absolute offset

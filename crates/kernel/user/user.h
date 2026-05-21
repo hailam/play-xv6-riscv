@@ -83,6 +83,8 @@ uint  geteuid(void);
 uint  getegid(void);
 uint  umask(uint mask);
 int   fcntl(int fd, int cmd, long arg);
+int   ftruncate(int fd, long length);
+int   truncate(const char* path, long length);
 
 #define O_CLOEXEC  0x4000
 #define O_NONBLOCK 0x8000

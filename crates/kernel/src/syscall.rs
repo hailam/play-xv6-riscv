@@ -24,11 +24,12 @@ use crate::uapi::{
     Stat, FD_CLOEXEC, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL,
     O_APPEND, O_CLOEXEC, O_CREATE, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
     SEEK_CUR, SEEK_END, SEEK_SET, SYS_CHDIR, SYS_CHMOD, SYS_CHOWN, SYS_CLOSE, SYS_DUP,
-    SYS_EXEC, SYS_EXIT, SYS_FCNTL, SYS_FORK, SYS_FSTAT, SYS_GETEGID, SYS_GETEUID,
+    SYS_EXEC, SYS_EXIT, SYS_FCNTL, SYS_FORK, SYS_FSTAT, SYS_FTRUNCATE, SYS_GETEGID,
+    SYS_GETEUID,
     SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_LSEEK, SYS_MKDIR,
     SYS_MKNOD, SYS_OPEN, SYS_PIPE, SYS_PREAD, SYS_PWRITE, SYS_READ, SYS_SBRK, SYS_SETGID,
-    SYS_SETUID, SYS_SLEEP, SYS_STAT, SYS_UMASK, SYS_UNLINK, SYS_UPTIME, SYS_WAIT,
-    SYS_WRITE,
+    SYS_SETUID, SYS_SLEEP, SYS_STAT, SYS_TRUNCATE, SYS_UMASK, SYS_UNLINK, SYS_UPTIME,
+    SYS_WAIT, SYS_WRITE,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -217,6 +218,18 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let cmd = tf.arg(1) as i32;
             let arg = tf.arg(2) as i64;
             sys_fcntl(proc, fd, cmd, arg)
+        }
+        SYS_FTRUNCATE => {
+            let tf = proc.trapframe();
+            let fd = tf.arg(0) as i32;
+            let length = tf.arg(1) as i64;
+            sys_ftruncate(proc, fd, length).await
+        }
+        SYS_TRUNCATE => {
+            let tf = proc.trapframe();
+            let path_va = tf.arg(0) as usize;
+            let length = tf.arg(1) as i64;
+            sys_truncate(proc, path_va, length).await
         }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
@@ -1422,6 +1435,67 @@ async fn sys_chown(proc: &Arc<Proc>, path_va: usize, uid: u16, gid: u16) -> i64 
 /// the kernel-side implementation of `lstat` (which would only
 /// diverge on a symlink — `lstat` reports the link, `stat` chases
 /// it).
+/// POSIX `ftruncate(fd, length)` — resize the file backing `fd` to
+/// `length` bytes. Shrink frees data blocks past `length`; grow
+/// bumps the size and leaves a sparse hole. Requires `fd` to have
+/// been opened with write access.
+async fn sys_ftruncate(proc: &Arc<Proc>, fd: i32, length: i64) -> i64 {
+    if length < 0 || length > u32::MAX as i64 {
+        return -1;
+    }
+    let Some(file) = proc.get_file(fd) else {
+        return -1;
+    };
+    let File::Inode {
+        ip, writable, ..
+    } = &*file
+    else {
+        return -1;
+    };
+    if !*writable {
+        return -1;
+    }
+    fs::log::begin_op().await;
+    {
+        let mut li = fs::inode::ilock(ip).await;
+        fs::inode::itrunc_to(&mut li, length as u32).await;
+    }
+    fs::log::end_op().await;
+    0
+}
+
+/// POSIX `truncate(path, length)` — path-based variant. Requires
+/// write permission on the file.
+async fn sys_truncate(proc: &Arc<Proc>, path_va: usize, length: i64) -> i64 {
+    if length < 0 || length > u32::MAX as i64 {
+        return -1;
+    }
+    let Some(path) = read_user_cstring(proc, path_va, 128) else {
+        return -1;
+    };
+    let Some(ip) = resolve_path(proc, &path).await else {
+        return -1;
+    };
+    // Check write permission (without actually opening).
+    {
+        let li = fs::inode::ilock(&ip).await;
+        let s = li.state();
+        if !check_access(proc, s.uid, s.gid, s.mode, /*r=*/false, /*w=*/true) {
+            return -1;
+        }
+        if s.typ == xv6_fs_layout::T_DIR {
+            return -1;
+        }
+    }
+    fs::log::begin_op().await;
+    {
+        let mut li = fs::inode::ilock(&ip).await;
+        fs::inode::itrunc_to(&mut li, length as u32).await;
+    }
+    fs::log::end_op().await;
+    0
+}
+
 async fn sys_stat(proc: &Arc<Proc>, path_va: usize, stat_va: usize) -> i64 {
     let Some(path) = read_user_cstring(proc, path_va, 128) else {
         return -1;

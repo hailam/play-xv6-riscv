@@ -378,28 +378,113 @@ pub async fn iupdate(li: &LockedInode<'_>) {
 /// all zero and `size == 0`, and `iupdate` has been called to push
 /// that to disk.
 pub async fn itrunc(li: &mut LockedInode<'_>) {
+    itrunc_to(li, 0).await;
+}
+
+/// Truncate `li` to exactly `new_size` bytes. Frees any data blocks
+/// that fall entirely beyond `new_size`. If `new_size` exceeds the
+/// current size, just bumps the size — the gap becomes a sparse
+/// hole. Caller must hold an open log transaction.
+pub async fn itrunc_to(li: &mut LockedInode<'_>, new_size: u32) {
     let dev = li.dev();
-    let addrs = li.state().addrs;
+    let cur_size = li.state().size;
+
+    // Number of data blocks needed to cover [0, new_size). Anything
+    // at block index ≥ keep_blocks gets freed.
+    let keep_blocks = ((new_size + BSIZE as u32 - 1) / BSIZE as u32) as usize;
+
+    // 1) Direct blocks beyond the keep cutoff.
+    let mut addrs = li.state().addrs;
     for i in 0..NDIRECT {
-        if addrs[i] != 0 {
+        if i >= keep_blocks && addrs[i] != 0 {
             crate::fs::bmap::bfree(dev, addrs[i]).await;
+            addrs[i] = 0;
         }
     }
+
+    // 2) Indirect block. If the entire indirect range is gone,
+    //    free every leaf + the indirect block itself. Otherwise
+    //    free just the leaves at indices ≥ (keep_blocks - NDIRECT).
     if addrs[NDIRECT] != 0 {
         let ind_blkno = addrs[NDIRECT];
-        let ind_buf = bio::bread(ind_blkno).await;
-        for j in 0..NINDIRECT {
-            let o = j * 4;
-            let b = u32::from_le_bytes(ind_buf.data()[o..o + 4].try_into().unwrap());
-            if b != 0 {
+        let ind_keep = keep_blocks.saturating_sub(NDIRECT);
+        if ind_keep == 0 {
+            // Free the whole indirect tree.
+            let ind_buf = bio::bread(ind_blkno).await;
+            for j in 0..NINDIRECT {
+                let o = j * 4;
+                let b = u32::from_le_bytes(
+                    ind_buf.data()[o..o + 4].try_into().unwrap(),
+                );
+                if b != 0 {
+                    crate::fs::bmap::bfree(dev, b).await;
+                }
+            }
+            crate::fs::bmap::bfree(dev, ind_blkno).await;
+            addrs[NDIRECT] = 0;
+        } else {
+            // Free leaves at indices ≥ ind_keep; zero out their
+            // slots in the indirect block so writers don't reuse
+            // stale block numbers.
+            let ind_buf = bio::bread(ind_blkno).await;
+            let mut to_free = alloc::vec::Vec::new();
+            unsafe {
+                let data = ind_buf.data_mut();
+                for j in ind_keep..NINDIRECT {
+                    let o = j * 4;
+                    let b = u32::from_le_bytes(
+                        data[o..o + 4].try_into().unwrap(),
+                    );
+                    if b != 0 {
+                        to_free.push(b);
+                        data[o..o + 4].copy_from_slice(&[0u8; 4]);
+                    }
+                }
+            }
+            crate::fs::log::log_write(&ind_buf);
+            for b in to_free {
                 crate::fs::bmap::bfree(dev, b).await;
             }
         }
-        crate::fs::bmap::bfree(dev, ind_blkno).await;
     }
+
+    // If shrinking, zero out the tail of the last-kept block so that
+    // a subsequent grow doesn't expose the bytes we just truncated.
+    // POSIX requires bytes past the new length to be gone.
+    if new_size < cur_size && keep_blocks > 0 {
+        let tail_blk_idx = keep_blocks - 1;
+        let in_blk_off = (new_size as usize) % BSIZE;
+        if in_blk_off > 0 && in_blk_off < BSIZE {
+            let blk_no = if tail_blk_idx < NDIRECT {
+                addrs[tail_blk_idx]
+            } else {
+                let ind_idx = tail_blk_idx - NDIRECT;
+                if addrs[NDIRECT] == 0 {
+                    0
+                } else {
+                    let ind_buf = bio::bread(addrs[NDIRECT]).await;
+                    let o = ind_idx * 4;
+                    u32::from_le_bytes(
+                        ind_buf.data()[o..o + 4].try_into().unwrap(),
+                    )
+                }
+            };
+            if blk_no != 0 {
+                let blk = bio::bread(blk_no).await;
+                unsafe {
+                    let d = blk.data_mut();
+                    for b in &mut d[in_blk_off..] {
+                        *b = 0;
+                    }
+                }
+                crate::fs::log::log_write(&blk);
+            }
+        }
+    }
+
     let state = li.state_mut();
-    state.addrs = [0; NDIRECT + 1];
-    state.size = 0;
+    state.addrs = addrs;
+    state.size = new_size;
     iupdate(li).await;
 }
 
