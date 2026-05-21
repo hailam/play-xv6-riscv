@@ -23,9 +23,10 @@ type TrapFrame = <Arch as Hal>::TrapFrame;
 use crate::uapi::{
     Stat, O_APPEND, O_CREATE, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_END,
     SEEK_SET, SYS_CHDIR, SYS_CHMOD, SYS_CHOWN, SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT,
-    SYS_FORK, SYS_FSTAT, SYS_GETPID, SYS_KILL, SYS_LINK, SYS_LSEEK, SYS_MKDIR, SYS_MKNOD,
-    SYS_OPEN, SYS_PIPE, SYS_PREAD, SYS_PWRITE, SYS_READ, SYS_SBRK, SYS_SLEEP, SYS_STAT,
-    SYS_UNLINK, SYS_UPTIME, SYS_WAIT, SYS_WRITE,
+    SYS_FORK, SYS_FSTAT, SYS_GETEGID, SYS_GETEUID, SYS_GETGID, SYS_GETPID, SYS_GETUID,
+    SYS_KILL, SYS_LINK, SYS_LSEEK, SYS_MKDIR, SYS_MKNOD, SYS_OPEN, SYS_PIPE, SYS_PREAD,
+    SYS_PWRITE, SYS_READ, SYS_SBRK, SYS_SETGID, SYS_SETUID, SYS_SLEEP, SYS_STAT,
+    SYS_UMASK, SYS_UNLINK, SYS_UPTIME, SYS_WAIT, SYS_WRITE,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -177,6 +178,36 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let uid = tf.arg(1) as u16;
             let gid = tf.arg(2) as u16;
             sys_chown(proc, path_va, uid, gid).await
+        }
+        SYS_GETUID | SYS_GETEUID => proc.uid.load(Ordering::Acquire) as i64,
+        SYS_GETGID | SYS_GETEGID => proc.gid.load(Ordering::Acquire) as i64,
+        SYS_SETUID => {
+            let new_uid = proc.trapframe().arg(0) as u32;
+            if proc.uid.load(Ordering::Acquire) != 0 {
+                // Non-root: POSIX would allow set to real/effective/
+                // saved. Without saved IDs the conservative choice is
+                // to refuse any change. Root can freely setuid below.
+                -1
+            } else {
+                proc.uid.store(new_uid, Ordering::Release);
+                0
+            }
+        }
+        SYS_SETGID => {
+            let new_gid = proc.trapframe().arg(0) as u32;
+            if proc.uid.load(Ordering::Acquire) != 0 {
+                -1
+            } else {
+                proc.gid.store(new_gid, Ordering::Release);
+                0
+            }
+        }
+        SYS_UMASK => {
+            // POSIX: returns the previous mask, sets the new one.
+            // mode_t is u32; we store as u32. Mask to 0o777 (xv6
+            // doesn't have setuid/setgid/sticky bits to mask).
+            let mask = (proc.trapframe().arg(0) as u32) & 0o777;
+            proc.umask.swap(mask, Ordering::AcqRel) as i64
         }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
@@ -918,6 +949,10 @@ async fn sys_open(proc: &Arc<Proc>, path_va: usize, flags: u32) -> i64 {
         i
     };
 
+    let readable = (flags & O_WRONLY) == 0;
+    let writable = (flags & (O_WRONLY | O_RDWR)) != 0;
+    let append = (flags & O_APPEND) != 0;
+
     let typ;
     {
         let mut li = fs::inode::ilock(&ip).await;
@@ -928,6 +963,15 @@ async fn sys_open(proc: &Arc<Proc>, path_va: usize, flags: u32) -> i64 {
         if typ == xv6_fs_layout::T_DIR && (flags & (O_WRONLY | O_RDWR)) != 0 {
             return -1; // can't open a directory for writing
         }
+        // POSIX permission check. Skip when the user just got handed
+        // back the inode they created (O_CREATE) — they already have
+        // the right since we just minted it.
+        if (flags & O_CREATE) == 0 {
+            let s = li.state();
+            if !check_access(proc, s.uid, s.gid, s.mode, readable, writable) {
+                return -1;
+            }
+        }
         if (flags & O_TRUNC) != 0 && typ == xv6_fs_layout::T_FILE {
             fs::log::begin_op().await;
             fs::inode::itrunc(&mut li).await;
@@ -936,10 +980,6 @@ async fn sys_open(proc: &Arc<Proc>, path_va: usize, flags: u32) -> i64 {
             fs::log::end_op().await;
         }
     }
-
-    let readable = (flags & O_WRONLY) == 0;
-    let writable = (flags & (O_WRONLY | O_RDWR)) != 0;
-    let append = (flags & O_APPEND) != 0;
     let f = Arc::new(File::Inode {
         ip,
         off: AtomicU32::new(0),
@@ -1033,16 +1073,22 @@ async fn create_at_path(
     {
         return None;
     }
-    // POSIX default mode by file type. umask isn't tracked yet —
-    // when it lands, mask `mode &= !proc.umask` here.
-    let mode = match typ {
-        xv6_fs_layout::T_DIR => 0o755,
-        xv6_fs_layout::T_FILE => 0o644,
+    // POSIX default mode by file type, then mask with the proc's
+    // umask. With the default umask=0o022 this matches what we used
+    // to hard-code (0o644 file, 0o755 dir).
+    let default_mode: u16 = match typ {
+        xv6_fs_layout::T_DIR => 0o777,
+        xv6_fs_layout::T_FILE => 0o666,
         xv6_fs_layout::T_DEVICE => 0o666,
-        _ => 0o644,
+        _ => 0o666,
     };
+    let umask = proc.umask.load(Ordering::Acquire) as u16;
+    let mode = default_mode & !umask;
+    let uid = proc.uid.load(Ordering::Acquire) as u16;
+    let gid = proc.gid.load(Ordering::Acquire) as u16;
     fs::log::begin_op().await;
-    let result = create_inside_op(&dir, &name, typ, major, minor, mode).await;
+    let result =
+        create_inside_op(&dir, &name, typ, major, minor, mode, uid, gid).await;
     fs::log::end_op().await;
     result
 }
@@ -1054,6 +1100,8 @@ async fn create_inside_op(
     major: u16,
     minor: u16,
     mode: u16,
+    uid: u16,
+    gid: u16,
 ) -> Option<Arc<crate::fs::inode::Inode>> {
     let mut dir_li = fs::inode::ilock(dir).await;
 
@@ -1084,6 +1132,8 @@ async fn create_inside_op(
         child_li.state_mut().major = major;
         child_li.state_mut().minor = minor;
         child_li.state_mut().nlink = 1;
+        child_li.state_mut().uid = uid;
+        child_li.state_mut().gid = gid;
         fs::inode::iupdate(&child_li).await;
 
         if typ == xv6_fs_layout::T_DIR {
@@ -1117,9 +1167,44 @@ async fn sys_fstat(proc: &Arc<Proc>, fd: i32, stat_va: usize) -> i64 {
     stat_inode_into_user(proc, ip, stat_va).await
 }
 
+/// Discretionary-access check. Returns true if `proc` may open the
+/// inode with the requested read/write bits.
+///
+/// Standard 3-tier POSIX: owner → group → world. The kernel uses
+/// uid 0 (root) as the universal bypass. We have no group membership
+/// table yet, so a user is in a group only if their proc.gid matches
+/// the inode's gid.
+fn check_access(
+    proc: &Arc<Proc>,
+    inode_uid: u16,
+    inode_gid: u16,
+    inode_mode: u16,
+    want_read: bool,
+    want_write: bool,
+) -> bool {
+    let uid = proc.uid.load(Ordering::Acquire);
+    if uid == 0 {
+        return true;
+    }
+    let gid = proc.gid.load(Ordering::Acquire);
+    let bits = if uid == inode_uid as u32 {
+        (inode_mode >> 6) & 0o7
+    } else if gid == inode_gid as u32 {
+        (inode_mode >> 3) & 0o7
+    } else {
+        inode_mode & 0o7
+    };
+    if want_read && (bits & 0o4) == 0 {
+        return false;
+    }
+    if want_write && (bits & 0o2) == 0 {
+        return false;
+    }
+    true
+}
+
 /// POSIX `chmod(path, mode)` — change a file's permission bits.
-/// No permission check yet (we'd need per-proc uid; for now any
-/// process can chmod any file).
+/// Only the owner (or root) may chmod.
 async fn sys_chmod(proc: &Arc<Proc>, path_va: usize, mode: u16) -> i64 {
     let Some(path) = read_user_cstring(proc, path_va, 128) else {
         return -1;
@@ -1127,19 +1212,31 @@ async fn sys_chmod(proc: &Arc<Proc>, path_va: usize, mode: u16) -> i64 {
     let Some(ip) = resolve_path(proc, &path).await else {
         return -1;
     };
+    let caller_uid = proc.uid.load(Ordering::Acquire);
     fs::log::begin_op().await;
-    {
+    let result: i64 = {
         let mut li = fs::inode::ilock(&ip).await;
-        li.state_mut().mode = mode;
-        fs::inode::iupdate(&li).await;
-    }
+        if caller_uid != 0 && (li.state().uid as u32) != caller_uid {
+            -1
+        } else {
+            li.state_mut().mode = mode;
+            fs::inode::iupdate(&li).await;
+            0
+        }
+    };
     fs::log::end_op().await;
-    0
+    result
 }
 
 /// POSIX `chown(path, uid, gid)` — change owner/group. `uid==-1` or
 /// `gid==-1` (sentinel u16::MAX here) leaves that field untouched.
+/// Only root may chown to an arbitrary uid; the owner may change gid
+/// to a group they're a member of, but we don't track group lists yet
+/// so we restrict gid-only changes to root too.
 async fn sys_chown(proc: &Arc<Proc>, path_va: usize, uid: u16, gid: u16) -> i64 {
+    if proc.uid.load(Ordering::Acquire) != 0 {
+        return -1;
+    }
     let Some(path) = read_user_cstring(proc, path_va, 128) else {
         return -1;
     };

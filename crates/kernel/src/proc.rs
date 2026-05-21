@@ -70,6 +70,15 @@ pub struct Proc {
     /// first `bringup_then_init` sets it to inode 1 (root) on the
     /// init proc, and every `fork` clones the parent's cwd.
     pub cwd: SpinLock<Option<Arc<crate::fs::inode::Inode>>>,
+    /// POSIX credentials. Collapsed model — no separate
+    /// real/effective/saved-set IDs (we don't have setuid binaries),
+    /// so getuid/geteuid both read this, and setuid/seteuid both
+    /// write it. Default 0 (root) at boot; init runs as root.
+    pub uid: AtomicU32,
+    pub gid: AtomicU32,
+    /// Per-proc file-creation mask. Bits set here are cleared from
+    /// the mode passed to `create_at_path`. Default 0o022.
+    pub umask: AtomicU32,
 }
 
 impl Proc {
@@ -148,6 +157,10 @@ impl Proc {
         let child = Self::with_layout(pt, tf_pa, code_end, child_files);
         // Child inherits the parent's cwd (Arc clone — same inode).
         *child.cwd.lock() = parent.cwd.lock().clone();
+        // Inherit credentials and umask.
+        child.uid.store(parent.uid.load(Ordering::Acquire), Ordering::Release);
+        child.gid.store(parent.gid.load(Ordering::Acquire), Ordering::Release);
+        child.umask.store(parent.umask.load(Ordering::Acquire), Ordering::Release);
         Some(child)
     }
 
@@ -172,6 +185,9 @@ impl Proc {
             killed: AtomicBool::new(false),
             files: SpinLock::new(files),
             cwd: SpinLock::new(None),
+            uid: AtomicU32::new(0),
+            gid: AtomicU32::new(0),
+            umask: AtomicU32::new(0o022),
         }
     }
 

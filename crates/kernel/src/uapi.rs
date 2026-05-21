@@ -28,6 +28,13 @@ pub const SYS_PWRITE: usize = 24;
 pub const SYS_STAT: usize = 25;
 pub const SYS_CHMOD: usize = 26;
 pub const SYS_CHOWN: usize = 27;
+pub const SYS_GETUID: usize = 28;
+pub const SYS_GETGID: usize = 29;
+pub const SYS_SETUID: usize = 30;
+pub const SYS_SETGID: usize = 31;
+pub const SYS_GETEUID: usize = 32;
+pub const SYS_GETEGID: usize = 33;
+pub const SYS_UMASK: usize = 34;
 
 // lseek "whence" values — POSIX-standard.
 pub const SEEK_SET: i32 = 0; // absolute offset
