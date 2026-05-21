@@ -57,7 +57,8 @@ fs.img: build $(MKFS)
 		xv6test:$(USER_DIR)/xv6test.elf \
 		lazytest:$(USER_DIR)/lazytest.elf \
 		usertests:$(USER_DIR)/usertests.elf \
-		seektest:$(USER_DIR)/seektest.elf
+		seektest:$(USER_DIR)/seektest.elf \
+		chmodtest:$(USER_DIR)/chmodtest.elf
 
 qemu: build fs.img
 	$(QEMU) $(QEMUOPTS)
@@ -99,7 +100,8 @@ fs-aarch64.img: build-aarch64 $(MKFS)
 		xv6test:$(AARCH64_USER_DIR)/xv6test.elf \
 		lazytest:$(AARCH64_USER_DIR)/lazytest.elf \
 		usertests:$(AARCH64_USER_DIR)/usertests.elf \
-		seektest:$(AARCH64_USER_DIR)/seektest.elf
+		seektest:$(AARCH64_USER_DIR)/seektest.elf \
+		chmodtest:$(AARCH64_USER_DIR)/chmodtest.elf
 
 qemu-aarch64: build-aarch64 fs-aarch64.img
 	$(QEMU_AARCH64) $(AARCH64_QEMUOPTS)

@@ -26,6 +26,8 @@ pub const SYS_LSEEK: usize = 22;
 pub const SYS_PREAD: usize = 23;
 pub const SYS_PWRITE: usize = 24;
 pub const SYS_STAT: usize = 25;
+pub const SYS_CHMOD: usize = 26;
+pub const SYS_CHOWN: usize = 27;
 
 // lseek "whence" values — POSIX-standard.
 pub const SEEK_SET: i32 = 0; // absolute offset
@@ -41,8 +43,16 @@ pub const O_TRUNC: u32 = 0x400;
 // POSIX additions (Tier 1 of the posix-compat track).
 pub const O_APPEND: u32 = 0x800;
 
-/// User-visible `struct stat`. Field order + size matches xv6
-/// `kernel/stat.h`. Total = 24 bytes (4 + 4 + 2 + 2 + 4 pad + 8).
+/// User-visible `struct stat`. Extended from xv6's 24-byte layout
+/// to expose POSIX `st_mode`/`st_uid`/`st_gid`. Total now 36 bytes:
+///
+///   dev:i32 ino:u32 typ:i16 nlink:i16 pad:u32 size:u64
+///   mode:u32 uid:u16 gid:u16
+///
+/// `typ` stays for backward compat with anything that read the old
+/// 24-byte layout. `mode` synthesises POSIX-style `S_IFREG`/
+/// `S_IFDIR`/`S_IFCHR` in the upper 4 bits and the rwx perm bits
+/// in the lower 12 — what `chmod` and `umask` actually manipulate.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Stat {
@@ -52,4 +62,27 @@ pub struct Stat {
     pub nlink: i16,
     pub _pad: u32,
     pub size: u64,
+    pub mode: u32,
+    pub uid: u16,
+    pub gid: u16,
+}
+
+// POSIX S_IF* file-type bits (top of st_mode).
+pub const S_IFMT: u32 = 0o170000;
+pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFCHR: u32 = 0o020000;
+pub const S_IFREG: u32 = 0o100000;
+
+/// Build a POSIX `st_mode` from xv6's typ + perm bits. Used by
+/// fstat/stat to fill the new `mode` field.
+#[inline]
+pub fn stat_mode(typ: u16, perm: u16) -> u32 {
+    use xv6_fs_layout::{T_DEVICE, T_DIR, T_FILE};
+    let kind = match typ {
+        T_DIR => S_IFDIR,
+        T_FILE => S_IFREG,
+        T_DEVICE => S_IFCHR,
+        _ => 0,
+    };
+    kind | (perm as u32 & 0o7777)
 }

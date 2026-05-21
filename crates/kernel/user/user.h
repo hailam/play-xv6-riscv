@@ -22,9 +22,27 @@ struct stat {
     uint         ino;
     short        type;
     short        nlink;
-    uint         _pad;          // matches our current kernel layout (G2 not yet fixed)
+    uint         _pad;
     uint64       size;
+    uint         mode;          // POSIX st_mode (S_IF* | rwx perms)
+    ushort       uid;
+    ushort       gid;
 };
+
+// POSIX st_mode bits.
+#define S_IFMT   0170000
+#define S_IFDIR  0040000
+#define S_IFCHR  0020000
+#define S_IFREG  0100000
+#define S_IRWXU  0000700
+#define S_IRUSR  0000400
+#define S_IWUSR  0000200
+#define S_IXUSR  0000100
+#define S_IRWXG  0000070
+#define S_IRWXO  0000007
+#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#define S_ISCHR(m) (((m) & S_IFMT) == S_IFCHR)
 
 struct dirent {
     ushort inum;
@@ -55,6 +73,8 @@ int   mknod(const char*, short, short);
 int   unlink(const char*);
 int   fstat(int fd, struct stat*);
 int   stat(const char*, struct stat*);
+int   chmod(const char* path, uint mode);
+int   chown(const char* path, ushort uid, ushort gid);
 int   link(const char*, const char*);
 int   mkdir(const char*);
 int   chdir(const char*);

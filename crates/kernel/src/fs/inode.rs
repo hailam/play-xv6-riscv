@@ -31,6 +31,9 @@ pub struct InodeState {
     pub major: u16,
     pub minor: u16,
     pub nlink: u16,
+    pub mode: u16,
+    pub uid: u16,
+    pub gid: u16,
     pub size: u32,
     pub addrs: [u32; NDIRECT + 1],
 }
@@ -63,6 +66,9 @@ impl Inode {
                 major: 0,
                 minor: 0,
                 nlink: 0,
+                mode: 0,
+                uid: 0,
+                gid: 0,
                 size: 0,
                 addrs: [0; NDIRECT + 1],
             }),
@@ -211,6 +217,9 @@ async fn load_from_disk(ip: &Arc<Inode>) {
         major: dino.major,
         minor: dino.minor,
         nlink: dino.nlink,
+        mode: dino.mode,
+        uid: dino.uid,
+        gid: dino.gid,
         size: dino.size,
         addrs: dino.addrs,
     };
@@ -344,8 +353,12 @@ pub async fn iupdate(li: &LockedInode<'_>) {
         major: s.major,
         minor: s.minor,
         nlink: s.nlink,
+        mode: s.mode,
+        uid: s.uid,
+        gid: s.gid,
         size: s.size,
         addrs: s.addrs,
+        ..DInode::default()
     };
     let bytes = unsafe {
         core::slice::from_raw_parts(
@@ -390,9 +403,19 @@ pub async fn itrunc(li: &mut LockedInode<'_>) {
     iupdate(li).await;
 }
 
-/// Find a free on-disk inode slot, claim it with `typ`, and return an
-/// `Arc<Inode>` for it. Caller must hold an open log transaction.
-pub async fn ialloc(dev: u32, typ: u16) -> Option<Arc<Inode>> {
+/// Find a free on-disk inode slot, claim it with `typ`/`mode`, and
+/// return an `Arc<Inode>` for it. Caller must hold an open log
+/// transaction.
+///
+/// `mode` carries POSIX-style permission bits (rwxrwxrwx + sticky).
+/// File-type bits (S_IFDIR/S_IFREG) live in `typ`; this routine
+/// doesn't merge them — `Stat` synthesises the combined `st_mode`
+/// on demand.
+///
+/// uid/gid default to 0 because `Proc` doesn't track per-process
+/// credentials yet. When that lands, switch the call sites to
+/// pass `proc.uid` / `proc.gid`.
+pub async fn ialloc(dev: u32, typ: u16, mode: u16) -> Option<Arc<Inode>> {
     let sb = superblock::get();
     for inum in 1..sb.ninodes {
         let blkno = inum / IPB + sb.inodestart;
@@ -404,11 +427,9 @@ pub async fn ialloc(dev: u32, typ: u16) -> Option<Arc<Inode>> {
         if dino.typ == 0 {
             dino = DInode {
                 typ,
-                major: 0,
-                minor: 0,
                 nlink: 1,
-                size: 0,
-                addrs: [0; NDIRECT + 1],
+                mode,
+                ..DInode::default()
             };
             let bytes = unsafe {
                 core::slice::from_raw_parts(

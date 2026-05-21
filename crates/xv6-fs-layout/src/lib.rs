@@ -45,7 +45,17 @@ impl Superblock {
     }
 }
 
-/// On-disk inode (packed into inode blocks). 64 bytes each.
+/// On-disk inode (packed into inode blocks). 128 bytes each — bumped
+/// from xv6's 64 to make room for POSIX mode/uid/gid plus reserved
+/// space for future timestamps. IPB = BSIZE/128 = 4.
+///
+/// Layout:
+///   typ/major/minor/nlink/mode/uid/gid + 1 reserved u16  =  16 B
+///   size + 3 reserved u32 (atime/mtime/ctime placeholder) =  16 B
+///   addrs [u32; 13]                                       =  52 B
+///   _reserved [u8; 44]                                    =  44 B
+///                                                          ----
+///                                                          128 B
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DInode {
@@ -53,8 +63,14 @@ pub struct DInode {
     pub major: u16,
     pub minor: u16,
     pub nlink: u16,
+    pub mode: u16,
+    pub uid: u16,
+    pub gid: u16,
+    pub _reserved0: u16,
     pub size: u32,
+    pub _reserved_time: [u32; 3],
     pub addrs: [u32; NDIRECT + 1],
+    pub _reserved_tail: [u8; 44],
 }
 
 impl Default for DInode {
@@ -64,8 +80,14 @@ impl Default for DInode {
             major: 0,
             minor: 0,
             nlink: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            _reserved0: 0,
             size: 0,
+            _reserved_time: [0; 3],
             addrs: [0; NDIRECT + 1],
+            _reserved_tail: [0; 44],
         }
     }
 }
@@ -98,7 +120,7 @@ pub const fn iblock(inum: u32, sb: &Superblock) -> u32 {
 
 const _: () = {
     assert!(core::mem::size_of::<Superblock>() <= BSIZE);
-    assert!(core::mem::size_of::<DInode>() == 64);
+    assert!(core::mem::size_of::<DInode>() == 128);
     assert!(core::mem::size_of::<Dirent>() == 16);
     assert!(BSIZE % core::mem::size_of::<DInode>() == 0);
 };

@@ -22,10 +22,10 @@ use crate::user_vm::STACK_VA_BASE;
 type TrapFrame = <Arch as Hal>::TrapFrame;
 use crate::uapi::{
     Stat, O_APPEND, O_CREATE, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_END,
-    SEEK_SET, SYS_CHDIR, SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FSTAT,
-    SYS_GETPID, SYS_KILL, SYS_LINK, SYS_LSEEK, SYS_MKDIR, SYS_MKNOD, SYS_OPEN, SYS_PIPE,
-    SYS_PREAD, SYS_PWRITE, SYS_READ, SYS_SBRK, SYS_SLEEP, SYS_STAT, SYS_UNLINK,
-    SYS_UPTIME, SYS_WAIT, SYS_WRITE,
+    SEEK_SET, SYS_CHDIR, SYS_CHMOD, SYS_CHOWN, SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT,
+    SYS_FORK, SYS_FSTAT, SYS_GETPID, SYS_KILL, SYS_LINK, SYS_LSEEK, SYS_MKDIR, SYS_MKNOD,
+    SYS_OPEN, SYS_PIPE, SYS_PREAD, SYS_PWRITE, SYS_READ, SYS_SBRK, SYS_SLEEP, SYS_STAT,
+    SYS_UNLINK, SYS_UPTIME, SYS_WAIT, SYS_WRITE,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -162,6 +162,21 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let path_va = tf.arg(0) as usize;
             let stat_va = tf.arg(1) as usize;
             sys_stat(proc, path_va, stat_va).await
+        }
+        SYS_CHMOD => {
+            let tf = proc.trapframe();
+            let path_va = tf.arg(0) as usize;
+            // mode_t is u32 in POSIX. Truncate the 12 low bits we
+            // store (rwxrwxrwx + sticky/setuid/setgid).
+            let mode = (tf.arg(1) as u32) & 0o7777;
+            sys_chmod(proc, path_va, mode as u16).await
+        }
+        SYS_CHOWN => {
+            let tf = proc.trapframe();
+            let path_va = tf.arg(0) as usize;
+            let uid = tf.arg(1) as u16;
+            let gid = tf.arg(2) as u16;
+            sys_chown(proc, path_va, uid, gid).await
         }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
@@ -1018,8 +1033,16 @@ async fn create_at_path(
     {
         return None;
     }
+    // POSIX default mode by file type. umask isn't tracked yet —
+    // when it lands, mask `mode &= !proc.umask` here.
+    let mode = match typ {
+        xv6_fs_layout::T_DIR => 0o755,
+        xv6_fs_layout::T_FILE => 0o644,
+        xv6_fs_layout::T_DEVICE => 0o666,
+        _ => 0o644,
+    };
     fs::log::begin_op().await;
-    let result = create_inside_op(&dir, &name, typ, major, minor).await;
+    let result = create_inside_op(&dir, &name, typ, major, minor, mode).await;
     fs::log::end_op().await;
     result
 }
@@ -1030,6 +1053,7 @@ async fn create_inside_op(
     typ: u16,
     major: u16,
     minor: u16,
+    mode: u16,
 ) -> Option<Arc<crate::fs::inode::Inode>> {
     let mut dir_li = fs::inode::ilock(dir).await;
 
@@ -1054,7 +1078,7 @@ async fn create_inside_op(
     }
 
     let dev = dir_li.dev();
-    let child = fs::inode::ialloc(dev, typ).await?;
+    let child = fs::inode::ialloc(dev, typ, mode).await?;
     {
         let mut child_li = fs::inode::ilock(&child).await;
         child_li.state_mut().major = major;
@@ -1093,6 +1117,50 @@ async fn sys_fstat(proc: &Arc<Proc>, fd: i32, stat_va: usize) -> i64 {
     stat_inode_into_user(proc, ip, stat_va).await
 }
 
+/// POSIX `chmod(path, mode)` — change a file's permission bits.
+/// No permission check yet (we'd need per-proc uid; for now any
+/// process can chmod any file).
+async fn sys_chmod(proc: &Arc<Proc>, path_va: usize, mode: u16) -> i64 {
+    let Some(path) = read_user_cstring(proc, path_va, 128) else {
+        return -1;
+    };
+    let Some(ip) = resolve_path(proc, &path).await else {
+        return -1;
+    };
+    fs::log::begin_op().await;
+    {
+        let mut li = fs::inode::ilock(&ip).await;
+        li.state_mut().mode = mode;
+        fs::inode::iupdate(&li).await;
+    }
+    fs::log::end_op().await;
+    0
+}
+
+/// POSIX `chown(path, uid, gid)` — change owner/group. `uid==-1` or
+/// `gid==-1` (sentinel u16::MAX here) leaves that field untouched.
+async fn sys_chown(proc: &Arc<Proc>, path_va: usize, uid: u16, gid: u16) -> i64 {
+    let Some(path) = read_user_cstring(proc, path_va, 128) else {
+        return -1;
+    };
+    let Some(ip) = resolve_path(proc, &path).await else {
+        return -1;
+    };
+    fs::log::begin_op().await;
+    {
+        let mut li = fs::inode::ilock(&ip).await;
+        if uid != u16::MAX {
+            li.state_mut().uid = uid;
+        }
+        if gid != u16::MAX {
+            li.state_mut().gid = gid;
+        }
+        fs::inode::iupdate(&li).await;
+    }
+    fs::log::end_op().await;
+    0
+}
+
 /// POSIX `stat(path, &stat)` — like `fstat` but takes a path string
 /// instead of an open fd. We have no symlinks yet, so this is also
 /// the kernel-side implementation of `lstat` (which would only
@@ -1109,13 +1177,13 @@ async fn sys_stat(proc: &Arc<Proc>, path_va: usize, stat_va: usize) -> i64 {
 }
 
 /// Shared implementation: stat the locked inode and copy out the
-/// 24-byte `Stat` struct to the user buffer at `stat_va`.
+/// `Stat` struct to the user buffer at `stat_va`.
 async fn stat_inode_into_user(
     proc: &Arc<Proc>,
     ip: &Arc<crate::fs::inode::Inode>,
     stat_va: usize,
 ) -> i64 {
-    let (typ, nlink, size, inum, dev);
+    let (typ, nlink, size, inum, dev, mode_bits, uid, gid);
     {
         let li = fs::inode::ilock(ip).await;
         let s = li.state();
@@ -1124,6 +1192,9 @@ async fn stat_inode_into_user(
         size = s.size as u64;
         inum = li.inum();
         dev = li.dev() as i32;
+        mode_bits = s.mode;
+        uid = s.uid;
+        gid = s.gid;
     }
     let st = Stat {
         dev,
@@ -1132,6 +1203,9 @@ async fn stat_inode_into_user(
         nlink,
         _pad: 0,
         size,
+        mode: crate::uapi::stat_mode(typ as u16, mode_bits),
+        uid,
+        gid,
     };
     let bytes = unsafe {
         core::slice::from_raw_parts(

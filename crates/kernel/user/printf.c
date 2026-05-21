@@ -78,6 +78,11 @@ vprintf(int fd, const char *fmt, va_list ap)
             } else if (c0 == 'l' && c1 == 'l' && c2 == 'x') {
                 printint(fd, va_arg(ap, uint64), 16, 0);
                 i += 2;
+            } else if (c0 == 'o') {
+                printint(fd, va_arg(ap, uint32), 8, 0);
+            } else if (c0 == 'l' && c1 == 'o') {
+                printint(fd, va_arg(ap, uint64), 8, 0);
+                i += 1;
             } else if (c0 == 'p') {
                 printptr(fd, va_arg(ap, uint64));
             } else if (c0 == 'c') {

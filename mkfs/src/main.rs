@@ -129,9 +129,20 @@ impl FsBuilder {
         let inum = self.next_inum;
         self.next_inum += 1;
         assert!(inum < NINODES, "inode table full");
+        // POSIX default mode by type. Matches the kernel-side
+        // `create_at_path` defaults so files in fs.img get the same
+        // perms whether they were written by mkfs or by a running
+        // user proc via open(O_CREATE).
+        let mode = match typ {
+            xv6_fs_layout::T_DIR => 0o755,
+            xv6_fs_layout::T_FILE => 0o644,
+            xv6_fs_layout::T_DEVICE => 0o666,
+            _ => 0o644,
+        };
         let dino = DInode {
             typ,
             nlink: 1,
+            mode,
             ..DInode::default()
         };
         self.write_inode(inum, &dino);

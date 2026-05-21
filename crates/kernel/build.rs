@@ -152,6 +152,7 @@ fn main() {
         ("lazytest", "LAZYTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
         ("usertests", "USERTESTS_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
         ("seektest", "SEEKTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
+        ("chmodtest", "CHMODTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
     ];
     for (name, env_var, lang, with_ulib, supported_archs) in programs {
         if supported_archs.contains(&arch) {
