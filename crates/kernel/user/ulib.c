@@ -115,6 +115,108 @@ extern int  _sys_sigaction(int signum, void* handler,
                            void* restorer, unsigned int mask);
 extern void _sigret(void);
 
+// Global pointer to the environment array. _start (in ulib.S /
+// ulib-aarch64.S) stores envp from x2/a2 here at process start.
+// init starts with environ == NULL (no envp from kernel); getenv
+// returns NULL in that case.
+char** environ;
+
+// Track whether we own (i.e. have malloced) the current environ
+// array. The original from the kernel lives on the user stack and
+// must not be free()d. After the first setenv-that-grows we
+// allocate a new array and switch.
+static int environ_owned = 0;
+
+static int env_match(const char* entry, const char* name) {
+    while (*name) {
+        if (*entry != *name) return 0;
+        entry++;
+        name++;
+    }
+    return *entry == '=';
+}
+
+char*
+getenv(const char* name)
+{
+    if (!environ || !name) return 0;
+    for (char** p = environ; *p; p++) {
+        if (env_match(*p, name)) {
+            char* eq = *p;
+            while (*eq && *eq != '=') eq++;
+            if (*eq == '=') return eq + 1;
+            return (char*)"";
+        }
+    }
+    return 0;
+}
+
+static int env_len(char** v) {
+    int n = 0;
+    if (v) while (v[n]) n++;
+    return n;
+}
+
+int
+setenv(const char* name, const char* value, int overwrite)
+{
+    if (!name || !value) return -1;
+    // Build the "name=value" buffer.
+    int nlen = strlen(name);
+    int vlen = strlen(value);
+    char* buf = (char*)malloc(nlen + 1 + vlen + 1);
+    if (!buf) return -1;
+    memcpy(buf, name, nlen);
+    buf[nlen] = '=';
+    memcpy(buf + nlen + 1, value, vlen);
+    buf[nlen + 1 + vlen] = 0;
+
+    // If `name` already in environ, replace (or skip if !overwrite).
+    if (environ) {
+        for (char** p = environ; *p; p++) {
+            if (env_match(*p, name)) {
+                if (!overwrite) {
+                    free(buf);
+                    return 0;
+                }
+                // Leak the prior entry — we don't know if it was
+                // malloced or from the kernel-built initial array.
+                *p = buf;
+                return 0;
+            }
+        }
+    }
+    // Append: grow environ.
+    int n = env_len(environ);
+    char** new_env = (char**)malloc((n + 2) * sizeof(char*));
+    if (!new_env) {
+        free(buf);
+        return -1;
+    }
+    for (int i = 0; i < n; i++) new_env[i] = environ[i];
+    new_env[n] = buf;
+    new_env[n + 1] = 0;
+    if (environ_owned) free(environ);
+    environ = new_env;
+    environ_owned = 1;
+    return 0;
+}
+
+int
+unsetenv(const char* name)
+{
+    if (!environ || !name) return 0;
+    int n = env_len(environ);
+    int w = 0;
+    for (int r = 0; r < n; r++) {
+        if (!env_match(environ[r], name)) {
+            environ[w++] = environ[r];
+        }
+    }
+    environ[w] = 0;
+    return 0;
+}
+
 int
 sigaction(int signum, const struct sigaction* act,
           struct sigaction* oldact)

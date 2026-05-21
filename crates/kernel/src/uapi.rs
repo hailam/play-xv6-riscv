@@ -49,6 +49,7 @@ pub const SYS_PAUSE: usize = 45;
 pub const SYS_ALARM: usize = 46;
 pub const SYS_CLOCK_GETTIME: usize = 47;
 pub const SYS_GETDENTS: usize = 48;
+pub const SYS_EXECVE: usize = 49;
 
 // waitpid options
 pub const WNOHANG: i32 = 1;

@@ -32,8 +32,8 @@ use crate::uapi::{
     SYS_TRUNCATE, SYS_UMASK, SYS_UNLINK, SYS_UPTIME, SYS_WAIT, SYS_WRITE,
     SYS_DUP2, SYS_GETCWD, SYS_RENAME,
     SYS_WAITPID, SYS_PAUSE, SYS_ALARM, WNOHANG,
-    SYS_CLOCK_GETTIME, SYS_GETDENTS, CLOCK_MONOTONIC, CLOCK_REALTIME,
-    Timespec, UserDirent,
+    SYS_CLOCK_GETTIME, SYS_GETDENTS, SYS_EXECVE, CLOCK_MONOTONIC,
+    CLOCK_REALTIME, Timespec, UserDirent,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -295,6 +295,13 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let buf_va = tf.arg(1) as usize;
             let len = tf.arg(2) as usize;
             sys_getdents(proc, fd, buf_va, len).await
+        }
+        SYS_EXECVE => {
+            let tf = proc.trapframe();
+            let path_va = tf.arg(0) as usize;
+            let argv_va = tf.arg(1) as usize;
+            let envp_va = tf.arg(2) as usize;
+            sys_execve(proc, path_va, argv_va, envp_va).await
         }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
@@ -2262,14 +2269,33 @@ async fn stat_inode_into_user(
 // ---------- sys_exec --------------------------------------------------------
 
 async fn sys_exec(proc: &Arc<Proc>, path_va: usize, argv_va: usize) -> i64 {
+    sys_execve(proc, path_va, argv_va, 0).await
+}
+
+/// POSIX `execve(path, argv, envp)` — like `exec` but also accepts
+/// an env-string array. `envp_va == 0` is treated as empty envp
+/// (matches the legacy `exec` entry point).
+async fn sys_execve(
+    proc: &Arc<Proc>,
+    path_va: usize,
+    argv_va: usize,
+    envp_va: usize,
+) -> i64 {
     let Some(path) = read_user_cstring(proc, path_va, 128) else {
         return -1;
     };
     let Some(argv) = read_user_argv(proc, argv_va, MAX_ARGS, MAX_ARG_LEN) else {
         return -1;
     };
+    let envp = if envp_va == 0 {
+        alloc::vec::Vec::new()
+    } else {
+        match read_user_argv(proc, envp_va, MAX_ARGS, MAX_ARG_LEN) {
+            Some(e) => e,
+            None => return -1,
+        }
+    };
 
-    // Load the ELF bytes from the on-disk file pointed to by `path`.
     let bin = match read_file_fully(proc, &path).await {
         Some(b) => b,
         None => {
@@ -2285,22 +2311,20 @@ async fn sys_exec(proc: &Arc<Proc>, path_va: usize, argv_va: usize) -> i64 {
             return -1;
         }
     };
-    let (sp_va, argv_array_va) =
-        crate::user_vm::place_argv_on_stack(image.stack_pa, &argv);
+    let (sp_va, argv_array_va, envp_array_va) =
+        crate::user_vm::place_argv_envp_on_stack(image.stack_pa, &argv, &envp);
     let argc = argv.len() as i64;
     let entry = image.entry;
     let code_end = image.code_end;
 
     proc.replace_image(image.pagetable, code_end);
-    // POSIX: fds marked FD_CLOEXEC close at exec time.
     proc.close_on_exec();
     let tf = proc.trapframe();
     *tf = TrapFrame::default();
     tf.set_epc(entry as u64);
     tf.set_sp(sp_va as u64);
     tf.set_arg(1, argv_array_va as u64);
-    // `proc_main` writes our return value into `tf.a0` → becomes the
-    // new image's `a0` (i.e., `argc`) when sret to user mode.
+    tf.set_arg(2, envp_array_va as u64);
     argc
 }
 

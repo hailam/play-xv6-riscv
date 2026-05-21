@@ -70,25 +70,55 @@ pub fn build_image_from_elf(
 /// Push the argv/argc layout near the top of the stack page. Returns
 /// `(initial_sp_va, argv_array_va)`.
 pub fn place_argv_on_stack(stack_pa: usize, argv: &[String]) -> (usize, usize) {
+    let (sp, argv_va, _) = place_argv_envp_on_stack(stack_pa, argv, &[]);
+    (sp, argv_va)
+}
+
+/// Lay out (argc, argv\[\], envp\[\]) + their backing strings near
+/// the top of the stack page. Returns `(initial_sp_va, argv_array_va,
+/// envp_array_va)`. envp_array_va == 0 when envp is empty.
+///
+/// Stack layout (low → high):
+///   sp_va        : argc (u64)
+///   sp_va + 8    : argv[0..argc+1] (NULL-terminated)
+///   ...          : envp[0..n+1]    (NULL-terminated; absent if empty)
+///   ...          : argv strings  (NUL-terminated, packed)
+///   ...          : envp strings
+///   STACK_VA_TOP : end
+pub fn place_argv_envp_on_stack(
+    stack_pa: usize,
+    argv: &[String],
+    envp: &[String],
+) -> (usize, usize, usize) {
     let argc = argv.len();
-    let strings_bytes: usize = argv.iter().map(|s| s.len() + 1).sum();
-    let strings_aligned = (strings_bytes + 7) & !7;
-    let argv_bytes = 8 * (argc + 1);
-    let total = 8 + argv_bytes + strings_aligned;
-    assert!(total < PGSIZE, "argv layout doesn't fit in one stack page");
+    let envc = envp.len();
+    let argv_strings: usize = argv.iter().map(|s| s.len() + 1).sum();
+    let envp_strings: usize = envp.iter().map(|s| s.len() + 1).sum();
+    let strings_aligned = (argv_strings + envp_strings + 7) & !7;
+    let argv_array_bytes = 8 * (argc + 1);
+    let envp_array_bytes = if envc == 0 { 0 } else { 8 * (envc + 1) };
+    let total = 8 + argv_array_bytes + envp_array_bytes + strings_aligned;
+    assert!(total < PGSIZE, "argv/envp layout doesn't fit in one stack page");
 
     let sp_va = STACK_VA_TOP - total;
     let argv_array_va = sp_va + 8;
-    let strings_start_va = sp_va + 8 + argv_bytes;
+    let envp_array_va = if envc == 0 { 0 } else { argv_array_va + argv_array_bytes };
+    let strings_start_va = sp_va + 8 + argv_array_bytes + envp_array_bytes;
 
     let sp_off = sp_va - STACK_VA_BASE;
     let argv_off = argv_array_va - STACK_VA_BASE;
+    let envp_off = if envp_array_va == 0 {
+        0
+    } else {
+        envp_array_va - STACK_VA_BASE
+    };
     let strings_off = strings_start_va - STACK_VA_BASE;
 
     unsafe {
         core::ptr::write_unaligned((stack_pa + sp_off) as *mut u64, argc as u64);
     }
 
+    // argv strings + array
     let mut str_off = strings_off;
     let mut str_va = strings_start_va;
     for (i, s) in argv.iter().enumerate() {
@@ -114,5 +144,31 @@ pub fn place_argv_on_stack(stack_pa: usize, argv: &[String]) -> (usize, usize) {
         );
     }
 
-    (sp_va, argv_array_va)
+    // envp strings + array (after argv strings)
+    if envc != 0 {
+        for (i, s) in envp.iter().enumerate() {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    s.as_ptr(),
+                    (stack_pa + str_off) as *mut u8,
+                    s.len(),
+                );
+                *((stack_pa + str_off + s.len()) as *mut u8) = 0;
+                core::ptr::write_unaligned(
+                    (stack_pa + envp_off + i * 8) as *mut u64,
+                    str_va as u64,
+                );
+            }
+            str_off += s.len() + 1;
+            str_va += s.len() + 1;
+        }
+        unsafe {
+            core::ptr::write_unaligned(
+                (stack_pa + envp_off + envc * 8) as *mut u64,
+                0,
+            );
+        }
+    }
+
+    (sp_va, argv_array_va, envp_array_va)
 }

@@ -11,6 +11,11 @@
 .section .text.entry, "ax"
 .global _start
 _start:
+        // Kernel set x0=argc, x1=argv, x2=envp before eret. Stash
+        // envp into the global `environ` (defined in ulib.c).
+        adrp    x9, environ
+        add     x9, x9, :lo12:environ
+        str     x2, [x9]
         bl      main
         // main returned — fall through to exit(retval). x0 already
         // holds main's return value per the AAPCS64 calling convention.
@@ -79,6 +84,7 @@ DEFINE_SYSCALL pause,    45
 DEFINE_SYSCALL alarm,    46
 DEFINE_SYSCALL clock_gettime, 47
 DEFINE_SYSCALL getdents,      48
+DEFINE_SYSCALL execve,        49
 
 // _sigret — POSIX signal restorer trampoline. Same role as the
 // riscv version: linked into every C user binary, used as the

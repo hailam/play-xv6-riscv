@@ -106,6 +106,12 @@ uint  umask(uint mask);
 int   fcntl(int fd, int cmd, long arg);
 int   ftruncate(int fd, long length);
 int   truncate(const char* path, long length);
+int   execve(const char* path, char* const argv[], char* const envp[]);
+
+extern char** environ;
+char* getenv(const char* name);
+int   setenv(const char* name, const char* value, int overwrite);
+int   unsetenv(const char* name);
 
 // POSIX-ish sigaction. Slim — we don't expose sa_flags or
 // SA_SIGINFO. `handler` is a function pointer (or SIG_DFL/SIG_IGN);

@@ -10,6 +10,11 @@
 .section .text.entry
 .global _start
 _start:
+        # Kernel set a0=argc, a1=argv, a2=envp before sret. Stash
+        # envp into the global `environ` (defined in ulib.c) so
+        # getenv/setenv have something to look at.
+        la      t0, environ
+        sd      a2, 0(t0)
         call    main
         # `main` returned; fall through to exit with its return value.
         li      a7, 2
@@ -75,6 +80,7 @@ DEFINE_SYSCALL pause,    45
 DEFINE_SYSCALL alarm,    46
 DEFINE_SYSCALL clock_gettime, 47
 DEFINE_SYSCALL getdents,      48
+DEFINE_SYSCALL execve,        49
 
 // _sigret — POSIX signal restorer trampoline. The kernel writes
 // `ra := &_sigret` into the trapframe before delivering a signal,

@@ -68,7 +68,8 @@ fs.img: build $(MKFS)
 		sigmasktest:$(USER_DIR)/sigmasktest.elf \
 		fdfiletest:$(USER_DIR)/fdfiletest.elf \
 		alarmtest:$(USER_DIR)/alarmtest.elf \
-		ctimetest:$(USER_DIR)/ctimetest.elf
+		ctimetest:$(USER_DIR)/ctimetest.elf \
+		envtest:$(USER_DIR)/envtest.elf
 
 qemu: build fs.img
 	$(QEMU) $(QEMUOPTS)
@@ -121,7 +122,8 @@ fs-aarch64.img: build-aarch64 $(MKFS)
 		sigmasktest:$(AARCH64_USER_DIR)/sigmasktest.elf \
 		fdfiletest:$(AARCH64_USER_DIR)/fdfiletest.elf \
 		alarmtest:$(AARCH64_USER_DIR)/alarmtest.elf \
-		ctimetest:$(AARCH64_USER_DIR)/ctimetest.elf
+		ctimetest:$(AARCH64_USER_DIR)/ctimetest.elf \
+		envtest:$(AARCH64_USER_DIR)/envtest.elf
 
 qemu-aarch64: build-aarch64 fs-aarch64.img
 	$(QEMU_AARCH64) $(AARCH64_QEMUOPTS)
