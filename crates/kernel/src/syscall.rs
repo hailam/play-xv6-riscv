@@ -28,8 +28,8 @@ use crate::uapi::{
     SYS_GETEUID,
     SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_LSEEK, SYS_MKDIR,
     SYS_MKNOD, SYS_OPEN, SYS_PIPE, SYS_PREAD, SYS_PWRITE, SYS_READ, SYS_SBRK, SYS_SETGID,
-    SYS_SETUID, SYS_SIGACTION, SYS_SIGRETURN, SYS_SLEEP, SYS_STAT, SYS_TRUNCATE,
-    SYS_UMASK, SYS_UNLINK, SYS_UPTIME, SYS_WAIT, SYS_WRITE,
+    SYS_SETUID, SYS_SIGACTION, SYS_SIGPROCMASK, SYS_SIGRETURN, SYS_SLEEP, SYS_STAT,
+    SYS_TRUNCATE, SYS_UMASK, SYS_UNLINK, SYS_UPTIME, SYS_WAIT, SYS_WRITE,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -242,6 +242,13 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             sys_sigaction(proc, signum, handler, restorer, mask)
         }
         SYS_SIGRETURN => sys_sigreturn(proc),
+        SYS_SIGPROCMASK => {
+            let tf = proc.trapframe();
+            let how = tf.arg(0) as i32;
+            let set = tf.arg(1) as u32;
+            let oldset_va = tf.arg(2) as usize;
+            sys_sigprocmask(proc, how, set, oldset_va)
+        }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
             -1
@@ -1591,6 +1598,12 @@ fn sys_sigreturn(proc: &Arc<Proc>) -> i64 {
     };
     let tf = proc.trapframe();
     *tf = saved;
+    // Restore the blocked mask that was in force before delivery.
+    let prev = proc
+        .sig_saved_blocked
+        .load(core::sync::atomic::Ordering::Acquire);
+    proc.sig_blocked
+        .store(prev, core::sync::atomic::Ordering::Release);
     // sys_sigreturn must NOT clobber the restored a0/x0. The
     // syscall dispatch wraps our return value into the trapframe's
     // arg 0 slot, so we have to make sure we return what was in a0
@@ -1598,6 +1611,44 @@ fn sys_sigreturn(proc: &Arc<Proc>) -> i64 {
     // return the freshly-restored a0 — proc_main will write it
     // back, no-op.
     tf.arg(0) as i64
+}
+
+/// POSIX `sigprocmask(how, &set, &oldset)`. `how`:
+///   * SIG_BLOCK   — `blocked |= set`
+///   * SIG_UNBLOCK — `blocked &= ~set`
+///   * SIG_SETMASK — `blocked = set`
+///
+/// Writes the previous mask into `oldset` if non-null. SIGKILL and
+/// SIGSTOP can never be blocked — strip them from any incoming set.
+fn sys_sigprocmask(
+    proc: &Arc<Proc>,
+    how: i32,
+    set: u32,
+    oldset_va: usize,
+) -> i64 {
+    use crate::uapi::{SIG_BLOCK, SIG_SETMASK, SIG_UNBLOCK, SIGKILL, SIGSTOP};
+    // Mask off the unblockable signals.
+    let set = set & !((1u32 << SIGKILL) | (1u32 << SIGSTOP));
+    let prev = proc.sig_blocked.load(core::sync::atomic::Ordering::Acquire);
+    let new = match how {
+        x if x == SIG_BLOCK => prev | set,
+        x if x == SIG_UNBLOCK => prev & !set,
+        x if x == SIG_SETMASK => set,
+        _ => return -1,
+    };
+    proc.sig_blocked
+        .store(new, core::sync::atomic::Ordering::Release);
+    if oldset_va != 0 {
+        // Write the 4-byte u32 to the user buffer.
+        let bytes = prev.to_le_bytes();
+        for (i, b) in bytes.iter().enumerate() {
+            let Some(kva) = proc.translate_user_write(oldset_va + i) else {
+                return -1;
+            };
+            unsafe { *(kva as *mut u8) = *b };
+        }
+    }
+    0
 }
 
 async fn sys_truncate(proc: &Arc<Proc>, path_va: usize, length: i64) -> i64 {

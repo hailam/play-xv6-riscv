@@ -122,6 +122,16 @@ struct sigaction {
 int sigaction(int signum, const struct sigaction* act,
               struct sigaction* oldact);
 
+// POSIX sigprocmask. `how` is one of:
+#define SIG_BLOCK    0
+#define SIG_UNBLOCK  1
+#define SIG_SETMASK  2
+// Our sigset_t is a u32 (32 signals max — matches our internal
+// bitmask width). Pass it by value as the `set` arg; the kernel
+// writes the previous mask back through `oldset` if non-null.
+typedef unsigned int sigset_t;
+int sigprocmask(int how, sigset_t set, sigset_t* oldset);
+
 #define O_CLOEXEC  0x4000
 #define O_NONBLOCK 0x8000
 

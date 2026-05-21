@@ -40,6 +40,7 @@ pub const SYS_FTRUNCATE: usize = 36;
 pub const SYS_TRUNCATE: usize = 37;
 pub const SYS_SIGACTION: usize = 38;
 pub const SYS_SIGRETURN: usize = 39;
+pub const SYS_SIGPROCMASK: usize = 40;
 
 // POSIX signal numbers (subset). Values match Linux for portability
 // of user-space code (so a port of `signal.h` reads naturally).

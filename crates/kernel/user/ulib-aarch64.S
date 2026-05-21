@@ -70,6 +70,7 @@ DEFINE_SYSCALL fcntl,    35
 DEFINE_SYSCALL ftruncate,36
 DEFINE_SYSCALL truncate, 37
 DEFINE_SYSCALL _sys_sigaction, 38
+DEFINE_SYSCALL sigprocmask, 40
 
 // _sigret — POSIX signal restorer trampoline. Same role as the
 // riscv version: linked into every C user binary, used as the

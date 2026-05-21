@@ -64,7 +64,8 @@ fs.img: build $(MKFS)
 		trunctest:$(USER_DIR)/trunctest.elf \
 		stattime:$(USER_DIR)/stattime.elf \
 		sigtest:$(USER_DIR)/sigtest.elf \
-		sigactest:$(USER_DIR)/sigactest.elf
+		sigactest:$(USER_DIR)/sigactest.elf \
+		sigmasktest:$(USER_DIR)/sigmasktest.elf
 
 qemu: build fs.img
 	$(QEMU) $(QEMUOPTS)
@@ -113,7 +114,8 @@ fs-aarch64.img: build-aarch64 $(MKFS)
 		trunctest:$(AARCH64_USER_DIR)/trunctest.elf \
 		stattime:$(AARCH64_USER_DIR)/stattime.elf \
 		sigtest:$(AARCH64_USER_DIR)/sigtest.elf \
-		sigactest:$(AARCH64_USER_DIR)/sigactest.elf
+		sigactest:$(AARCH64_USER_DIR)/sigactest.elf \
+		sigmasktest:$(AARCH64_USER_DIR)/sigmasktest.elf
 
 qemu-aarch64: build-aarch64 fs-aarch64.img
 	$(QEMU_AARCH64) $(AARCH64_QEMUOPTS)

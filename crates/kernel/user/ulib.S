@@ -66,6 +66,7 @@ DEFINE_SYSCALL fcntl,    35
 DEFINE_SYSCALL ftruncate,36
 DEFINE_SYSCALL truncate, 37
 DEFINE_SYSCALL _sys_sigaction, 38
+DEFINE_SYSCALL sigprocmask, 40
 
 // _sigret — POSIX signal restorer trampoline. The kernel writes
 // `ra := &_sigret` into the trapframe before delivering a signal,

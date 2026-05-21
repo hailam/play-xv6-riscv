@@ -95,6 +95,11 @@ pub struct Proc {
     /// flight per process — no nesting.
     pub sig_saved_frame:
         SpinLock<Option<<crate::arch::Arch as hal::Hal>::TrapFrame>>,
+    /// Blocked-mask snapshot taken at delivery time; sigreturn
+    /// restores `sig_blocked` from this. (POSIX: a handler runs with
+    /// `sa_mask | (1<<sig)` ORed into the blocked set; on return the
+    /// previous mask is restored.)
+    pub sig_saved_blocked: AtomicU32,
 }
 
 impl Proc {
@@ -229,6 +234,7 @@ impl Proc {
                 [crate::uapi::SigAction::default_action(); 32],
             ),
             sig_saved_frame: SpinLock::new(None),
+            sig_saved_blocked: AtomicU32::new(0),
         }
     }
 

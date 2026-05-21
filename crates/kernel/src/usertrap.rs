@@ -157,6 +157,15 @@ fn maybe_deliver_signal(proc: &Proc) {
     proc.sig_pending.fetch_and(!(1u32 << sig), core::sync::atomic::Ordering::AcqRel);
     let tf = proc.trapframe();
     *proc.sig_saved_frame.lock() = Some(*tf);
+    // POSIX: handler runs with the signal itself + sa_mask added
+    // to the blocked set. Save the pre-delivery mask so sigreturn
+    // can restore it.
+    let prev_blocked = proc
+        .sig_blocked
+        .swap(blocked | action.mask | (1u32 << sig),
+              core::sync::atomic::Ordering::AcqRel);
+    proc.sig_saved_blocked
+        .store(prev_blocked, core::sync::atomic::Ordering::Release);
     // Rewrite the trapframe for the handler invocation. arg0 = sig,
     // pc = handler, return address = restorer. sp untouched — the
     // handler runs on the same user stack (no separate signal stack).
