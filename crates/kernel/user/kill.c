@@ -1,7 +1,6 @@
-// kill — send `kill` to a single pid argument.
+// kill — send SIGTERM to a pid argument.
 
-extern int kill(int);
-extern int write(int, const void*, int);
+#include "user.h"
 
 static int u_strlen(const char* s) { int n = 0; while (s[n]) n++; return n; }
 
@@ -16,7 +15,7 @@ int main(int argc, char** argv) {
         if (*p < '0' || *p > '9') return -1;
         pid = pid * 10 + (*p - '0');
     }
-    if (kill(pid) < 0) {
+    if (kill(pid, SIGTERM) < 0) {
         write(2, "kill: failed\n", 13);
         return -1;
     }

@@ -39,6 +39,44 @@ pub const SYS_FCNTL: usize = 35;
 pub const SYS_FTRUNCATE: usize = 36;
 pub const SYS_TRUNCATE: usize = 37;
 
+// POSIX signal numbers (subset). Values match Linux for portability
+// of user-space code (so a port of `signal.h` reads naturally).
+pub const SIGHUP: i32 = 1;
+pub const SIGINT: i32 = 2;
+pub const SIGQUIT: i32 = 3;
+pub const SIGILL: i32 = 4;
+pub const SIGABRT: i32 = 6;
+pub const SIGKILL: i32 = 9;
+pub const SIGUSR1: i32 = 10;
+pub const SIGSEGV: i32 = 11;
+pub const SIGUSR2: i32 = 12;
+pub const SIGPIPE: i32 = 13;
+pub const SIGALRM: i32 = 14;
+pub const SIGTERM: i32 = 15;
+pub const SIGCHLD: i32 = 17;
+pub const SIGCONT: i32 = 18;
+pub const SIGSTOP: i32 = 19;
+
+/// True if `sig`'s default disposition is to terminate the process.
+/// Signals with "ignore" default (CHLD, CONT, etc.) return false.
+pub fn sig_default_kills(sig: i32) -> bool {
+    matches!(
+        sig,
+        SIGHUP
+            | SIGINT
+            | SIGQUIT
+            | SIGILL
+            | SIGABRT
+            | SIGKILL
+            | SIGUSR1
+            | SIGSEGV
+            | SIGUSR2
+            | SIGPIPE
+            | SIGALRM
+            | SIGTERM
+    )
+}
+
 // lseek "whence" values — POSIX-standard.
 pub const SEEK_SET: i32 = 0; // absolute offset
 pub const SEEK_CUR: i32 = 1; // current + offset

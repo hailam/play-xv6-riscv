@@ -69,7 +69,25 @@ int   pwrite(int fd, const void* buf, int len, long offset);
 #define SEEK_SET 0
 #define SEEK_CUR 1
 #define SEEK_END 2
-int   kill(int);
+// POSIX kill(pid, sig). Use SIGKILL or SIGTERM to actually kill.
+int   kill(int pid, int sig);
+
+// POSIX signal numbers (subset).
+#define SIGHUP   1
+#define SIGINT   2
+#define SIGQUIT  3
+#define SIGILL   4
+#define SIGABRT  6
+#define SIGKILL  9
+#define SIGUSR1  10
+#define SIGSEGV  11
+#define SIGUSR2  12
+#define SIGPIPE  13
+#define SIGALRM  14
+#define SIGTERM  15
+#define SIGCHLD  17
+#define SIGCONT  18
+#define SIGSTOP  19
 int   exec(const char*, char* const argv[]);
 int   open(const char*, int);
 int   mknod(const char*, short, short);

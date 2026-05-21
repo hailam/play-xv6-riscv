@@ -96,8 +96,10 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
         SYS_GETPID => proc.pid as i64,
         SYS_UPTIME => (Arch::now_ticks() / TIMER_INTERVAL) as i64,
         SYS_KILL => {
-            let pid = proc.trapframe().arg(0) as i32;
-            sys_kill(proc, pid).await
+            let tf = proc.trapframe();
+            let pid = tf.arg(0) as i32;
+            let sig = tf.arg(1) as i32;
+            sys_kill(proc, pid, sig).await
         }
         SYS_SBRK => {
             let tf = proc.trapframe();
@@ -361,13 +363,46 @@ pub fn lazy_map_page(proc: &Arc<Proc>, fault_va: usize) -> bool {
     true
 }
 
-async fn sys_kill(_proc: &Arc<Proc>, pid: i32) -> i64 {
+/// POSIX `kill(pid, sig)`.
+///
+/// * `sig == 0` is "check that `pid` exists and we may signal it"; no
+///   signal is delivered. Returns 0 on existence, -1 otherwise.
+/// * For signals whose default disposition is to terminate
+///   ([`sig_default_kills`]), we set `proc.killed` and wake all
+///   blocking futures so the target unwinds into `sys_exit(-1)`. No
+///   user-installed handlers yet — sigaction lands in a later slice.
+/// * Ignorable signals (CHLD, CONT, STOP) are no-ops in this slice.
+/// * Unknown `sig` returns -1.
+async fn sys_kill(proc: &Arc<Proc>, pid: i32, sig: i32) -> i64 {
     if pid <= 0 {
         return -1;
     }
-    let Some(target) = executor::find_proc_by_pid(pid as usize) else {
+    if sig < 0 || sig > 31 {
         return -1;
+    }
+    // The executor `take()`s the currently-running task from the
+    // per-CPU table while polling, so `find_proc_by_pid` can't see
+    // the caller itself. Short-circuit on self-pid using the
+    // already-held caller reference.
+    let target = if (pid as usize) == proc.pid {
+        Arc::clone(proc)
+    } else {
+        match executor::find_proc_by_pid(pid as usize) {
+            Some(p) => p,
+            None => return -1,
+        }
     };
+    if sig == 0 {
+        // Existence check — caller can signal `pid` (we don't yet
+        // enforce uid checks on kill; that'll come with a fuller
+        // capability pass).
+        return 0;
+    }
+    if !crate::uapi::sig_default_kills(sig) {
+        // Ignored / unimplemented disposition (CHLD/CONT/STOP) —
+        // accept but don't actually do anything.
+        return 0;
+    }
     target.killed.store(true, Ordering::Release);
     // Boot every blocking future this proc may be parked on. Each
     // poll checks `killed` and returns a cancellation sentinel.

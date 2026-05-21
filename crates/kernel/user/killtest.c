@@ -1,12 +1,7 @@
 // killtest — fork a child that sleeps for a long time, then kill it
 // from the parent and verify the child was reaped promptly.
 
-extern int fork(void);
-extern void exit(int);
-extern int wait(int* status);
-extern int sleep(int);
-extern int kill(int);
-extern int write(int, const void*, int);
+#include "user.h"
 
 static int u_strlen(const char* s) { int n = 0; while (s[n]) n++; return n; }
 
@@ -41,7 +36,7 @@ int main(void) {
     write(1, "killtest: sending kill to pid ", 30);
     put_int(pid);
     write(1, "\n", 1);
-    if (kill(pid) < 0) {
+    if (kill(pid, SIGTERM) < 0) {
         write(1, "killtest: kill syscall failed\n", 30);
         wait(0);
         return -1;
