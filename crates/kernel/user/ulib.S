@@ -67,6 +67,9 @@ DEFINE_SYSCALL ftruncate,36
 DEFINE_SYSCALL truncate, 37
 DEFINE_SYSCALL _sys_sigaction, 38
 DEFINE_SYSCALL sigprocmask, 40
+DEFINE_SYSCALL dup2,     41
+DEFINE_SYSCALL getcwd,   42
+DEFINE_SYSCALL rename,   43
 
 // _sigret — POSIX signal restorer trampoline. The kernel writes
 // `ra := &_sigret` into the trapframe before delivering a signal,

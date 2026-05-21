@@ -7,6 +7,51 @@ use xv6_fs_layout::{Dirent, DIRSIZ, T_DIR};
 
 use crate::fs::inode::{iget, readi, writei, Inode, LockedInode};
 
+/// Reverse lookup: find the name of the entry in `dir` that points
+/// to `child_inum`. Used by `getcwd` to walk a leaf-up path. Caller
+/// must hold `dir`'s lock. Returns the entry's name (up to DIRSIZ
+/// bytes, NUL-trimmed) or None.
+pub async fn dirlookup_by_inum(
+    dir: &LockedInode<'_>,
+    child_inum: u16,
+) -> Option<alloc::string::String> {
+    use alloc::string::String;
+    assert_eq!(dir.state().typ, T_DIR, "dirlookup_by_inum on non-directory");
+    let entry_size = core::mem::size_of::<Dirent>() as u32;
+    let mut off: u32 = 0;
+    let dir_size = dir.state().size;
+    let mut entry = Dirent::default();
+    while off < dir_size {
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                &mut entry as *mut _ as *mut u8,
+                entry_size as usize,
+            )
+        };
+        let n = readi(dir, bytes, off).await;
+        if n != entry_size as usize {
+            break;
+        }
+        if entry.inum == child_inum && entry.inum != 0 {
+            // Skip "." and ".." — we want the real name in our parent.
+            let trimmed_len = entry
+                .name
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(DIRSIZ);
+            let name_bytes = &entry.name[..trimmed_len];
+            if name_bytes == b"." || name_bytes == b".." {
+                off += entry_size;
+                continue;
+            }
+            let s = String::from_utf8_lossy(name_bytes).into_owned();
+            return Some(s);
+        }
+        off += entry_size;
+    }
+    None
+}
+
 /// Look up `name` in directory `dir`. Returns the inode if found.
 /// Caller must hold `dir`'s lock.
 pub async fn dirlookup(dir: &LockedInode<'_>, name: &str) -> Option<Arc<Inode>> {

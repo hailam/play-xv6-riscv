@@ -132,6 +132,10 @@ int sigaction(int signum, const struct sigaction* act,
 typedef unsigned int sigset_t;
 int sigprocmask(int how, sigset_t set, sigset_t* oldset);
 
+int   dup2(int oldfd, int newfd);
+int   getcwd(char* buf, unsigned int len);
+int   rename(const char* old_path, const char* new_path);
+
 #define O_CLOEXEC  0x4000
 #define O_NONBLOCK 0x8000
 

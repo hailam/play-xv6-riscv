@@ -30,6 +30,7 @@ use crate::uapi::{
     SYS_MKNOD, SYS_OPEN, SYS_PIPE, SYS_PREAD, SYS_PWRITE, SYS_READ, SYS_SBRK, SYS_SETGID,
     SYS_SETUID, SYS_SIGACTION, SYS_SIGPROCMASK, SYS_SIGRETURN, SYS_SLEEP, SYS_STAT,
     SYS_TRUNCATE, SYS_UMASK, SYS_UNLINK, SYS_UPTIME, SYS_WAIT, SYS_WRITE,
+    SYS_DUP2, SYS_GETCWD, SYS_RENAME,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -248,6 +249,24 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let set = tf.arg(1) as u32;
             let oldset_va = tf.arg(2) as usize;
             sys_sigprocmask(proc, how, set, oldset_va)
+        }
+        SYS_DUP2 => {
+            let tf = proc.trapframe();
+            let oldfd = tf.arg(0) as i32;
+            let newfd = tf.arg(1) as i32;
+            sys_dup2(proc, oldfd, newfd)
+        }
+        SYS_GETCWD => {
+            let tf = proc.trapframe();
+            let buf_va = tf.arg(0) as usize;
+            let len = tf.arg(1) as usize;
+            sys_getcwd(proc, buf_va, len).await
+        }
+        SYS_RENAME => {
+            let tf = proc.trapframe();
+            let old_va = tf.arg(0) as usize;
+            let new_va = tf.arg(1) as usize;
+            sys_rename(proc, old_va, new_va).await
         }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
@@ -940,6 +959,36 @@ async fn sys_dup(proc: &Arc<Proc>, fd: i32) -> i64 {
     // independently. `File::Clone` bumps pipe counts.
     let new_file = Arc::new((*file).clone());
     proc.alloc_fd(new_file).map(|f| f as i64).unwrap_or(-1)
+}
+
+/// POSIX `dup2(oldfd, newfd)` — duplicate `oldfd` onto `newfd`,
+/// closing whatever was at `newfd` first. If `oldfd == newfd` (and
+/// `oldfd` is valid), it's a no-op and returns `newfd`. Returns the
+/// new fd number, or -1 on error.
+fn sys_dup2(proc: &Arc<Proc>, oldfd: i32, newfd: i32) -> i64 {
+    if oldfd < 0 || newfd < 0 {
+        return -1;
+    }
+    // oldfd must be open.
+    let Some(file) = proc.get_file(oldfd) else {
+        return -1;
+    };
+    if oldfd == newfd {
+        return newfd as i64;
+    }
+    // Bounds check newfd.
+    if (newfd as usize) >= crate::proc::NOFILE {
+        return -1;
+    }
+    // Close any existing entry at newfd (ignoring error — entry
+    // may already be empty), then install a fresh FdEntry.
+    let _ = proc.close_fd(newfd);
+    let new_file = Arc::new((*file).clone());
+    {
+        let mut files = proc.files.lock();
+        files[newfd as usize] = Some(crate::file::FdEntry::new(new_file));
+    }
+    newfd as i64
 }
 
 async fn pipe_write(
@@ -1649,6 +1698,210 @@ fn sys_sigprocmask(
         }
     }
     0
+}
+
+/// POSIX `getcwd(buf, len)` — write the absolute path of the current
+/// working directory into `buf[0..len]` (NUL-terminated). Returns
+/// the length written (not counting NUL) or -1 if `buf` is too small,
+/// `buf` isn't writable, or the cwd is unreachable from root.
+async fn sys_getcwd(proc: &Arc<Proc>, buf_va: usize, len: usize) -> i64 {
+    use alloc::string::String;
+    if len == 0 {
+        return -1;
+    }
+    let cwd = match proc.cwd.lock().clone() {
+        Some(c) => c,
+        None => return -1,
+    };
+    // Walk leaf-to-root, prepending "/<name>" each step. Root is
+    // inum 1 by convention (xv6 mkfs). When current inum == 1 we
+    // stop.
+    let mut current = cwd;
+    let mut parts: alloc::vec::Vec<String> = alloc::vec::Vec::new();
+    // Guard against infinite loops (corrupt fs).
+    for _ in 0..64 {
+        let (cur_inum, cur_is_root) = {
+            let li = fs::inode::ilock(&current).await;
+            (li.inum() as u16, li.inum() == 1)
+        };
+        if cur_is_root {
+            break;
+        }
+        // Open ".." from current. ".." is always present in dirs.
+        let parent = {
+            let li = fs::inode::ilock(&current).await;
+            crate::fs::dir::dirlookup(&li, "..").await
+        };
+        let Some(parent) = parent else {
+            return -1;
+        };
+        // Find current's name in parent's dirents.
+        let name = {
+            let li = fs::inode::ilock(&parent).await;
+            crate::fs::dir::dirlookup_by_inum(&li, cur_inum).await
+        };
+        let Some(name) = name else { return -1 };
+        parts.push(name);
+        current = parent;
+    }
+    // Build the absolute path. parts is leaf-first; reverse.
+    let path = if parts.is_empty() {
+        String::from("/")
+    } else {
+        let mut s = String::new();
+        for p in parts.iter().rev() {
+            s.push('/');
+            s.push_str(p);
+        }
+        s
+    };
+    let bytes = path.as_bytes();
+    if bytes.len() + 1 > len {
+        return -1;
+    }
+    for (i, b) in bytes.iter().enumerate() {
+        let Some(kva) = proc.translate_user_write(buf_va + i) else {
+            return -1;
+        };
+        unsafe { *(kva as *mut u8) = *b };
+    }
+    let Some(kva) = proc.translate_user_write(buf_va + bytes.len()) else {
+        return -1;
+    };
+    unsafe { *(kva as *mut u8) = 0 };
+    bytes.len() as i64
+}
+
+/// POSIX `rename(old, new)` — atomic-ish rename within the same
+/// directory; cross-directory rename does link+unlink under one log
+/// op so it's all-or-nothing (matches POSIX atomicity requirements).
+async fn sys_rename(proc: &Arc<Proc>, old_va: usize, new_va: usize) -> i64 {
+    let Some(old_path) = read_user_cstring(proc, old_va, 128) else {
+        return -1;
+    };
+    let Some(new_path) = read_user_cstring(proc, new_va, 128) else {
+        return -1;
+    };
+    // Resolve the source up front; if it doesn't exist, fail before
+    // taking the log lock.
+    let src = match resolve_path(proc, &old_path).await {
+        Some(s) => s,
+        None => return -1,
+    };
+    let Some((old_dir, old_name)) = nameiparent_via_cwd(proc, &old_path).await else {
+        return -1;
+    };
+    let Some((new_dir, new_name)) = nameiparent_via_cwd(proc, &new_path).await else {
+        return -1;
+    };
+    if old_name == "." || old_name == ".." || new_name == "." || new_name == ".." {
+        return -1;
+    }
+    // Same-name no-op: just succeed. Compare inums via Arc identity
+    // — locking the same inode twice would deadlock (xv6's ilock
+    // spins on an AtomicBool).
+    let same_dir = Arc::as_ptr(&old_dir) == Arc::as_ptr(&new_dir);
+    if same_dir && old_name == new_name {
+        return 0;
+    }
+    let src_inum = {
+        let li = fs::inode::ilock(&src).await;
+        li.inum() as u16
+    };
+    fs::log::begin_op().await;
+    let result: i64 = {
+        // If `new` already exists, unlink it first (POSIX allows
+        // overwriting a regular file; refuses to overwrite a dir).
+        let existing_new = {
+            let li = fs::inode::ilock(&new_dir).await;
+            crate::fs::dir::dirlookup(&li, &new_name).await
+        };
+        if let Some(ex) = existing_new {
+            let ex_typ = {
+                let li = fs::inode::ilock(&ex).await;
+                li.state().typ
+            };
+            if ex_typ == xv6_fs_layout::T_DIR {
+                fs::log::end_op().await;
+                return -1;
+            }
+            // Drop the dirent for the existing target.
+            if !unlink_dirent_inside_op(&new_dir, &new_name).await {
+                fs::log::end_op().await;
+                return -1;
+            }
+            // Decrement nlink on the old target inode. (Borrow from
+            // sys_unlink's logic — simplified.)
+            let mut ex_li = fs::inode::ilock(&ex).await;
+            let n = ex_li.state().nlink;
+            ex_li.state_mut().nlink = n.saturating_sub(1);
+            fs::inode::iupdate(&ex_li).await;
+        }
+        // Link src into new_dir under new_name.
+        let linked = {
+            let mut new_li = fs::inode::ilock(&new_dir).await;
+            crate::fs::dir::dirlink(&mut new_li, &new_name, src_inum).await
+        };
+        if !linked {
+            -1
+        } else if !unlink_dirent_inside_op(&old_dir, &old_name).await {
+            // Rare — we successfully linked under new name but the
+            // old dirent removal failed. Leave both names pointing
+            // at the inode (nlink reflects two refs); user can clean
+            // up manually.
+            -1
+        } else {
+            0
+        }
+    };
+    fs::log::end_op().await;
+    result
+}
+
+/// Remove a single dirent from `dir` by name (no recursion, no
+/// inode bookkeeping — caller handles nlink). Returns true on
+/// success. Used by rename's overwrite path.
+async fn unlink_dirent_inside_op(
+    dir: &Arc<crate::fs::inode::Inode>,
+    name: &str,
+) -> bool {
+    use xv6_fs_layout::{Dirent, DIRSIZ};
+    let mut dir_li = fs::inode::ilock(dir).await;
+    let entry_size = core::mem::size_of::<Dirent>() as u32;
+    let mut off: u32 = 0;
+    let dir_size = dir_li.state().size;
+    while off < dir_size {
+        let mut entry = Dirent::default();
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                &mut entry as *mut _ as *mut u8,
+                entry_size as usize,
+            )
+        };
+        let n = fs::inode::readi(&dir_li, bytes, off).await;
+        if n != entry_size as usize {
+            return false;
+        }
+        // Match (entry.name == name, trimmed).
+        let trimmed = entry
+            .name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(DIRSIZ);
+        if entry.inum != 0 && &entry.name[..trimmed] == name.as_bytes() {
+            let zero = Dirent::default();
+            let zb = unsafe {
+                core::slice::from_raw_parts(
+                    &zero as *const _ as *const u8,
+                    entry_size as usize,
+                )
+            };
+            let w = fs::inode::writei(&mut dir_li, zb, off).await;
+            return w == entry_size as usize;
+        }
+        off += entry_size;
+    }
+    false
 }
 
 async fn sys_truncate(proc: &Arc<Proc>, path_va: usize, length: i64) -> i64 {
