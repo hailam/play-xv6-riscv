@@ -5,7 +5,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
 use hal::{FrameAllocator, PageTableOps, PtePerm, TrapFrameAccess};
@@ -100,6 +100,12 @@ pub struct Proc {
     /// `sa_mask | (1<<sig)` ORed into the blocked set; on return the
     /// previous mask is restored.)
     pub sig_saved_blocked: AtomicU32,
+    /// POSIX `alarm()` state. `alarm_deadline` is the absolute tick
+    /// at which to raise SIGALRM (0 = no alarm). `alarm_generation`
+    /// bumps every time alarm() is called so an in-flight timer
+    /// entry can tell it's been superseded.
+    pub alarm_deadline: AtomicU64,
+    pub alarm_generation: AtomicU32,
 }
 
 impl Proc {
@@ -235,6 +241,8 @@ impl Proc {
             ),
             sig_saved_frame: SpinLock::new(None),
             sig_saved_blocked: AtomicU32::new(0),
+            alarm_deadline: AtomicU64::new(0),
+            alarm_generation: AtomicU32::new(0),
         }
     }
 

@@ -161,6 +161,7 @@ fn main() {
         ("sigactest", "SIGACTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
         ("sigmasktest", "SIGMASKTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
         ("fdfiletest", "FDFILETEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
+        ("alarmtest", "ALARMTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
     ];
     for (name, env_var, lang, with_ulib, supported_archs) in programs {
         if supported_archs.contains(&arch) {

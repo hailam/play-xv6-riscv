@@ -31,6 +31,7 @@ use crate::uapi::{
     SYS_SETUID, SYS_SIGACTION, SYS_SIGPROCMASK, SYS_SIGRETURN, SYS_SLEEP, SYS_STAT,
     SYS_TRUNCATE, SYS_UMASK, SYS_UNLINK, SYS_UPTIME, SYS_WAIT, SYS_WRITE,
     SYS_DUP2, SYS_GETCWD, SYS_RENAME,
+    SYS_WAITPID, SYS_PAUSE, SYS_ALARM, WNOHANG,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -267,6 +268,18 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let old_va = tf.arg(0) as usize;
             let new_va = tf.arg(1) as usize;
             sys_rename(proc, old_va, new_va).await
+        }
+        SYS_WAITPID => {
+            let tf = proc.trapframe();
+            let pid = tf.arg(0) as i32;
+            let status_va = tf.arg(1) as usize;
+            let options = tf.arg(2) as i32;
+            sys_waitpid(proc, pid, status_va, options).await
+        }
+        SYS_PAUSE => sys_pause(proc).await,
+        SYS_ALARM => {
+            let secs = proc.trapframe().arg(0) as u32;
+            sys_alarm(proc, secs)
         }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
@@ -535,47 +548,93 @@ async fn sys_exit_inner(proc: &Arc<Proc>, code: i32) -> i64 {
 /// `status_va != 0`, the child's exit code is written through that
 /// user pointer.
 async fn sys_wait(proc: &Arc<Proc>, status_va: usize) -> i64 {
-    let (pid, code) = match (Wait { proc }).await {
-        Some(t) => t,
-        None => return -1,
-    };
+    sys_waitpid(proc, -1, status_va, 0).await
+}
+
+/// POSIX `waitpid(pid, &status, options)`:
+///   * `pid == -1` → any child (matches `wait()`)
+///   * `pid > 0`   → that specific child
+///   * `pid == 0` / `pid < -1` → no process-group semantics yet
+///     (treat as "any" for safety)
+///   * `options & WNOHANG` → don't block; return 0 if no eligible
+///     exited child
+async fn sys_waitpid(
+    proc: &Arc<Proc>,
+    pid: i32,
+    status_va: usize,
+    options: i32,
+) -> i64 {
+    let filter = if pid > 0 { Some(pid as usize) } else { None };
+    let nonblock = (options & WNOHANG) != 0;
+    let (reaped_pid, code) =
+        match (WaitFor { proc, filter, nonblock }).await {
+            WaitOutcome::Reaped(p, c) => (p, c),
+            WaitOutcome::NoChildren => return -1,
+            WaitOutcome::WouldBlock => return 0,
+            WaitOutcome::Killed => return -1,
+        };
     if status_va != 0 {
         let Some(kva) = proc.translate_user_write(status_va) else {
             return -1;
         };
         unsafe { *(kva as *mut i32) = code };
     }
-    pid as i64
+    reaped_pid as i64
 }
 
-struct Wait<'a> {
+enum WaitOutcome {
+    Reaped(usize, i32),
+    NoChildren,
+    WouldBlock,
+    Killed,
+}
+
+struct WaitFor<'a> {
     proc: &'a Arc<Proc>,
+    filter: Option<usize>,
+    nonblock: bool,
 }
 
-impl Future for Wait<'_> {
-    type Output = Option<(usize, i32)>; // (pid, exit_code) or None on error / killed
+impl Future for WaitFor<'_> {
+    type Output = WaitOutcome;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<(usize, i32)>> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<WaitOutcome> {
         if self.proc.killed.load(Ordering::Acquire) {
-            return Poll::Ready(None);
+            return Poll::Ready(WaitOutcome::Killed);
         }
         self.proc.wait_waker.register(cx.waker());
         let mut children = self.proc.children.lock();
-        let mut zombie_idx = None;
+        // No children at all — there's nothing to wait for.
+        if children.is_empty() {
+            return Poll::Ready(WaitOutcome::NoChildren);
+        }
+        // Look for an exited child that matches the filter (if any).
+        let mut idx = None;
+        let mut any_match = false;
         for (i, c) in children.iter().enumerate() {
+            let pid_match = self.filter.map_or(true, |p| c.pid == p);
+            if !pid_match {
+                continue;
+            }
+            any_match = true;
             if c.is_zombie() {
-                zombie_idx = Some(i);
+                idx = Some(i);
                 break;
             }
         }
-        if let Some(i) = zombie_idx {
+        if let Some(i) = idx {
             let dead = children.remove(i);
             let pid = dead.pid;
             let code = dead.exit_code.load(Ordering::Relaxed);
-            return Poll::Ready(Some((pid, code)));
+            return Poll::Ready(WaitOutcome::Reaped(pid, code));
         }
-        if children.is_empty() {
-            return Poll::Ready(None);
+        // Filter named a specific pid but we have no child with that
+        // pid at all — POSIX semantics: ECHILD-equivalent.
+        if self.filter.is_some() && !any_match {
+            return Poll::Ready(WaitOutcome::NoChildren);
+        }
+        if self.nonblock {
+            return Poll::Ready(WaitOutcome::WouldBlock);
         }
         Poll::Pending
     }
@@ -586,6 +645,64 @@ async fn sys_sleep(_proc: &Arc<Proc>, ticks: u64) -> i64 {
     let deadline = now + ticks * TIMER_INTERVAL;
     Sleep { deadline }.await;
     0
+}
+
+/// POSIX `pause()` — block until a signal handler runs (or the proc
+/// is killed). Always returns -1; POSIX requires errno=EINTR which
+/// we conflate with the return code.
+async fn sys_pause(proc: &Arc<Proc>) -> i64 {
+    Pause { proc }.await;
+    -1
+}
+
+struct Pause<'a> {
+    proc: &'a Arc<Proc>,
+}
+
+impl Future for Pause<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.proc.killed.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+        // Wake on either pending-signal-after-mask or kill. sys_kill
+        // pings wait_waker for both, so we register there.
+        self.proc.wait_waker.register(cx.waker());
+        let pending = self.proc.sig_pending.load(Ordering::Acquire);
+        let blocked = self.proc.sig_blocked.load(Ordering::Acquire);
+        if pending & !blocked != 0 {
+            // A deliverable signal is queued — let return-to-user
+            // dispatch it.
+            return Poll::Ready(());
+        }
+        Poll::Pending
+    }
+}
+
+/// POSIX `alarm(seconds)` — schedule SIGALRM for the calling proc
+/// in `seconds` real time. `seconds == 0` cancels any pending alarm.
+/// Returns the remaining seconds of any prior alarm (0 if none).
+fn sys_alarm(proc: &Arc<Proc>, seconds: u32) -> i64 {
+    let now = Arch::now_ticks();
+    let prev_deadline = proc.alarm_deadline.load(Ordering::Acquire);
+    let prev_remaining = if prev_deadline > now {
+        ((prev_deadline - now) / TIMER_INTERVAL) as i64
+    } else {
+        0
+    };
+    // Bump the generation — any in-flight alarm entry for the old
+    // deadline will see its generation != proc.alarm_generation when
+    // it fires and skip delivery.
+    let new_gen = proc.alarm_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    if seconds == 0 {
+        proc.alarm_deadline.store(0, Ordering::Release);
+    } else {
+        let deadline = now + (seconds as u64) * TIMER_INTERVAL;
+        proc.alarm_deadline.store(deadline, Ordering::Release);
+        crate::time::add_alarm(deadline, proc.pid, new_gen);
+    }
+    prev_remaining
 }
 
 struct Sleep {

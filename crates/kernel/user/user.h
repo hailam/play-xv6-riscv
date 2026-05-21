@@ -135,6 +135,11 @@ int sigprocmask(int how, sigset_t set, sigset_t* oldset);
 int   dup2(int oldfd, int newfd);
 int   getcwd(char* buf, unsigned int len);
 int   rename(const char* old_path, const char* new_path);
+int   waitpid(int pid, int* status, int options);
+int   pause(void);
+unsigned int alarm(unsigned int seconds);
+
+#define WNOHANG 1
 
 #define O_CLOEXEC  0x4000
 #define O_NONBLOCK 0x8000

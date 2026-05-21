@@ -46,9 +46,11 @@
 
 #define SBRK_ERROR  ((char*)-1)
 
-// xv6's "pause(n)" is just our sleep(n). Provide a shim so the
-// usertests calls compile without us touching the test bodies.
-static inline int pause(int n) { return sleep(n); }
+// xv6's "pause(n)" (in some test variants) is just our sleep(n).
+// Rebind the in-tree callers to a non-clashing name so the file
+// builds against POSIX's `int pause(void)` declared in user.h.
+static inline int xv6_pause(int n) { return sleep(n); }
+#define pause xv6_pause
 
 // xv6/kernel/riscv.h provides r_sp(); usertests uses it to probe
 // an invalid SP. Inline asm; valid in user mode.
