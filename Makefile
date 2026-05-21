@@ -59,7 +59,8 @@ fs.img: build $(MKFS)
 		usertests:$(USER_DIR)/usertests.elf \
 		seektest:$(USER_DIR)/seektest.elf \
 		chmodtest:$(USER_DIR)/chmodtest.elf \
-		credtest:$(USER_DIR)/credtest.elf
+		credtest:$(USER_DIR)/credtest.elf \
+		cloexectest:$(USER_DIR)/cloexectest.elf
 
 qemu: build fs.img
 	$(QEMU) $(QEMUOPTS)
@@ -103,7 +104,8 @@ fs-aarch64.img: build-aarch64 $(MKFS)
 		usertests:$(AARCH64_USER_DIR)/usertests.elf \
 		seektest:$(AARCH64_USER_DIR)/seektest.elf \
 		chmodtest:$(AARCH64_USER_DIR)/chmodtest.elf \
-		credtest:$(AARCH64_USER_DIR)/credtest.elf
+		credtest:$(AARCH64_USER_DIR)/credtest.elf \
+		cloexectest:$(AARCH64_USER_DIR)/cloexectest.elf
 
 qemu-aarch64: build-aarch64 fs-aarch64.img
 	$(QEMU_AARCH64) $(AARCH64_QEMUOPTS)

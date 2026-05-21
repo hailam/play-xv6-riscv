@@ -66,3 +66,4 @@ DEFINE_SYSCALL setgid,   31
 DEFINE_SYSCALL geteuid,  32
 DEFINE_SYSCALL getegid,  33
 DEFINE_SYSCALL umask,    34
+DEFINE_SYSCALL fcntl,    35

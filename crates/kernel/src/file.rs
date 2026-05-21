@@ -43,6 +43,40 @@ impl PipeInner {
     }
 }
 
+/// One entry in a `Proc`'s fd table. Bundles the underlying `File`
+/// with per-fd flags: `cloexec` (O_CLOEXEC / FD_CLOEXEC — sys_exec
+/// closes this entry) and `nonblock` (POSIX O_NONBLOCK — read/write
+/// paths return -1 instead of awaiting when no progress can be made
+/// immediately).
+///
+/// Flags live on the fd, not on the `File`, because `dup` and `fork`
+/// can produce two fds that point to the same `File` but have
+/// different flags.
+pub struct FdEntry {
+    pub file: Arc<File>,
+    pub cloexec: bool,
+    pub nonblock: bool,
+}
+
+impl FdEntry {
+    pub fn new(file: Arc<File>) -> Self {
+        Self { file, cloexec: false, nonblock: false }
+    }
+}
+
+impl Clone for FdEntry {
+    fn clone(&self) -> Self {
+        // The Arc<File> is the same object across dup; bumping any
+        // pipe ref counts happens through Arc::new((*file).clone())
+        // when callers explicitly want a separate File.
+        Self {
+            file: Arc::clone(&self.file),
+            cloexec: self.cloexec,
+            nonblock: self.nonblock,
+        }
+    }
+}
+
 pub enum File {
     Console,
     PipeRead(Arc<PipeInner>),

@@ -82,6 +82,18 @@ int   setgid(uint gid);
 uint  geteuid(void);
 uint  getegid(void);
 uint  umask(uint mask);
+int   fcntl(int fd, int cmd, long arg);
+
+#define O_CLOEXEC  0x4000
+#define O_NONBLOCK 0x8000
+
+#define F_DUPFD          0
+#define F_GETFD          1
+#define F_SETFD          2
+#define F_GETFL          3
+#define F_SETFL          4
+#define F_DUPFD_CLOEXEC  1030
+#define FD_CLOEXEC       1
 int   link(const char*, const char*);
 int   mkdir(const char*);
 int   chdir(const char*);

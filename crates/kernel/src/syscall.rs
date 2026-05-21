@@ -21,12 +21,14 @@ use crate::user_vm::STACK_VA_BASE;
 
 type TrapFrame = <Arch as Hal>::TrapFrame;
 use crate::uapi::{
-    Stat, O_APPEND, O_CREATE, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_END,
-    SEEK_SET, SYS_CHDIR, SYS_CHMOD, SYS_CHOWN, SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT,
-    SYS_FORK, SYS_FSTAT, SYS_GETEGID, SYS_GETEUID, SYS_GETGID, SYS_GETPID, SYS_GETUID,
-    SYS_KILL, SYS_LINK, SYS_LSEEK, SYS_MKDIR, SYS_MKNOD, SYS_OPEN, SYS_PIPE, SYS_PREAD,
-    SYS_PWRITE, SYS_READ, SYS_SBRK, SYS_SETGID, SYS_SETUID, SYS_SLEEP, SYS_STAT,
-    SYS_UMASK, SYS_UNLINK, SYS_UPTIME, SYS_WAIT, SYS_WRITE,
+    Stat, FD_CLOEXEC, F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL,
+    O_APPEND, O_CLOEXEC, O_CREATE, O_NONBLOCK, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+    SEEK_CUR, SEEK_END, SEEK_SET, SYS_CHDIR, SYS_CHMOD, SYS_CHOWN, SYS_CLOSE, SYS_DUP,
+    SYS_EXEC, SYS_EXIT, SYS_FCNTL, SYS_FORK, SYS_FSTAT, SYS_GETEGID, SYS_GETEUID,
+    SYS_GETGID, SYS_GETPID, SYS_GETUID, SYS_KILL, SYS_LINK, SYS_LSEEK, SYS_MKDIR,
+    SYS_MKNOD, SYS_OPEN, SYS_PIPE, SYS_PREAD, SYS_PWRITE, SYS_READ, SYS_SBRK, SYS_SETGID,
+    SYS_SETUID, SYS_SLEEP, SYS_STAT, SYS_UMASK, SYS_UNLINK, SYS_UPTIME, SYS_WAIT,
+    SYS_WRITE,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -208,6 +210,13 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             // doesn't have setuid/setgid/sticky bits to mask).
             let mask = (proc.trapframe().arg(0) as u32) & 0o777;
             proc.umask.swap(mask, Ordering::AcqRel) as i64
+        }
+        SYS_FCNTL => {
+            let tf = proc.trapframe();
+            let fd = tf.arg(0) as i32;
+            let cmd = tf.arg(1) as i32;
+            let arg = tf.arg(2) as i64;
+            sys_fcntl(proc, fd, cmd, arg)
         }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
@@ -490,12 +499,13 @@ impl Future for Sleep {
 // ---------- fd-dispatched read/write ----------------------------------------
 
 async fn sys_write(proc: &Arc<Proc>, fd: i32, buf_va: usize, len: usize) -> i64 {
-    let Some(file) = proc.get_file(fd) else {
+    let Some(entry) = proc.get_fd_entry(fd) else {
         return -1;
     };
-    match &*file {
+    let nonblock = entry.nonblock;
+    match &*entry.file {
         File::Console => console_write(proc, buf_va, len),
-        File::PipeWrite(p) => pipe_write(p.clone(), proc, buf_va, len).await,
+        File::PipeWrite(p) => pipe_write(p.clone(), proc, buf_va, len, nonblock).await,
         File::PipeRead(_) => -1,
         File::Inode {
             ip,
@@ -569,12 +579,13 @@ async fn sys_read(proc: &Arc<Proc>, fd: i32, buf_va: usize, len: usize) -> i64 {
     if len == 0 {
         return 0;
     }
-    let Some(file) = proc.get_file(fd) else {
+    let Some(entry) = proc.get_fd_entry(fd) else {
         return -1;
     };
-    match &*file {
-        File::Console => console_read(proc, buf_va, len).await,
-        File::PipeRead(p) => pipe_read(p.clone(), proc, buf_va, len).await,
+    let nonblock = entry.nonblock;
+    match &*entry.file {
+        File::Console => console_read(proc, buf_va, len, nonblock).await,
+        File::PipeRead(p) => pipe_read(p.clone(), proc, buf_va, len, nonblock).await,
         File::PipeWrite(_) => -1,
         File::Inode {
             ip,
@@ -621,19 +632,41 @@ async fn inode_read(
     n as i64
 }
 
-async fn console_read(proc: &Proc, buf_va: usize, len: usize) -> i64 {
+async fn console_read(proc: &Proc, buf_va: usize, len: usize, nonblock: bool) -> i64 {
     let mut n: usize = 0;
     while n < len {
-        let Some(b) = ConsoleByte.await else {
-            return -1; // killed
-        };
-        let Some(kva) = proc.translate_user_write(buf_va + n) else {
-            return -1;
-        };
-        unsafe { *(kva as *mut u8) = b };
-        n += 1;
-        if b == b'\n' {
-            break;
+        // POSIX O_NONBLOCK: first byte may block normally if we
+        // haven't gotten anything yet; if the FIFO is empty and
+        // nonblock, return -1 (EAGAIN). After any bytes have been
+        // read, return what we have rather than block further.
+        if nonblock {
+            match crate::console_in::try_pop() {
+                Some(b) => {
+                    let Some(kva) = proc.translate_user_write(buf_va + n) else {
+                        return -1;
+                    };
+                    unsafe { *(kva as *mut u8) = b };
+                    n += 1;
+                    if b == b'\n' {
+                        break;
+                    }
+                }
+                None => {
+                    return if n == 0 { -1 } else { n as i64 };
+                }
+            }
+        } else {
+            let Some(b) = ConsoleByte.await else {
+                return -1; // killed
+            };
+            let Some(kva) = proc.translate_user_write(buf_va + n) else {
+                return -1;
+            };
+            unsafe { *(kva as *mut u8) = b };
+            n += 1;
+            if b == b'\n' {
+                break;
+            }
         }
     }
     n as i64
@@ -822,6 +855,7 @@ async fn pipe_write(
     proc: &Arc<Proc>,
     buf_va: usize,
     len: usize,
+    nonblock: bool,
 ) -> i64 {
     let mut n: usize = 0;
     while n < len {
@@ -832,6 +866,25 @@ async fn pipe_write(
             return -1;
         };
         let byte = unsafe { *(kva as *const u8) };
+        if nonblock {
+            // Fast-path: try to push directly without awaiting.
+            // If the buffer is full and readers are still attached,
+            // bail with EAGAIN (or partial); on no-readers, normal
+            // failure path.
+            let mut buf = pipe.buf.lock();
+            if buf.len() < pipe.cap() {
+                buf.push_back(byte);
+                drop(buf);
+                pipe.read_waker.wake();
+                n += 1;
+                continue;
+            }
+            drop(buf);
+            if pipe.readers.load(Ordering::Acquire) == 0 {
+                return -1; // EPIPE-ish
+            }
+            return if n == 0 { -1 } else { n as i64 };
+        }
         if !(PipeWriteByte {
             pipe: pipe.clone(),
             byte,
@@ -878,9 +931,38 @@ async fn pipe_read(
     proc: &Arc<Proc>,
     buf_va: usize,
     len: usize,
+    nonblock: bool,
 ) -> i64 {
     let mut n: usize = 0;
     while n < len {
+        // O_NONBLOCK fast-path: don't await if there's nothing
+        // ready right now. Return -1 (EAGAIN) only if we haven't
+        // copied anything yet; otherwise return what we got.
+        if nonblock {
+            let popped = pipe.buf.lock().pop_front();
+            match popped {
+                Some(b) => {
+                    pipe.write_waker.wake();
+                    let Some(kva) = proc.translate_user_write(buf_va + n) else {
+                        return -1;
+                    };
+                    unsafe { *(kva as *mut u8) = b };
+                    n += 1;
+                    if pipe.buf.lock().is_empty() {
+                        break;
+                    }
+                }
+                None => {
+                    // Empty: if writers all closed, EOF (return 0
+                    // or what we have). Else EAGAIN.
+                    if pipe.writers.load(Ordering::Acquire) == 0 {
+                        break;
+                    }
+                    return if n == 0 { -1 } else { n as i64 };
+                }
+            }
+            continue;
+        }
         match (PipeReadByte { pipe: pipe.clone() }).await {
             Some(b) => {
                 let Some(kva) = proc.translate_user_write(buf_va + n) else {
@@ -932,7 +1014,8 @@ async fn sys_open(proc: &Arc<Proc>, path_va: usize, flags: u32) -> i64 {
     let Some(path) = read_user_cstring(proc, path_va, 128) else {
         return -1;
     };
-    let allowed = O_RDONLY | O_WRONLY | O_RDWR | O_CREATE | O_TRUNC | O_APPEND;
+    let allowed =
+        O_RDONLY | O_WRONLY | O_RDWR | O_CREATE | O_TRUNC | O_APPEND | O_CLOEXEC | O_NONBLOCK;
     if (flags & !allowed) != 0 {
         return -1;
     }
@@ -987,7 +1070,83 @@ async fn sys_open(proc: &Arc<Proc>, path_va: usize, flags: u32) -> i64 {
         writable,
         append,
     });
-    proc.alloc_fd(f).map(|fd| fd as i64).unwrap_or(-1)
+    let entry = crate::file::FdEntry {
+        file: f,
+        cloexec: (flags & O_CLOEXEC) != 0,
+        nonblock: (flags & O_NONBLOCK) != 0,
+    };
+    proc.alloc_fd_entry(entry).map(|fd| fd as i64).unwrap_or(-1)
+}
+
+/// POSIX `fcntl(fd, cmd, arg)`. Subset:
+///   F_DUPFD(start)         — dup to lowest fd ≥ start
+///   F_DUPFD_CLOEXEC(start) — same, with cloexec set
+///   F_GETFD                — read FD_CLOEXEC bit
+///   F_SETFD(flags)         — write FD_CLOEXEC bit
+///   F_GETFL                — read O_APPEND/O_NONBLOCK status flags
+///   F_SETFL(flags)         — write O_NONBLOCK (others ignored)
+fn sys_fcntl(proc: &Arc<Proc>, fd: i32, cmd: i32, arg: i64) -> i64 {
+    let Some(entry) = proc.get_fd_entry(fd) else {
+        return -1;
+    };
+    match cmd {
+        x if x == F_DUPFD => {
+            let mut e = entry.clone();
+            // POSIX F_DUPFD strips cloexec by definition.
+            e.cloexec = false;
+            proc.alloc_fd_entry_from(e, arg as i32)
+                .map(|n| n as i64)
+                .unwrap_or(-1)
+        }
+        x if x == F_DUPFD_CLOEXEC => {
+            let mut e = entry.clone();
+            e.cloexec = true;
+            proc.alloc_fd_entry_from(e, arg as i32)
+                .map(|n| n as i64)
+                .unwrap_or(-1)
+        }
+        x if x == F_GETFD => {
+            if entry.cloexec {
+                FD_CLOEXEC as i64
+            } else {
+                0
+            }
+        }
+        x if x == F_SETFD => {
+            let cloexec = (arg & FD_CLOEXEC as i64) != 0;
+            if proc.set_fd_cloexec(fd, cloexec) {
+                0
+            } else {
+                -1
+            }
+        }
+        x if x == F_GETFL => {
+            // We carry per-File "append" inside File::Inode; the
+            // user-visible O_APPEND in F_GETFL means "this fd was
+            // opened append-mode". Pull it from the File enum.
+            let mut flags: i64 = 0;
+            if let crate::file::File::Inode { append, .. } = &*entry.file {
+                if *append {
+                    flags |= O_APPEND as i64;
+                }
+            }
+            if entry.nonblock {
+                flags |= O_NONBLOCK as i64;
+            }
+            flags
+        }
+        x if x == F_SETFL => {
+            // Only O_NONBLOCK is a settable status flag in our subset.
+            // (O_APPEND mutation post-open isn't supported.)
+            let nb = (arg & O_NONBLOCK as i64) != 0;
+            if proc.set_fd_nonblock(fd, nb) {
+                0
+            } else {
+                -1
+            }
+        }
+        _ => -1,
+    }
 }
 
 async fn sys_mkdir(proc: &Arc<Proc>, path_va: usize) -> i64 {
@@ -1352,6 +1511,8 @@ async fn sys_exec(proc: &Arc<Proc>, path_va: usize, argv_va: usize) -> i64 {
     let code_end = image.code_end;
 
     proc.replace_image(image.pagetable, code_end);
+    // POSIX: fds marked FD_CLOEXEC close at exec time.
+    proc.close_on_exec();
     let tf = proc.trapframe();
     *tf = TrapFrame::default();
     tf.set_epc(entry as u64);

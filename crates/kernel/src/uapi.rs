@@ -35,6 +35,7 @@ pub const SYS_SETGID: usize = 31;
 pub const SYS_GETEUID: usize = 32;
 pub const SYS_GETEGID: usize = 33;
 pub const SYS_UMASK: usize = 34;
+pub const SYS_FCNTL: usize = 35;
 
 // lseek "whence" values — POSIX-standard.
 pub const SEEK_SET: i32 = 0; // absolute offset
@@ -49,6 +50,19 @@ pub const O_CREATE: u32 = 0x200;
 pub const O_TRUNC: u32 = 0x400;
 // POSIX additions (Tier 1 of the posix-compat track).
 pub const O_APPEND: u32 = 0x800;
+pub const O_CLOEXEC: u32 = 0x4000;
+pub const O_NONBLOCK: u32 = 0x8000;
+
+// fcntl commands (subset).
+pub const F_DUPFD: i32 = 0;
+pub const F_GETFD: i32 = 1;
+pub const F_SETFD: i32 = 2;
+pub const F_GETFL: i32 = 3;
+pub const F_SETFL: i32 = 4;
+pub const F_DUPFD_CLOEXEC: i32 = 1030; // Linux value
+
+// Bits in F_GETFD/F_SETFD's third arg.
+pub const FD_CLOEXEC: i32 = 1;
 
 /// User-visible `struct stat`. Extended from xv6's 24-byte layout
 /// to expose POSIX `st_mode`/`st_uid`/`st_gid`. Total now 36 bytes:

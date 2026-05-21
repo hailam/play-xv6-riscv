@@ -64,8 +64,11 @@ pub struct Proc {
     /// and bails (returning a sentinel value); `proc_main` then routes
     /// the killed proc into `sys_exit(-1)`.
     pub killed: AtomicBool,
-    /// Per-proc file descriptor table.
-    pub files: SpinLock<Vec<Option<Arc<File>>>>,
+    /// Per-proc file descriptor table. Each slot is an `FdEntry`
+    /// (file + per-fd flags); flags travel with the fd, not the
+    /// File, so `dup` can produce two fds pointing at the same File
+    /// but with different cloexec/nonblock settings.
+    pub files: SpinLock<Vec<Option<crate::file::FdEntry>>>,
     /// Current working directory. `None` until the fs is up; the
     /// first `bringup_then_init` sets it to inode 1 (root) on the
     /// init proc, and every `fork` clones the parent's cwd.
@@ -147,11 +150,21 @@ impl Proc {
         *child_tf = *parent_tf;
         child_tf.set_arg(0, 0);
 
-        let child_files: Vec<Option<Arc<File>>> = parent
+        // Fork copies the fd table — each child slot gets a fresh
+        // `Arc<File>` cloned from the parent's (so pipe ref counts
+        // bump in `File::Clone`), while the cloexec/nonblock flags
+        // carry over byte-for-byte.
+        let child_files: Vec<Option<crate::file::FdEntry>> = parent
             .files
             .lock()
             .iter()
-            .map(|f| f.as_ref().map(|a| Arc::new((**a).clone())))
+            .map(|slot| {
+                slot.as_ref().map(|e| crate::file::FdEntry {
+                    file: Arc::new((*e.file).clone()),
+                    cloexec: e.cloexec,
+                    nonblock: e.nonblock,
+                })
+            })
             .collect();
 
         let child = Self::with_layout(pt, tf_pa, code_end, child_files);
@@ -168,7 +181,7 @@ impl Proc {
         pt: <Arch as Hal>::PageTable,
         trapframe_pa: usize,
         size: usize,
-        files: Vec<Option<Arc<File>>>,
+        files: Vec<Option<crate::file::FdEntry>>,
     ) -> Self {
         Self {
             pid: next_pid(),
@@ -242,16 +255,57 @@ impl Proc {
         if fd < 0 {
             return None;
         }
+        self.files
+            .lock()
+            .get(fd as usize)
+            .and_then(|s| s.as_ref().map(|e| Arc::clone(&e.file)))
+    }
+
+    /// Look up an fd's whole FdEntry (file + per-fd flags). Returns
+    /// an owned clone so the caller doesn't hold the lock.
+    pub fn get_fd_entry(&self, fd: i32) -> Option<crate::file::FdEntry> {
+        if fd < 0 {
+            return None;
+        }
         self.files.lock().get(fd as usize).cloned().flatten()
     }
 
-    /// Find the lowest free fd and install `file` there. Returns the fd
-    /// number or `None` if the table is full.
+    /// Find the lowest free fd and install `file` there with default
+    /// (zero) per-fd flags. Returns the fd number or `None` if the
+    /// table is full.
     pub fn alloc_fd(&self, file: Arc<File>) -> Option<i32> {
+        self.alloc_fd_entry(crate::file::FdEntry::new(file))
+    }
+
+    /// Find the lowest free fd and install `entry` there. Lets the
+    /// caller pre-populate `cloexec`/`nonblock` (e.g. `sys_open` for
+    /// O_CLOEXEC, `sys_pipe` for `pipe2`).
+    pub fn alloc_fd_entry(&self, entry: crate::file::FdEntry) -> Option<i32> {
         let mut files = self.files.lock();
         for (i, slot) in files.iter_mut().enumerate() {
             if slot.is_none() {
-                *slot = Some(file);
+                *slot = Some(entry);
+                return Some(i as i32);
+            }
+        }
+        None
+    }
+
+    /// Find the lowest free fd ≥ `start` and install `entry` there.
+    /// Used by `fcntl(F_DUPFD, start)`.
+    pub fn alloc_fd_entry_from(
+        &self,
+        entry: crate::file::FdEntry,
+        start: i32,
+    ) -> Option<i32> {
+        if start < 0 {
+            return None;
+        }
+        let mut files = self.files.lock();
+        let begin = (start as usize).min(files.len());
+        for (i, slot) in files.iter_mut().enumerate().skip(begin) {
+            if slot.is_none() {
+                *slot = Some(entry);
                 return Some(i as i32);
             }
         }
@@ -274,6 +328,58 @@ impl Proc {
             -1
         }
     }
+
+    /// Read / mutate per-fd flags. Used by `fcntl` and by
+    /// `sys_exec`'s cloexec sweep.
+    pub fn fd_flags(&self, fd: i32) -> Option<(bool, bool)> {
+        if fd < 0 {
+            return None;
+        }
+        self.files
+            .lock()
+            .get(fd as usize)
+            .and_then(|s| s.as_ref().map(|e| (e.cloexec, e.nonblock)))
+    }
+
+    pub fn set_fd_cloexec(&self, fd: i32, v: bool) -> bool {
+        if fd < 0 {
+            return false;
+        }
+        let mut files = self.files.lock();
+        match files.get_mut(fd as usize).and_then(|s| s.as_mut()) {
+            Some(e) => {
+                e.cloexec = v;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn set_fd_nonblock(&self, fd: i32, v: bool) -> bool {
+        if fd < 0 {
+            return false;
+        }
+        let mut files = self.files.lock();
+        match files.get_mut(fd as usize).and_then(|s| s.as_mut()) {
+            Some(e) => {
+                e.nonblock = v;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Sweep the fd table on `exec`, closing every entry whose
+    /// `cloexec` flag is set. Called from `sys_exec` after the new
+    /// image successfully loads but before user mode resumes.
+    pub fn close_on_exec(&self) {
+        let mut files = self.files.lock();
+        for slot in files.iter_mut() {
+            if slot.as_ref().map_or(false, |e| e.cloexec) {
+                slot.take();
+            }
+        }
+    }
 }
 
 impl Drop for Proc {
@@ -288,12 +394,13 @@ impl Drop for Proc {
     }
 }
 
-fn default_files() -> Vec<Option<Arc<File>>> {
-    let mut files: Vec<Option<Arc<File>>> = (0..NOFILE).map(|_| None).collect();
+fn default_files() -> Vec<Option<crate::file::FdEntry>> {
+    let mut files: Vec<Option<crate::file::FdEntry>> =
+        (0..NOFILE).map(|_| None).collect();
     let console = Arc::new(File::Console);
-    files[0] = Some(console.clone());
-    files[1] = Some(console.clone());
-    files[2] = Some(console);
+    files[0] = Some(crate::file::FdEntry::new(console.clone()));
+    files[1] = Some(crate::file::FdEntry::new(console.clone()));
+    files[2] = Some(crate::file::FdEntry::new(console));
     files
 }
 
