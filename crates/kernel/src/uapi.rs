@@ -67,15 +67,17 @@ pub const F_DUPFD_CLOEXEC: i32 = 1030; // Linux value
 pub const FD_CLOEXEC: i32 = 1;
 
 /// User-visible `struct stat`. Extended from xv6's 24-byte layout
-/// to expose POSIX `st_mode`/`st_uid`/`st_gid`. Total now 36 bytes:
+/// to expose POSIX `st_mode`/`st_uid`/`st_gid`/`st_*time`. Total
+/// now 48 bytes:
 ///
 ///   dev:i32 ino:u32 typ:i16 nlink:i16 pad:u32 size:u64
-///   mode:u32 uid:u16 gid:u16
+///   mode:u32 uid:u16 gid:u16 atime:u32 mtime:u32 ctime:u32
 ///
 /// `typ` stays for backward compat with anything that read the old
 /// 24-byte layout. `mode` synthesises POSIX-style `S_IFREG`/
 /// `S_IFDIR`/`S_IFCHR` in the upper 4 bits and the rwx perm bits
 /// in the lower 12 — what `chmod` and `umask` actually manipulate.
+/// Timestamps are in monotonic uptime units (no wall clock yet).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Stat {
@@ -88,6 +90,9 @@ pub struct Stat {
     pub mode: u32,
     pub uid: u16,
     pub gid: u16,
+    pub atime: u32,
+    pub mtime: u32,
+    pub ctime: u32,
 }
 
 // POSIX S_IF* file-type bits (top of st_mode).

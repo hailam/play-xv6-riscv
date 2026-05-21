@@ -35,7 +35,25 @@ pub struct InodeState {
     pub uid: u16,
     pub gid: u16,
     pub size: u32,
+    /// POSIX timestamps in "uptime units" (Arch::now_ticks() /
+    /// TIMER_INTERVAL — monotonic, useful for ordering but not
+    /// real-world). Persistence: mtime/ctime survive reboots via
+    /// DInode._reserved_time; atime is updated in-memory on each
+    /// read but NOT flushed to disk (common production pattern,
+    /// matching Linux's `noatime` mount option — keeps reads
+    /// cheap).
+    pub atime: u32,
+    pub mtime: u32,
+    pub ctime: u32,
     pub addrs: [u32; NDIRECT + 1],
+}
+
+/// Current "time" — uptime in TIMER_INTERVAL units, truncated to
+/// u32. Monotonic; usable for `st_atime`/`mtime`/`ctime` ordering.
+/// 2^32 deci-seconds ≈ 13.6 years before wrap, fine for now.
+pub fn now_secs() -> u32 {
+    use hal::Hal;
+    (<crate::arch::Arch as Hal>::now_ticks() / crate::arch::TIMER_INTERVAL) as u32
 }
 
 pub struct Inode {
@@ -70,6 +88,9 @@ impl Inode {
                 uid: 0,
                 gid: 0,
                 size: 0,
+                atime: 0,
+                mtime: 0,
+                ctime: 0,
                 addrs: [0; NDIRECT + 1],
             }),
         }
@@ -221,6 +242,12 @@ async fn load_from_disk(ip: &Arc<Inode>) {
         uid: dino.uid,
         gid: dino.gid,
         size: dino.size,
+        // _reserved_time[0..3] holds [atime, mtime, ctime]. atime
+        // we re-read from disk for completeness — runtime updates
+        // are in-memory only (no iupdate path bumps it).
+        atime: dino._reserved_time[0],
+        mtime: dino._reserved_time[1],
+        ctime: dino._reserved_time[2],
         addrs: dino.addrs,
     };
     // Safety: we hold the lock (locked == true) for the duration of
@@ -236,6 +263,16 @@ pub async fn readi(li: &LockedInode<'_>, dst: &mut [u8], off: u32) -> usize {
     let size = li.state().size;
     if off >= size {
         return 0;
+    }
+    // atime bump — in-memory only, no iupdate. The `state_mut`
+    // method here goes through UnsafeCell since we only hold a
+    // shared `&LockedInode`. We use a small carefully-scoped block
+    // to bump the field; the LockedInode guarantee that we're the
+    // sole writer of inode state is preserved.
+    {
+        let now = now_secs();
+        let ptr = li.inode().state.get();
+        unsafe { (*ptr).atime = now };
     }
     let limit = (dst.len() as u32).min(size - off) as usize;
     let mut tot = 0usize;
@@ -332,8 +369,16 @@ pub async fn writei(li: &mut LockedInode<'_>, src: &[u8], off: u32) -> usize {
         tot += chunk;
         cur_off += chunk as u32;
     }
-    if cur_off > li.state().size {
-        li.state_mut().size = cur_off;
+    // Bump mtime + ctime on any successful byte write. (Even when
+    // we didn't grow the file — overwrites still modify content.)
+    if tot > 0 {
+        let now = now_secs();
+        let s = li.state_mut();
+        s.mtime = now;
+        s.ctime = now;
+        if cur_off > s.size {
+            s.size = cur_off;
+        }
         iupdate(li).await;
     }
     tot
@@ -357,6 +402,11 @@ pub async fn iupdate(li: &LockedInode<'_>) {
         uid: s.uid,
         gid: s.gid,
         size: s.size,
+        // Persist atime/mtime/ctime via the reserved time slots.
+        // Note: atime here only reflects what we knew at the last
+        // mtime/ctime-driven iupdate; pure-read atime bumps stay
+        // in memory.
+        _reserved_time: [s.atime, s.mtime, s.ctime],
         addrs: s.addrs,
         ..DInode::default()
     };
@@ -448,6 +498,13 @@ pub async fn itrunc_to(li: &mut LockedInode<'_>, new_size: u32) {
         }
     }
 
+    // mtime/ctime change whenever truncate touches data layout.
+    {
+        let now = now_secs();
+        let s = li.state_mut();
+        s.mtime = now;
+        s.ctime = now;
+    }
     // If shrinking, zero out the tail of the last-kept block so that
     // a subsequent grow doesn't expose the bytes we just truncated.
     // POSIX requires bytes past the new length to be gone.
@@ -510,10 +567,12 @@ pub async fn ialloc(dev: u32, typ: u16, mode: u16) -> Option<Arc<Inode>> {
             core::ptr::read_unaligned(buf.data()[off..].as_ptr() as *const DInode)
         };
         if dino.typ == 0 {
+            let now = now_secs();
             dino = DInode {
                 typ,
                 nlink: 1,
                 mode,
+                _reserved_time: [now, now, now],
                 ..DInode::default()
             };
             let bytes = unsafe {

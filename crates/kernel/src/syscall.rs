@@ -1391,7 +1391,9 @@ async fn sys_chmod(proc: &Arc<Proc>, path_va: usize, mode: u16) -> i64 {
         if caller_uid != 0 && (li.state().uid as u32) != caller_uid {
             -1
         } else {
-            li.state_mut().mode = mode;
+            let s = li.state_mut();
+            s.mode = mode;
+            s.ctime = fs::inode::now_secs();
             fs::inode::iupdate(&li).await;
             0
         }
@@ -1418,12 +1420,14 @@ async fn sys_chown(proc: &Arc<Proc>, path_va: usize, uid: u16, gid: u16) -> i64 
     fs::log::begin_op().await;
     {
         let mut li = fs::inode::ilock(&ip).await;
+        let now = fs::inode::now_secs();
         if uid != u16::MAX {
             li.state_mut().uid = uid;
         }
         if gid != u16::MAX {
             li.state_mut().gid = gid;
         }
+        li.state_mut().ctime = now;
         fs::inode::iupdate(&li).await;
     }
     fs::log::end_op().await;
@@ -1513,7 +1517,7 @@ async fn stat_inode_into_user(
     ip: &Arc<crate::fs::inode::Inode>,
     stat_va: usize,
 ) -> i64 {
-    let (typ, nlink, size, inum, dev, mode_bits, uid, gid);
+    let (typ, nlink, size, inum, dev, mode_bits, uid, gid, atime, mtime, ctime);
     {
         let li = fs::inode::ilock(ip).await;
         let s = li.state();
@@ -1525,6 +1529,9 @@ async fn stat_inode_into_user(
         mode_bits = s.mode;
         uid = s.uid;
         gid = s.gid;
+        atime = s.atime;
+        mtime = s.mtime;
+        ctime = s.ctime;
     }
     let st = Stat {
         dev,
@@ -1536,6 +1543,9 @@ async fn stat_inode_into_user(
         mode: crate::uapi::stat_mode(typ as u16, mode_bits),
         uid,
         gid,
+        atime,
+        mtime,
+        ctime,
     };
     let bytes = unsafe {
         core::slice::from_raw_parts(

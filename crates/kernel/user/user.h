@@ -27,6 +27,9 @@ struct stat {
     uint         mode;          // POSIX st_mode (S_IF* | rwx perms)
     ushort       uid;
     ushort       gid;
+    uint         atime;         // monotonic uptime units (no wall clock)
+    uint         mtime;
+    uint         ctime;
 };
 
 // POSIX st_mode bits.
