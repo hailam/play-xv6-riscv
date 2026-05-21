@@ -64,15 +64,8 @@ gets(char *buf, int max)
     return buf;
 }
 
-int
-stat(const char *n, struct stat *st)
-{
-    int fd = open(n, O_RDONLY);
-    if (fd < 0) return -1;
-    int r = fstat(fd, st);
-    close(fd);
-    return r;
-}
+// stat() is now a direct syscall (SYS_STAT). Defined in ulib.S /
+// ulib-aarch64.S — no open+fstat indirection.
 
 int
 atoi(const char *s)

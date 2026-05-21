@@ -54,6 +54,7 @@ int   open(const char*, int);
 int   mknod(const char*, short, short);
 int   unlink(const char*);
 int   fstat(int fd, struct stat*);
+int   stat(const char*, struct stat*);
 int   link(const char*, const char*);
 int   mkdir(const char*);
 int   chdir(const char*);
@@ -75,7 +76,6 @@ uint  strlen(const char*);
 void* memset(void*, int, uint);
 char* strchr(const char*, char);
 char* gets(char*, int max);
-int   stat(const char*, struct stat*);
 int   atoi(const char*);
 void* memmove(void*, const void*, int);
 int   memcmp(const void*, const void*, uint);
@@ -94,5 +94,6 @@ void  printf(const char*, ...);
 #define O_RDWR    0x002
 #define O_CREATE  0x200
 #define O_TRUNC   0x400
+#define O_APPEND  0x800
 
 #endif

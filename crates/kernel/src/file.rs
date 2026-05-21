@@ -50,11 +50,17 @@ pub enum File {
     /// On-disk file. Each fd has its own seek offset; the underlying
     /// inode is shared via `Arc<Inode>` (the inode cache holds another
     /// strong ref).
+    ///
+    /// `append`: O_APPEND semantics — every write seeks to current
+    /// end-of-file before issuing the write. The seek-then-write is
+    /// done inside the inode lock so it's atomic w.r.t. other writers
+    /// on the same inode.
     Inode {
         ip: Arc<Inode>,
         off: AtomicU32,
         readable: bool,
         writable: bool,
+        append: bool,
     },
 }
 
@@ -75,11 +81,13 @@ impl Clone for File {
                 off,
                 readable,
                 writable,
+                append,
             } => File::Inode {
                 ip: Arc::clone(ip),
                 off: AtomicU32::new(off.load(Ordering::Acquire)),
                 readable: *readable,
                 writable: *writable,
+                append: *append,
             },
         }
     }

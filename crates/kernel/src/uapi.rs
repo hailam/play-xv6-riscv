@@ -25,18 +25,21 @@ pub const SYS_CLOSE: usize = 21;
 pub const SYS_LSEEK: usize = 22;
 pub const SYS_PREAD: usize = 23;
 pub const SYS_PWRITE: usize = 24;
+pub const SYS_STAT: usize = 25;
 
 // lseek "whence" values — POSIX-standard.
 pub const SEEK_SET: i32 = 0; // absolute offset
 pub const SEEK_CUR: i32 = 1; // current + offset
 pub const SEEK_END: i32 = 2; // EOF + offset
 
-// open() flags (matches xv6 `kernel/fcntl.h`).
+// open() flags (matches xv6 `kernel/fcntl.h`, plus POSIX additions).
 pub const O_RDONLY: u32 = 0x000;
 pub const O_WRONLY: u32 = 0x001;
 pub const O_RDWR: u32 = 0x002;
 pub const O_CREATE: u32 = 0x200;
 pub const O_TRUNC: u32 = 0x400;
+// POSIX additions (Tier 1 of the posix-compat track).
+pub const O_APPEND: u32 = 0x800;
 
 /// User-visible `struct stat`. Field order + size matches xv6
 /// `kernel/stat.h`. Total = 24 bytes (4 + 4 + 2 + 2 + 4 pad + 8).

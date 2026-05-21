@@ -80,6 +80,36 @@ int main(int argc, char* argv[]) {
     close(wfd);
     unlink("/seekwrite");
 
+    // 9) O_APPEND — every write should land at EOF regardless of
+    //    the fd's offset. Open fresh, write "1", lseek to 0, write
+    //    "2" — file should end up "12" not "2".
+    int afd = open("/appendf", O_CREATE | O_RDWR | O_APPEND);
+    if (afd < 0) die("open(/appendf) failed");
+    if (write(afd, "1", 1) != 1) die("append write#1 failed");
+    if (lseek(afd, 0, SEEK_SET) != 0) die("lseek append failed");
+    if (write(afd, "2", 1) != 1) die("append write#2 failed");
+    char ab[4];
+    memset(ab, '_', sizeof(ab));
+    if (lseek(afd, 0, SEEK_SET) != 0) die("rewind for read failed");
+    int got3 = read(afd, ab, sizeof(ab));
+    printf("O_APPEND: wrote 1, rewind, wrote 2 -> read %d bytes \"%c%c\" (expected 12)\n",
+           got3, ab[0], ab[1]);
+    if (got3 != 2 || ab[0] != '1' || ab[1] != '2') die("O_APPEND mismatch");
+    close(afd);
+    unlink("/appendf");
+
+    // 10) Path-based stat() — open-less version of fstat. Should
+    //     return the same size as we measured via fstat above.
+    struct stat st2;
+    if (stat("README", &st2) < 0) die("stat(README) failed");
+    printf("stat(README): size=%d nlink=%d type=%d\n",
+           (int)st2.size, st2.nlink, st2.type);
+    if (st2.size != st.size) die("stat size differs from fstat");
+    // Non-existent path should return -1.
+    if (stat("/nonexistent-xyz", &st2) != -1)
+        die("stat(/nonexistent) should fail");
+    printf("stat(/nonexistent) -> -1 OK\n");
+
     printf("seektest ok\n");
     return 0;
 }

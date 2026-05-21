@@ -21,10 +21,11 @@ use crate::user_vm::STACK_VA_BASE;
 
 type TrapFrame = <Arch as Hal>::TrapFrame;
 use crate::uapi::{
-    Stat, O_CREATE, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_END, SEEK_SET,
-    SYS_CHDIR, SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FSTAT, SYS_GETPID,
-    SYS_KILL, SYS_LINK, SYS_LSEEK, SYS_MKDIR, SYS_MKNOD, SYS_OPEN, SYS_PIPE, SYS_PREAD,
-    SYS_PWRITE, SYS_READ, SYS_SBRK, SYS_SLEEP, SYS_UNLINK, SYS_UPTIME, SYS_WAIT, SYS_WRITE,
+    Stat, O_APPEND, O_CREATE, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, SEEK_CUR, SEEK_END,
+    SEEK_SET, SYS_CHDIR, SYS_CLOSE, SYS_DUP, SYS_EXEC, SYS_EXIT, SYS_FORK, SYS_FSTAT,
+    SYS_GETPID, SYS_KILL, SYS_LINK, SYS_LSEEK, SYS_MKDIR, SYS_MKNOD, SYS_OPEN, SYS_PIPE,
+    SYS_PREAD, SYS_PWRITE, SYS_READ, SYS_SBRK, SYS_SLEEP, SYS_STAT, SYS_UNLINK,
+    SYS_UPTIME, SYS_WAIT, SYS_WRITE,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -155,6 +156,12 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let len = tf.arg(2) as usize;
             let offset = tf.arg(3) as i64;
             sys_pwrite(proc, fd, buf_va, len, offset).await
+        }
+        SYS_STAT => {
+            let tf = proc.trapframe();
+            let path_va = tf.arg(0) as usize;
+            let stat_va = tf.arg(1) as usize;
+            sys_stat(proc, path_va, stat_va).await
         }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
@@ -449,11 +456,12 @@ async fn sys_write(proc: &Arc<Proc>, fd: i32, buf_va: usize, len: usize) -> i64 
             off,
             readable: _,
             writable,
+            append,
         } => {
             if !*writable {
                 return -1;
             }
-            inode_write(proc, ip.clone(), off, buf_va, len).await
+            inode_write(proc, ip.clone(), off, buf_va, len, *append).await
         }
     }
 }
@@ -464,6 +472,7 @@ async fn inode_write(
     off: &AtomicU32,
     buf_va: usize,
     len: usize,
+    append: bool,
 ) -> i64 {
     // Copy user bytes into a kernel buffer first so that writei (which
     // does many awaits) doesn't have to keep crossing into user VA.
@@ -475,9 +484,17 @@ async fn inode_write(
         tmp[i] = unsafe { *(kva as *const u8) };
     }
 
-    let cur = off.load(Ordering::Acquire);
     fs::log::begin_op().await;
     let mut li = fs::inode::ilock(&ip).await;
+    // O_APPEND: re-read the inode's size *under the lock* and write
+    // from there, ignoring whatever offset the fd holds. This is
+    // POSIX's atomicity guarantee — concurrent appenders never
+    // overwrite each other.
+    let cur = if append {
+        li.state().size
+    } else {
+        off.load(Ordering::Acquire)
+    };
     let n = fs::inode::writei(&mut li, &tmp, cur).await;
     drop(li);
     fs::log::end_op().await;
@@ -518,6 +535,7 @@ async fn sys_read(proc: &Arc<Proc>, fd: i32, buf_va: usize, len: usize) -> i64 {
             off,
             readable,
             writable: _,
+            append: _,
         } => {
             if !*readable {
                 return -1;
@@ -868,7 +886,7 @@ async fn sys_open(proc: &Arc<Proc>, path_va: usize, flags: u32) -> i64 {
     let Some(path) = read_user_cstring(proc, path_va, 128) else {
         return -1;
     };
-    let allowed = O_RDONLY | O_WRONLY | O_RDWR | O_CREATE | O_TRUNC;
+    let allowed = O_RDONLY | O_WRONLY | O_RDWR | O_CREATE | O_TRUNC | O_APPEND;
     if (flags & !allowed) != 0 {
         return -1;
     }
@@ -906,11 +924,13 @@ async fn sys_open(proc: &Arc<Proc>, path_va: usize, flags: u32) -> i64 {
 
     let readable = (flags & O_WRONLY) == 0;
     let writable = (flags & (O_WRONLY | O_RDWR)) != 0;
+    let append = (flags & O_APPEND) != 0;
     let f = Arc::new(File::Inode {
         ip,
         off: AtomicU32::new(0),
         readable,
         writable,
+        append,
     });
     proc.alloc_fd(f).map(|fd| fd as i64).unwrap_or(-1)
 }
@@ -1070,6 +1090,31 @@ async fn sys_fstat(proc: &Arc<Proc>, fd: i32, stat_va: usize) -> i64 {
     let File::Inode { ip, .. } = &*file else {
         return -1;
     };
+    stat_inode_into_user(proc, ip, stat_va).await
+}
+
+/// POSIX `stat(path, &stat)` — like `fstat` but takes a path string
+/// instead of an open fd. We have no symlinks yet, so this is also
+/// the kernel-side implementation of `lstat` (which would only
+/// diverge on a symlink — `lstat` reports the link, `stat` chases
+/// it).
+async fn sys_stat(proc: &Arc<Proc>, path_va: usize, stat_va: usize) -> i64 {
+    let Some(path) = read_user_cstring(proc, path_va, 128) else {
+        return -1;
+    };
+    let Some(ip) = resolve_path(proc, &path).await else {
+        return -1;
+    };
+    stat_inode_into_user(proc, &ip, stat_va).await
+}
+
+/// Shared implementation: stat the locked inode and copy out the
+/// 24-byte `Stat` struct to the user buffer at `stat_va`.
+async fn stat_inode_into_user(
+    proc: &Arc<Proc>,
+    ip: &Arc<crate::fs::inode::Inode>,
+    stat_va: usize,
+) -> i64 {
     let (typ, nlink, size, inum, dev);
     {
         let li = fs::inode::ilock(ip).await;
