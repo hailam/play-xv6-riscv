@@ -34,6 +34,8 @@ use crate::uapi::{
     SYS_WAITPID, SYS_PAUSE, SYS_ALARM, WNOHANG,
     SYS_CLOCK_GETTIME, SYS_GETDENTS, SYS_EXECVE, CLOCK_MONOTONIC,
     CLOCK_REALTIME, Timespec, UserDirent,
+    SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_NANOSLEEP, SYS_BRK, SYS_RMDIR, SYS_WAIT4,
+    Timeval, Rusage,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -302,6 +304,35 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let argv_va = tf.arg(1) as usize;
             let envp_va = tf.arg(2) as usize;
             sys_execve(proc, path_va, argv_va, envp_va).await
+        }
+        SYS_GETPPID => sys_getppid(proc),
+        SYS_GETTIMEOFDAY => {
+            let tf = proc.trapframe();
+            let tv_va = tf.arg(0) as usize;
+            let tz_va = tf.arg(1) as usize;
+            sys_gettimeofday(proc, tv_va, tz_va)
+        }
+        SYS_NANOSLEEP => {
+            let tf = proc.trapframe();
+            let req_va = tf.arg(0) as usize;
+            let rem_va = tf.arg(1) as usize;
+            sys_nanosleep(proc, req_va, rem_va).await
+        }
+        SYS_BRK => {
+            let addr = proc.trapframe().arg(0) as usize;
+            sys_brk(proc, addr).await
+        }
+        SYS_RMDIR => {
+            let path_va = proc.trapframe().arg(0) as usize;
+            sys_rmdir(proc, path_va).await
+        }
+        SYS_WAIT4 => {
+            let tf = proc.trapframe();
+            let pid = tf.arg(0) as i32;
+            let status_va = tf.arg(1) as usize;
+            let options = tf.arg(2) as i32;
+            let rusage_va = tf.arg(3) as usize;
+            sys_wait4(proc, pid, status_va, options, rusage_va).await
         }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
@@ -2275,6 +2306,192 @@ async fn sys_exec(proc: &Arc<Proc>, path_va: usize, argv_va: usize) -> i64 {
 /// POSIX `execve(path, argv, envp)` — like `exec` but also accepts
 /// an env-string array. `envp_va == 0` is treated as empty envp
 /// (matches the legacy `exec` entry point).
+/// POSIX `getppid()` — parent's pid, or 0 if reparented/orphaned.
+fn sys_getppid(proc: &Arc<Proc>) -> i64 {
+    let parent_weak = proc.parent.lock().clone();
+    parent_weak
+        .and_then(|w| w.upgrade())
+        .map(|p| p.pid as i64)
+        .unwrap_or(0)
+}
+
+/// POSIX `gettimeofday(tv, tz)` — fill tv with current monotonic
+/// time (we have no RTC). `tz` (timezone) is obsolete; we ignore
+/// it but accept the pointer.
+fn sys_gettimeofday(proc: &Arc<Proc>, tv_va: usize, _tz_va: usize) -> i64 {
+    if tv_va == 0 {
+        return -1;
+    }
+    let ticks = Arch::now_ticks();
+    let ts_per_sec = TIMER_INTERVAL * 10;
+    let tv_sec = (ticks / ts_per_sec) as i64;
+    let rem = ticks % ts_per_sec;
+    let tv_usec = ((rem as u128 * 1_000_000) / ts_per_sec as u128) as i64;
+    let tv = Timeval { tv_sec, tv_usec };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &tv as *const _ as *const u8,
+            core::mem::size_of::<Timeval>(),
+        )
+    };
+    for (i, b) in bytes.iter().enumerate() {
+        let Some(kva) = proc.translate_user_write(tv_va + i) else {
+            return -1;
+        };
+        unsafe { *(kva as *mut u8) = *b };
+    }
+    0
+}
+
+/// POSIX `nanosleep(req, rem)` — sleep for `req->tv_sec` seconds +
+/// `req->tv_nsec` nanoseconds. We round up to whole timer ticks (our
+/// minimum sleep granularity). `rem` is unused on completion; on
+/// signal-interrupted return we'd fill it (Slice 3 of nanosleep).
+async fn sys_nanosleep(proc: &Arc<Proc>, req_va: usize, _rem_va: usize) -> i64 {
+    if req_va == 0 {
+        return -1;
+    }
+    // Read 16 bytes of timespec from user.
+    let mut req = Timespec::default();
+    let req_bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            &mut req as *mut _ as *mut u8,
+            core::mem::size_of::<Timespec>(),
+        )
+    };
+    for (i, b) in req_bytes.iter_mut().enumerate() {
+        let Some(kva) = proc.translate_user(req_va + i) else {
+            return -1;
+        };
+        *b = unsafe { *(kva as *const u8) };
+    }
+    if req.tv_sec < 0 || req.tv_nsec < 0 || req.tv_nsec >= 1_000_000_000 {
+        return -1;
+    }
+    let ts_per_sec = TIMER_INTERVAL * 10;
+    let total_ticks = (req.tv_sec as u64) * ts_per_sec
+        + ((req.tv_nsec as u64 * ts_per_sec + 999_999_999) / 1_000_000_000);
+    if total_ticks == 0 {
+        return 0;
+    }
+    let now = Arch::now_ticks();
+    let deadline = now + total_ticks;
+    Sleep { deadline }.await;
+    0
+}
+
+/// POSIX `brk(addr)` — set the program-break (heap end) to `addr`.
+/// Equivalent to "sbrk to absolute address". Returns 0 on success or
+/// -1 on error. Legacy convention: some platforms also return the
+/// new break; we match Linux's "0 or -1" form (libc's `__brk` cares
+/// about that).
+async fn sys_brk(proc: &Arc<Proc>, addr: usize) -> i64 {
+    if addr == 0 {
+        // Query — return current break.
+        return proc.size.load(Ordering::Acquire) as i64;
+    }
+    let old = proc.size.load(Ordering::Acquire);
+    if addr == old {
+        return 0;
+    }
+    let delta = if addr > old {
+        (addr - old) as i64
+    } else {
+        -((old - addr) as i64)
+    };
+    // Delegate to sbrk's eager path. Pass lazy=0 (SBRK_EAGER).
+    let r = sys_sbrk(proc, delta, 0).await;
+    if r < 0 {
+        -1
+    } else {
+        0
+    }
+}
+
+/// POSIX `rmdir(path)` — like unlink, but only succeeds for empty
+/// directories. Refuses non-dirs (POSIX would say ENOTDIR) and
+/// non-empty dirs (ENOTEMPTY). Calls into the existing unlink path
+/// after the type/empty checks.
+async fn sys_rmdir(proc: &Arc<Proc>, path_va: usize) -> i64 {
+    let Some(path) = read_user_cstring(proc, path_va, 128) else {
+        return -1;
+    };
+    let Some(ip) = resolve_path(proc, &path).await else {
+        return -1;
+    };
+    // Must be a directory; must be empty (only "." and "..").
+    {
+        let li = fs::inode::ilock(&ip).await;
+        if li.state().typ != xv6_fs_layout::T_DIR {
+            return -1;
+        }
+        if !dir_is_empty(&li).await {
+            return -1;
+        }
+    }
+    // Drop our hold on `ip` before calling unlink (which re-locks).
+    drop(ip);
+    sys_unlink(proc, path_va).await
+}
+
+async fn dir_is_empty(dir: &fs::inode::LockedInode<'_>) -> bool {
+    use xv6_fs_layout::{Dirent, DIRSIZ};
+    let entry_size = core::mem::size_of::<Dirent>() as u32;
+    let mut off: u32 = 0;
+    let size = dir.state().size;
+    while off < size {
+        let mut e = Dirent::default();
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                &mut e as *mut _ as *mut u8,
+                entry_size as usize,
+            )
+        };
+        if fs::inode::readi(dir, bytes, off).await != entry_size as usize {
+            return false;
+        }
+        if e.inum != 0 {
+            let trimmed = e.name.iter().position(|&b| b == 0).unwrap_or(DIRSIZ);
+            let name = &e.name[..trimmed];
+            if name != b"." && name != b".." {
+                return false;
+            }
+        }
+        off += entry_size;
+    }
+    true
+}
+
+/// POSIX `wait4(pid, status, options, rusage)` — waitpid + zeroed
+/// rusage. We don't track resource usage; the rusage struct is
+/// filled with zeros for libc's sake (newlib/musl typically just
+/// pass it through).
+async fn sys_wait4(
+    proc: &Arc<Proc>,
+    pid: i32,
+    status_va: usize,
+    options: i32,
+    rusage_va: usize,
+) -> i64 {
+    let r = sys_waitpid(proc, pid, status_va, options).await;
+    if r > 0 && rusage_va != 0 {
+        let ru = Rusage::default();
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                &ru as *const _ as *const u8,
+                core::mem::size_of::<Rusage>(),
+            )
+        };
+        for (i, b) in bytes.iter().enumerate() {
+            let Some(kva) = proc.translate_user_write(rusage_va + i) else {
+                return -1;
+            };
+            unsafe { *(kva as *mut u8) = *b };
+        }
+    }
+    r
+}
+
 async fn sys_execve(
     proc: &Arc<Proc>,
     path_va: usize,

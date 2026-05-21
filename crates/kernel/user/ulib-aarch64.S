@@ -85,6 +85,12 @@ DEFINE_SYSCALL alarm,    46
 DEFINE_SYSCALL clock_gettime, 47
 DEFINE_SYSCALL getdents,      48
 DEFINE_SYSCALL execve,        49
+DEFINE_SYSCALL getppid,       50
+DEFINE_SYSCALL gettimeofday,  51
+DEFINE_SYSCALL nanosleep,     52
+DEFINE_SYSCALL brk,           53
+DEFINE_SYSCALL rmdir,         54
+DEFINE_SYSCALL wait4,         55
 
 // _sigret — POSIX signal restorer trampoline. Same role as the
 // riscv version: linked into every C user binary, used as the

@@ -113,6 +113,23 @@ char* getenv(const char* name);
 int   setenv(const char* name, const char* value, int overwrite);
 int   unsetenv(const char* name);
 
+struct timeval {
+    long long tv_sec;
+    long long tv_usec;
+};
+
+struct timespec {
+    long long tv_sec;
+    long long tv_nsec;
+};
+
+int   getppid(void);
+int   gettimeofday(struct timeval* tv, void* tz);
+int   nanosleep(const struct timespec* req, struct timespec* rem);
+long  brk(void* addr);
+int   rmdir(const char* path);
+int   wait4(int pid, int* status, int options, void* rusage);
+
 // POSIX-ish sigaction. Slim — we don't expose sa_flags or
 // SA_SIGINFO. `handler` is a function pointer (or SIG_DFL/SIG_IGN);
 // `mask` is the set of signals to block while it runs.
@@ -148,13 +165,9 @@ unsigned int alarm(unsigned int seconds);
 #define WNOHANG 1
 
 // POSIX clock_gettime — only MONOTONIC is meaningful (no RTC).
+// `struct timespec` declared up top alongside `struct timeval`.
 #define CLOCK_REALTIME  0
 #define CLOCK_MONOTONIC 1
-
-struct timespec {
-    long long tv_sec;
-    long long tv_nsec;
-};
 
 int clock_gettime(int clk, struct timespec* ts);
 

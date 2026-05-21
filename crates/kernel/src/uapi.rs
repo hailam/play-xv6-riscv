@@ -50,6 +50,32 @@ pub const SYS_ALARM: usize = 46;
 pub const SYS_CLOCK_GETTIME: usize = 47;
 pub const SYS_GETDENTS: usize = 48;
 pub const SYS_EXECVE: usize = 49;
+pub const SYS_GETPPID: usize = 50;
+pub const SYS_GETTIMEOFDAY: usize = 51;
+pub const SYS_NANOSLEEP: usize = 52;
+pub const SYS_BRK: usize = 53;
+pub const SYS_RMDIR: usize = 54;
+pub const SYS_WAIT4: usize = 55;
+
+/// POSIX `struct timeval` — 16 bytes (s:i64, us:i64). Used by
+/// `gettimeofday`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Timeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+/// POSIX `struct rusage` — full layout is huge (16 fields). We
+/// expose just the zeroed first two timevals for libc's sake; real
+/// kernel rusage tracking is a separate project.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Rusage {
+    pub ru_utime: Timeval,
+    pub ru_stime: Timeval,
+    pub _rest: [i64; 14],
+}
 
 // waitpid options
 pub const WNOHANG: i32 = 1;
