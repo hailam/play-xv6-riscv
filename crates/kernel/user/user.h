@@ -130,6 +130,21 @@ long  brk(void* addr);
 int   rmdir(const char* path);
 int   wait4(int pid, int* status, int options, void* rusage);
 
+// POSIX mmap/munmap. Slice 1 supports MAP_ANONYMOUS | MAP_PRIVATE
+// only — anonymous private memory (malloc backend). File-backed
+// mmap is slice 2.
+#define PROT_NONE    0
+#define PROT_READ    1
+#define PROT_WRITE   2
+#define PROT_EXEC    4
+#define MAP_PRIVATE     0x02
+#define MAP_ANONYMOUS   0x20
+#define MAP_FAILED      ((void*)-1)
+
+void* mmap(void* addr, unsigned int length, int prot, int flags,
+           int fd, long offset);
+int   munmap(void* addr, unsigned int length);
+
 // POSIX-ish sigaction. Slim — we don't expose sa_flags or
 // SA_SIGINFO. `handler` is a function pointer (or SIG_DFL/SIG_IGN);
 // `mask` is the set of signals to block while it runs.

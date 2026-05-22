@@ -35,7 +35,8 @@ use crate::uapi::{
     SYS_CLOCK_GETTIME, SYS_GETDENTS, SYS_EXECVE, CLOCK_MONOTONIC,
     CLOCK_REALTIME, Timespec, UserDirent,
     SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_NANOSLEEP, SYS_BRK, SYS_RMDIR, SYS_WAIT4,
-    Timeval, Rusage,
+    Timeval, Rusage, SYS_MMAP, SYS_MUNMAP, MAP_ANONYMOUS, MAP_PRIVATE,
+    PROT_READ, PROT_WRITE, PROT_EXEC, MAP_FAILED,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -334,6 +335,22 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let rusage_va = tf.arg(3) as usize;
             sys_wait4(proc, pid, status_va, options, rusage_va).await
         }
+        SYS_MMAP => {
+            let tf = proc.trapframe();
+            let addr = tf.arg(0) as usize;
+            let length = tf.arg(1) as usize;
+            let prot = tf.arg(2) as i32;
+            let flags = tf.arg(3) as i32;
+            let fd = tf.arg(4) as i32;
+            let offset = tf.arg(5) as i64;
+            sys_mmap(proc, addr, length, prot, flags, fd, offset)
+        }
+        SYS_MUNMAP => {
+            let tf = proc.trapframe();
+            let addr = tf.arg(0) as usize;
+            let length = tf.arg(1) as usize;
+            sys_munmap(proc, addr, length)
+        }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
             -1
@@ -437,12 +454,28 @@ async fn sys_sbrk(proc: &Arc<Proc>, n: i64, lazy: i64) -> i64 {
 /// if the fault was a "lazy region" miss and we mapped a fresh
 /// zero page (caller should resume the trapping instr by not
 /// advancing epc); false if the fault is genuinely illegal.
+///
+/// Two flavors of "lazy region":
+///   1. sbrk-grown heap below `proc.size` that hasn't faulted in yet.
+///   2. anonymous mmap region — VA falls inside a registered VMA.
 pub fn lazy_map_page(proc: &Arc<Proc>, fault_va: usize) -> bool {
-    let size = proc.size.load(Ordering::Acquire);
-    if fault_va >= size {
-        return false;
-    }
     let page = fault_va & !(PGSIZE - 1);
+    let size = proc.size.load(Ordering::Acquire);
+    let perm: PtePerm = if fault_va < size {
+        // Heap (sbrk lazy) — always RW user.
+        PtePerm::URW
+    } else if let Some(vma_prot) = proc
+        .vmas
+        .lock()
+        .iter()
+        .find(|v| fault_va >= v.start && fault_va < v.end)
+        .map(|v| v.prot)
+    {
+        // mmap-managed region — translate prot bits to PtePerm.
+        vma_prot_to_pteperm(vma_prot)
+    } else {
+        return false;
+    };
     // Already mapped? Could happen if two harts faulted at once;
     // bail rather than double-map.
     {
@@ -455,13 +488,140 @@ pub fn lazy_map_page(proc: &Arc<Proc>, fault_va: usize) -> bool {
         return false;
     };
     let mut pt = proc.pagetable.lock();
-    if pt.map(page, pa, PGSIZE, PtePerm::URW, &KFRAMES).is_err() {
-        // Free the frame if mapping fails (only happens on Remap,
-        // which our check above already filtered).
+    if pt.map(page, pa, PGSIZE, perm, &KFRAMES).is_err() {
         unsafe { KFRAMES.free(pa) };
         return false;
     }
     true
+}
+
+fn vma_prot_to_pteperm(prot: i32) -> PtePerm {
+    use hal::PtePerm as PP;
+    let mut bits = PP::USER;
+    if prot & PROT_READ != 0 {
+        bits |= PP::READ;
+    }
+    if prot & PROT_WRITE != 0 {
+        bits |= PP::WRITE;
+    }
+    if prot & PROT_EXEC != 0 {
+        bits |= PP::EXEC;
+    }
+    // A mapping with no access bits would faultloop; force at
+    // least read (POSIX allows PROT_NONE as "reserved address" with
+    // no actual access — we model by leaving the page unmapped and
+    // letting the fault return -1).
+    if (prot & (PROT_READ | PROT_WRITE | PROT_EXEC)) == 0 {
+        bits |= PP::READ;
+    }
+    PtePerm(bits)
+}
+
+/// POSIX `mmap(addr, length, prot, flags, fd, offset)`.
+///
+/// Slice 1 supports only `MAP_ANONYMOUS | MAP_PRIVATE` — the
+/// allocator that `malloc`-like libcs use. File-backed mmap is
+/// slice 2. `addr` is treated as a hint and ignored — we pick from
+/// the top-down mmap region.
+fn sys_mmap(
+    proc: &Arc<Proc>,
+    _addr: usize,
+    length: usize,
+    prot: i32,
+    flags: i32,
+    _fd: i32,
+    _offset: i64,
+) -> i64 {
+    if length == 0 {
+        return MAP_FAILED as i64;
+    }
+    // Required flags for slice 1.
+    if (flags & MAP_ANONYMOUS) == 0 || (flags & MAP_PRIVATE) == 0 {
+        return MAP_FAILED as i64;
+    }
+    // Reject unknown prot bits.
+    if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+        return MAP_FAILED as i64;
+    }
+    let len_aligned = (length + PGSIZE - 1) & !(PGSIZE - 1);
+    // Bump-allocate top-down.
+    let new_base = match proc
+        .mmap_base
+        .load(Ordering::Acquire)
+        .checked_sub(len_aligned)
+    {
+        Some(v) => v,
+        None => return MAP_FAILED as i64,
+    };
+    if new_base < (crate::user_vm::MMAP_TOP / 2) {
+        // Out of mmap address space.
+        return MAP_FAILED as i64;
+    }
+    proc.mmap_base.store(new_base, Ordering::Release);
+    let vma = crate::proc::Vma {
+        start: new_base,
+        end: new_base + len_aligned,
+        prot,
+    };
+    let mut vmas = proc.vmas.lock();
+    // Insert sorted by start so lookups can short-circuit.
+    let pos = vmas.partition_point(|v| v.start < vma.start);
+    vmas.insert(pos, vma);
+    new_base as i64
+}
+
+/// POSIX `munmap(addr, length)`. Removes any VMAs fully inside the
+/// range and unmaps backing pages. Partial-overlap with a VMA is
+/// rejected (POSIX allows splitting; we don't yet).
+fn sys_munmap(proc: &Arc<Proc>, addr: usize, length: usize) -> i64 {
+    if addr & (PGSIZE - 1) != 0 || length == 0 {
+        return -1;
+    }
+    let len_aligned = (length + PGSIZE - 1) & !(PGSIZE - 1);
+    let req_end = match addr.checked_add(len_aligned) {
+        Some(v) => v,
+        None => return -1,
+    };
+    let mut vmas = proc.vmas.lock();
+    let mut to_remove = alloc::vec::Vec::new();
+    for (i, v) in vmas.iter().enumerate() {
+        // Fully contained inside request: remove.
+        if v.start >= addr && v.end <= req_end {
+            to_remove.push(i);
+        }
+        // Partial overlap → reject (no VMA splitting in slice 1).
+        else if (v.start < req_end && v.end > addr)
+            && !(v.start >= addr && v.end <= req_end)
+        {
+            return -1;
+        }
+    }
+    if to_remove.is_empty() {
+        // No mapping at this range (double-munmap or unmapped-area).
+        return -1;
+    }
+    // Snapshot the ranges to free before mutating vmas.
+    let ranges: alloc::vec::Vec<(usize, usize)> = to_remove
+        .iter()
+        .rev()
+        .map(|&i| {
+            let v = vmas.remove(i);
+            (v.start, v.end)
+        })
+        .collect();
+    drop(vmas);
+    // Unmap each page that was mapped (lazy pages may not be).
+    let mut pt = proc.pagetable.lock();
+    for (start, end) in ranges {
+        let mut va = start;
+        while va < end {
+            if let Some(pa) = pt.unmap_page(va) {
+                unsafe { KFRAMES.free(pa) };
+            }
+            va += PGSIZE;
+        }
+    }
+    0
 }
 
 /// POSIX `kill(pid, sig)`.

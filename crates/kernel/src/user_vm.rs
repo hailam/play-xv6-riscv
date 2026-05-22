@@ -23,6 +23,10 @@ use crate::arch::{trampoline_pa, PGSIZE, TRAMPOLINE, TRAPFRAME};
 
 pub const STACK_VA_TOP: usize = TRAPFRAME;
 pub const STACK_VA_BASE: usize = STACK_VA_TOP - PGSIZE;
+/// Top of the mmap region. Leave a 16 MiB guard below the stack
+/// page so a wild sbrk into the stack-guard area isn't immediately
+/// indistinguishable from an mmap region.
+pub const MMAP_TOP: usize = STACK_VA_BASE - 16 * 1024 * 1024;
 
 pub struct UserImage {
     pub pagetable: <Arch as Hal>::PageTable,

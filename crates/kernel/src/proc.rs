@@ -106,6 +106,23 @@ pub struct Proc {
     /// entry can tell it's been superseded.
     pub alarm_deadline: AtomicU64,
     pub alarm_generation: AtomicU32,
+    /// mmap regions. Sorted by `start`. Anonymous-private only for
+    /// now (slice 1). Lazy: VMAs register the range here at mmap
+    /// time; pages are allocated on demand by the page-fault path.
+    pub vmas: SpinLock<Vec<Vma>>,
+    /// Bump pointer for the next anonymous mmap allocation —
+    /// grows top-down from `user_vm::MMAP_TOP`. munmap doesn't
+    /// reuse VA space (simpler than maintaining a hole list).
+    pub mmap_base: AtomicUsize,
+}
+
+/// Per-Proc memory region descriptor. Anonymous private mappings
+/// only in slice 1; file-backed adds another field in slice 2.
+#[derive(Clone, Copy)]
+pub struct Vma {
+    pub start: usize,
+    pub end: usize,
+    pub prot: i32,
 }
 
 impl Proc {
@@ -243,6 +260,8 @@ impl Proc {
             sig_saved_blocked: AtomicU32::new(0),
             alarm_deadline: AtomicU64::new(0),
             alarm_generation: AtomicU32::new(0),
+            vmas: SpinLock::new(Vec::new()),
+            mmap_base: AtomicUsize::new(crate::user_vm::MMAP_TOP),
         }
     }
 
@@ -292,6 +311,10 @@ impl Proc {
         // about queued signals. Blocked mask carries over.
         *self.sig_actions.lock() = [crate::uapi::SigAction::default_action(); 32];
         *self.sig_saved_frame.lock() = None;
+        // mmap regions belong to the old image — wipe.
+        self.vmas.lock().clear();
+        self.mmap_base
+            .store(crate::user_vm::MMAP_TOP, Ordering::Release);
     }
 
     pub fn is_zombie(&self) -> bool {

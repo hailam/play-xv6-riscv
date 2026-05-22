@@ -56,6 +56,17 @@ pub const SYS_NANOSLEEP: usize = 52;
 pub const SYS_BRK: usize = 53;
 pub const SYS_RMDIR: usize = 54;
 pub const SYS_WAIT4: usize = 55;
+pub const SYS_MMAP: usize = 56;
+pub const SYS_MUNMAP: usize = 57;
+
+// mmap flags (subset).
+pub const PROT_NONE:  i32 = 0;
+pub const PROT_READ:  i32 = 1;
+pub const PROT_WRITE: i32 = 2;
+pub const PROT_EXEC:  i32 = 4;
+pub const MAP_PRIVATE:   i32 = 0x02;
+pub const MAP_ANONYMOUS: i32 = 0x20;
+pub const MAP_FAILED:    usize = !0; // (void*)-1
 
 /// POSIX `struct timeval` — 16 bytes (s:i64, us:i64). Used by
 /// `gettimeofday`.

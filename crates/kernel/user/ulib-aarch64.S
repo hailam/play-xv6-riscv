@@ -91,6 +91,8 @@ DEFINE_SYSCALL nanosleep,     52
 DEFINE_SYSCALL brk,           53
 DEFINE_SYSCALL rmdir,         54
 DEFINE_SYSCALL wait4,         55
+DEFINE_SYSCALL mmap,          56
+DEFINE_SYSCALL munmap,        57
 
 // _sigret — POSIX signal restorer trampoline. Same role as the
 // riscv version: linked into every C user binary, used as the
