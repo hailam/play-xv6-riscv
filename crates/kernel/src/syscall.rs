@@ -40,6 +40,7 @@ use crate::uapi::{
     SYS_SYMLINK, SYS_READLINK, SYS_LSTAT, SYS_IOCTL,
     TIOCGWINSZ, TCGETS, TCSETS, TCSETSW, TCSETSF, FIONREAD,
     Winsize, Termios,
+    SYS_POLL, POLLIN, POLLOUT, POLLERR, POLLHUP, POLLNVAL, PollFd,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -379,6 +380,13 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let cmd = tf.arg(1) as i32;
             let arg = tf.arg(2) as usize;
             sys_ioctl(proc, fd, cmd, arg)
+        }
+        SYS_POLL => {
+            let tf = proc.trapframe();
+            let fds_va = tf.arg(0) as usize;
+            let nfds = tf.arg(1) as usize;
+            let timeout_ms = tf.arg(2) as i32;
+            sys_poll(proc, fds_va, nfds, timeout_ms).await
         }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
@@ -2480,6 +2488,179 @@ async fn sys_truncate(proc: &Arc<Proc>, path_va: usize, length: i64) -> i64 {
     }
     fs::log::end_op().await;
     0
+}
+
+/// POSIX `poll(fds[], nfds, timeout_ms)`.
+///
+/// Walks each `pollfd`, computes `revents` from the File's current
+/// state, and returns the count of fds with non-zero `revents`. If
+/// none are ready, sleeps in 10ms ticks until ready or timeout.
+/// `timeout_ms < 0` means block indefinitely; `0` means poll-once.
+///
+/// Per-File readiness:
+///   * Console: POLLIN iff `console_in::pending() > 0`
+///   * PipeRead:  POLLIN iff buffer non-empty; POLLHUP iff no writers
+///   * PipeWrite: POLLOUT iff buffer has space; POLLERR iff no readers
+///   * Inode:     always POLLIN | POLLOUT (regular files never block)
+///   * Bad fd:    POLLNVAL
+async fn sys_poll(
+    proc: &Arc<Proc>,
+    fds_va: usize,
+    nfds: usize,
+    timeout_ms: i32,
+) -> i64 {
+    if nfds > 64 {
+        return -1;
+    }
+    let entry_size = core::mem::size_of::<PollFd>();
+    // Copy in the fds array.
+    let mut entries: alloc::vec::Vec<PollFd> = alloc::vec::Vec::with_capacity(nfds);
+    for i in 0..nfds {
+        let mut pf = PollFd::default();
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                &mut pf as *mut _ as *mut u8,
+                entry_size,
+            )
+        };
+        for j in 0..entry_size {
+            let Some(kva) = proc.translate_user(fds_va + i * entry_size + j) else {
+                return -1;
+            };
+            bytes[j] = unsafe { *(kva as *const u8) };
+        }
+        entries.push(pf);
+    }
+
+    // Convert timeout to a tick deadline. Negative = infinite, 0
+    // = poll-once.
+    let start_ticks = Arch::now_ticks();
+    let ticks_per_ms = TIMER_INTERVAL * 10 / 1000;
+    let deadline = if timeout_ms < 0 {
+        u64::MAX
+    } else {
+        start_ticks + (timeout_ms as u64) * ticks_per_ms
+    };
+
+    // Inner closure: write the current `entries` back to user.
+    // POSIX says revents is set by poll on every non-ignored fd
+    // — even when returning 0, the cleared revents needs to be
+    // visible to the caller.
+    let writeback = |entries: &[PollFd]| -> Result<(), ()> {
+        for (i, pf) in entries.iter().enumerate() {
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    pf as *const _ as *const u8,
+                    entry_size,
+                )
+            };
+            for j in 0..entry_size {
+                let Some(kva) = proc.translate_user_write(fds_va + i * entry_size + j) else {
+                    return Err(());
+                };
+                unsafe { *(kva as *mut u8) = bytes[j] };
+            }
+        }
+        Ok(())
+    };
+
+    loop {
+        let ready = poll_fill_revents(proc, &mut entries);
+        if ready > 0 {
+            if writeback(&entries).is_err() {
+                return -1;
+            }
+            return ready as i64;
+        }
+        if timeout_ms == 0 {
+            if writeback(&entries).is_err() {
+                return -1;
+            }
+            return 0;
+        }
+        if proc.killed.load(Ordering::Acquire) {
+            return -1;
+        }
+        let now = Arch::now_ticks();
+        if now >= deadline {
+            if writeback(&entries).is_err() {
+                return -1;
+            }
+            return 0;
+        }
+        // Cooperative polling: sleep up to 10ms or until deadline.
+        let next_wake = deadline.min(now + ticks_per_ms * 10);
+        Sleep { deadline: next_wake }.await;
+    }
+}
+
+/// Walk `entries`, set each `revents` per current fd state. Returns
+/// the count of entries with non-zero `revents`.
+fn poll_fill_revents(proc: &Arc<Proc>, entries: &mut [PollFd]) -> usize {
+    let mut ready = 0usize;
+    for pf in entries.iter_mut() {
+        pf.revents = 0;
+        if pf.fd < 0 {
+            // POSIX: negative fd means ignore — revents stays 0.
+            continue;
+        }
+        let Some(file) = proc.get_file(pf.fd) else {
+            pf.revents = POLLNVAL;
+            ready += 1;
+            continue;
+        };
+        let r = file_revents(&file, pf.events);
+        if r != 0 {
+            pf.revents = r;
+            ready += 1;
+        }
+    }
+    ready
+}
+
+fn file_revents(file: &File, requested: i16) -> i16 {
+    let mut r: i16 = 0;
+    match file {
+        File::Console => {
+            if (requested & POLLIN) != 0 && crate::console_in::pending() > 0 {
+                r |= POLLIN;
+            }
+            // Console output is always writable.
+            if (requested & POLLOUT) != 0 {
+                r |= POLLOUT;
+            }
+        }
+        File::PipeRead(p) => {
+            let buf_empty = p.buf.lock().is_empty();
+            let writers = p.writers.load(Ordering::Acquire);
+            if (requested & POLLIN) != 0 && !buf_empty {
+                r |= POLLIN;
+            }
+            if writers == 0 {
+                r |= POLLHUP;
+            }
+        }
+        File::PipeWrite(p) => {
+            let buf_full = p.buf.lock().len() >= p.cap();
+            let readers = p.readers.load(Ordering::Acquire);
+            if (requested & POLLOUT) != 0 && !buf_full {
+                r |= POLLOUT;
+            }
+            if readers == 0 {
+                r |= POLLERR;
+            }
+        }
+        File::Inode { .. } => {
+            // Regular files are always ready (no blocking I/O).
+            if (requested & POLLIN) != 0 {
+                r |= POLLIN;
+            }
+            if (requested & POLLOUT) != 0 {
+                r |= POLLOUT;
+            }
+        }
+    }
+    r
 }
 
 /// POSIX `ioctl(fd, cmd, arg)`. Slim subset for libc bring-up:

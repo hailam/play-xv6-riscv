@@ -151,6 +151,21 @@ int   lstat(const char* path, struct stat* st);
 
 int   ioctl(int fd, int cmd, void* arg);
 
+// POSIX poll(2). Subset of events — POLLPRI/POLLRDHUP not exposed.
+#define POLLIN   0x0001
+#define POLLOUT  0x0004
+#define POLLERR  0x0008
+#define POLLHUP  0x0010
+#define POLLNVAL 0x0020
+
+struct pollfd {
+    int           fd;
+    short         events;
+    short         revents;
+};
+
+int poll(struct pollfd* fds, unsigned int nfds, int timeout_ms);
+
 // ioctl request numbers (Linux values).
 #define TIOCGWINSZ  0x5413
 #define TCGETS      0x5401

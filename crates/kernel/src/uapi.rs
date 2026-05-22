@@ -62,6 +62,22 @@ pub const SYS_SYMLINK: usize = 58;
 pub const SYS_READLINK: usize = 59;
 pub const SYS_LSTAT: usize = 60;
 pub const SYS_IOCTL: usize = 61;
+pub const SYS_POLL: usize = 62;
+
+// poll() event bits.
+pub const POLLIN:   i16 = 0x0001;
+pub const POLLOUT:  i16 = 0x0004;
+pub const POLLERR:  i16 = 0x0008;
+pub const POLLHUP:  i16 = 0x0010;
+pub const POLLNVAL: i16 = 0x0020;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
 
 // ioctl request numbers — Linux values for the subset we expose.
 pub const TIOCGWINSZ: i32 = 0x5413;
