@@ -149,6 +149,35 @@ int   symlink(const char* target, const char* linkpath);
 int   readlink(const char* path, char* buf, unsigned int len);
 int   lstat(const char* path, struct stat* st);
 
+int   ioctl(int fd, int cmd, void* arg);
+
+// ioctl request numbers (Linux values).
+#define TIOCGWINSZ  0x5413
+#define TCGETS      0x5401
+#define TCSETS      0x5402
+#define TCSETSW     0x5403
+#define TCSETSF     0x5404
+#define FIONREAD    0x541B
+
+struct winsize {
+    unsigned short ws_row;
+    unsigned short ws_col;
+    unsigned short ws_xpixel;
+    unsigned short ws_ypixel;
+};
+
+struct termios {
+    unsigned int   c_iflag, c_oflag, c_cflag, c_lflag;
+    unsigned char  c_line;
+    unsigned char  c_cc[19];
+};
+
+// libc convenience: isatty(fd) — succeeds iff TCGETS works on fd.
+static inline int isatty(int fd) {
+    struct termios t;
+    return ioctl(fd, TCGETS, &t) == 0 ? 1 : 0;
+}
+
 // POSIX file-type bit for symlinks (paired with the existing
 // S_IFDIR/S_IFREG/S_IFCHR in `struct stat`'s `mode`).
 #define S_IFLNK   0120000

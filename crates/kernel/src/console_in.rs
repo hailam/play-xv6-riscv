@@ -28,6 +28,11 @@ pub fn try_pop() -> Option<u8> {
     BUF.lock().pop_front()
 }
 
+/// Number of unread bytes in the console queue (for FIONREAD).
+pub fn pending() -> usize {
+    BUF.lock().len()
+}
+
 pub fn register_waker(w: &Waker) {
     READER.register(w);
 }

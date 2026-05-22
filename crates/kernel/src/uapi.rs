@@ -61,6 +61,40 @@ pub const SYS_MUNMAP: usize = 57;
 pub const SYS_SYMLINK: usize = 58;
 pub const SYS_READLINK: usize = 59;
 pub const SYS_LSTAT: usize = 60;
+pub const SYS_IOCTL: usize = 61;
+
+// ioctl request numbers — Linux values for the subset we expose.
+pub const TIOCGWINSZ: i32 = 0x5413;
+pub const TCGETS:     i32 = 0x5401;
+pub const TCSETS:     i32 = 0x5402;
+pub const TCSETSW:    i32 = 0x5403;
+pub const TCSETSF:    i32 = 0x5404;
+pub const FIONREAD:   i32 = 0x541B;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Winsize {
+    pub ws_row: u16,
+    pub ws_col: u16,
+    pub ws_xpixel: u16,
+    pub ws_ypixel: u16,
+}
+
+/// Minimal POSIX-ish termios. Matches the leading 4 u32s + c_cc[19]
+/// layout from Linux/glibc enough for libc's tcgetattr/tcsetattr
+/// round-trip — we don't actually enforce any of the bits since
+/// our console driver runs in fixed cooked-mode-with-echo (no raw
+/// mode, no signal generation).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct Termios {
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cflag: u32,
+    pub c_lflag: u32,
+    pub c_line: u8,
+    pub c_cc: [u8; 19],
+}
 
 // S_IFLNK file-type bit (POSIX).
 pub const S_IFLNK: u32 = 0o120000;

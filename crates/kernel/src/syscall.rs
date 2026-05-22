@@ -37,7 +37,9 @@ use crate::uapi::{
     SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_NANOSLEEP, SYS_BRK, SYS_RMDIR, SYS_WAIT4,
     Timeval, Rusage, SYS_MMAP, SYS_MUNMAP, MAP_ANONYMOUS, MAP_PRIVATE,
     PROT_READ, PROT_WRITE, PROT_EXEC, MAP_FAILED,
-    SYS_SYMLINK, SYS_READLINK, SYS_LSTAT,
+    SYS_SYMLINK, SYS_READLINK, SYS_LSTAT, SYS_IOCTL,
+    TIOCGWINSZ, TCGETS, TCSETS, TCSETSW, TCSETSF, FIONREAD,
+    Winsize, Termios,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -370,6 +372,13 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let path_va = tf.arg(0) as usize;
             let stat_va = tf.arg(1) as usize;
             sys_lstat(proc, path_va, stat_va).await
+        }
+        SYS_IOCTL => {
+            let tf = proc.trapframe();
+            let fd = tf.arg(0) as i32;
+            let cmd = tf.arg(1) as i32;
+            let arg = tf.arg(2) as usize;
+            sys_ioctl(proc, fd, cmd, arg)
         }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
@@ -2471,6 +2480,97 @@ async fn sys_truncate(proc: &Arc<Proc>, path_va: usize, length: i64) -> i64 {
     }
     fs::log::end_op().await;
     0
+}
+
+/// POSIX `ioctl(fd, cmd, arg)`. Slim subset for libc bring-up:
+///
+///   TIOCGWINSZ  — terminal window size (returns fixed 80x24)
+///   TCGETS      — get termios (stub defaults)
+///   TCSETS/W/F  — set termios (accepted, but not enforced — our
+///                 console driver runs in fixed cooked-with-echo)
+///   FIONREAD    — bytes available to read on the console
+///
+/// Any other request, or any terminal request on a non-Console fd,
+/// returns -1.
+fn sys_ioctl(proc: &Arc<Proc>, fd: i32, cmd: i32, arg: usize) -> i64 {
+    let Some(file) = proc.get_file(fd) else {
+        return -1;
+    };
+    let is_console = matches!(&*file, File::Console);
+
+    let write_struct = |va: usize, bytes: &[u8]| -> bool {
+        for (i, b) in bytes.iter().enumerate() {
+            let Some(kva) = proc.translate_user_write(va + i) else {
+                return false;
+            };
+            unsafe { *(kva as *mut u8) = *b };
+        }
+        true
+    };
+
+    match cmd {
+        x if x == TIOCGWINSZ => {
+            if !is_console {
+                return -1;
+            }
+            let ws = Winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &ws as *const _ as *const u8,
+                    core::mem::size_of::<Winsize>(),
+                )
+            };
+            if !write_struct(arg, bytes) {
+                return -1;
+            }
+            0
+        }
+        x if x == TCGETS => {
+            if !is_console {
+                return -1;
+            }
+            // Default cooked termios — these are the canonical
+            // Linux post-boot values for a basic VT. We don't
+            // enforce them; libc just needs the syscall to succeed.
+            let mut t = Termios::default();
+            t.c_iflag = 0x500;  // BRKINT | ICRNL | IXON-ish
+            t.c_oflag = 0x5;    // OPOST | ONLCR
+            t.c_cflag = 0xbf;   // CS8 | CREAD | ...
+            t.c_lflag = 0x8a3b; // ISIG | ICANON | ECHO | ECHOE | IEXTEN
+            t.c_cc[2] = 0x7f;   // VERASE = DEL
+            t.c_cc[3] = 0x15;   // VKILL  = ^U
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &t as *const _ as *const u8,
+                    core::mem::size_of::<Termios>(),
+                )
+            };
+            if !write_struct(arg, bytes) {
+                return -1;
+            }
+            0
+        }
+        x if x == TCSETS || x == TCSETSW || x == TCSETSF => {
+            if !is_console {
+                return -1;
+            }
+            // Accept but ignore — our console doesn't support raw
+            // mode / signal-on-input / etc.
+            0
+        }
+        x if x == FIONREAD => {
+            if !is_console {
+                return -1;
+            }
+            let n = crate::console_in::pending() as i32;
+            let bytes = n.to_le_bytes();
+            if !write_struct(arg, &bytes) {
+                return -1;
+            }
+            0
+        }
+        _ => -1,
+    }
 }
 
 /// POSIX `symlink(target, linkpath)` — create a `T_SYMLINK` inode at

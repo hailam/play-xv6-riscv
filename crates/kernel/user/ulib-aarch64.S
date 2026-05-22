@@ -96,6 +96,7 @@ DEFINE_SYSCALL munmap,        57
 DEFINE_SYSCALL symlink,       58
 DEFINE_SYSCALL readlink,      59
 DEFINE_SYSCALL lstat,         60
+DEFINE_SYSCALL ioctl,         61
 
 // _sigret — POSIX signal restorer trampoline. Same role as the
 // riscv version: linked into every C user binary, used as the
