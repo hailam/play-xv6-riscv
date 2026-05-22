@@ -145,6 +145,15 @@ void* mmap(void* addr, unsigned int length, int prot, int flags,
            int fd, long offset);
 int   munmap(void* addr, unsigned int length);
 
+int   symlink(const char* target, const char* linkpath);
+int   readlink(const char* path, char* buf, unsigned int len);
+int   lstat(const char* path, struct stat* st);
+
+// POSIX file-type bit for symlinks (paired with the existing
+// S_IFDIR/S_IFREG/S_IFCHR in `struct stat`'s `mode`).
+#define S_IFLNK   0120000
+#define S_ISLNK(m) (((m) & S_IFMT) == S_IFLNK)
+
 // POSIX-ish sigaction. Slim — we don't expose sa_flags or
 // SA_SIGINFO. `handler` is a function pointer (or SIG_DFL/SIG_IGN);
 // `mask` is the set of signals to block while it runs.

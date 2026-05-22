@@ -58,6 +58,12 @@ pub const SYS_RMDIR: usize = 54;
 pub const SYS_WAIT4: usize = 55;
 pub const SYS_MMAP: usize = 56;
 pub const SYS_MUNMAP: usize = 57;
+pub const SYS_SYMLINK: usize = 58;
+pub const SYS_READLINK: usize = 59;
+pub const SYS_LSTAT: usize = 60;
+
+// S_IFLNK file-type bit (POSIX).
+pub const S_IFLNK: u32 = 0o120000;
 
 // mmap flags (subset).
 pub const PROT_NONE:  i32 = 0;
@@ -250,11 +256,12 @@ pub const S_IFREG: u32 = 0o100000;
 /// fstat/stat to fill the new `mode` field.
 #[inline]
 pub fn stat_mode(typ: u16, perm: u16) -> u32 {
-    use xv6_fs_layout::{T_DEVICE, T_DIR, T_FILE};
+    use xv6_fs_layout::{T_DEVICE, T_DIR, T_FILE, T_SYMLINK};
     let kind = match typ {
         T_DIR => S_IFDIR,
         T_FILE => S_IFREG,
         T_DEVICE => S_IFCHR,
+        T_SYMLINK => S_IFLNK,
         _ => 0,
     };
     kind | (perm as u32 & 0o7777)

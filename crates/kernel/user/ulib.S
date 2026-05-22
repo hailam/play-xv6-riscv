@@ -89,6 +89,9 @@ DEFINE_SYSCALL rmdir,         54
 DEFINE_SYSCALL wait4,         55
 DEFINE_SYSCALL mmap,          56
 DEFINE_SYSCALL munmap,        57
+DEFINE_SYSCALL symlink,       58
+DEFINE_SYSCALL readlink,      59
+DEFINE_SYSCALL lstat,         60
 
 // _sigret — POSIX signal restorer trampoline. The kernel writes
 // `ra := &_sigret` into the trapframe before delivering a signal,

@@ -166,6 +166,7 @@ fn main() {
         ("envtest", "ENVTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
         ("posix6test", "POSIX6TEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
         ("mmaptest", "MMAPTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
+        ("symlinktest", "SYMLINKTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
     ];
     for (name, env_var, lang, with_ulib, supported_archs) in programs {
         if supported_archs.contains(&arch) {

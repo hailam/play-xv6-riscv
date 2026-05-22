@@ -37,6 +37,7 @@ use crate::uapi::{
     SYS_GETPPID, SYS_GETTIMEOFDAY, SYS_NANOSLEEP, SYS_BRK, SYS_RMDIR, SYS_WAIT4,
     Timeval, Rusage, SYS_MMAP, SYS_MUNMAP, MAP_ANONYMOUS, MAP_PRIVATE,
     PROT_READ, PROT_WRITE, PROT_EXEC, MAP_FAILED,
+    SYS_SYMLINK, SYS_READLINK, SYS_LSTAT,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -351,6 +352,25 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let length = tf.arg(1) as usize;
             sys_munmap(proc, addr, length)
         }
+        SYS_SYMLINK => {
+            let tf = proc.trapframe();
+            let target_va = tf.arg(0) as usize;
+            let link_va = tf.arg(1) as usize;
+            sys_symlink(proc, target_va, link_va).await
+        }
+        SYS_READLINK => {
+            let tf = proc.trapframe();
+            let path_va = tf.arg(0) as usize;
+            let buf_va = tf.arg(1) as usize;
+            let len = tf.arg(2) as usize;
+            sys_readlink(proc, path_va, buf_va, len).await
+        }
+        SYS_LSTAT => {
+            let tf = proc.trapframe();
+            let path_va = tf.arg(0) as usize;
+            let stat_va = tf.arg(1) as usize;
+            sys_lstat(proc, path_va, stat_va).await
+        }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
             -1
@@ -458,26 +478,48 @@ async fn sys_sbrk(proc: &Arc<Proc>, n: i64, lazy: i64) -> i64 {
 /// Two flavors of "lazy region":
 ///   1. sbrk-grown heap below `proc.size` that hasn't faulted in yet.
 ///   2. anonymous mmap region — VA falls inside a registered VMA.
-pub fn lazy_map_page(proc: &Arc<Proc>, fault_va: usize) -> bool {
+/// Async page-fault handler called from `proc_main` on a
+/// `TrapEvent::PageFault`. File-backed mmap reads from disk → must
+/// be awaitable.
+pub async fn lazy_map_page_async(proc: &Arc<Proc>, fault_va: usize) -> bool {
     let page = fault_va & !(PGSIZE - 1);
     let size = proc.size.load(Ordering::Acquire);
-    let perm: PtePerm = if fault_va < size {
-        // Heap (sbrk lazy) — always RW user.
-        PtePerm::URW
-    } else if let Some(vma_prot) = proc
-        .vmas
-        .lock()
-        .iter()
-        .find(|v| fault_va >= v.start && fault_va < v.end)
-        .map(|v| v.prot)
-    {
-        // mmap-managed region — translate prot bits to PtePerm.
-        vma_prot_to_pteperm(vma_prot)
+
+    // Categorize the fault. Three cases:
+    //   * Heap (lazy sbrk): fault_va < proc.size → URW, zero page.
+    //   * VMA anonymous: register page from kalloc, prot from VMA.
+    //   * VMA file-backed: alloc page, read from inode at the right
+    //     offset, prot from VMA.
+    enum Source {
+        Heap,
+        Anon(i32),
+        File(Arc<crate::fs::inode::Inode>, u64, i32),
+    }
+    let source = if fault_va < size {
+        Source::Heap
     } else {
-        return false;
+        let vmas = proc.vmas.lock();
+        let v = vmas
+            .iter()
+            .find(|v| fault_va >= v.start && fault_va < v.end);
+        match v {
+            None => return false,
+            Some(v) => match &v.file {
+                None => Source::Anon(v.prot),
+                Some(ip) => {
+                    let off = v.file_offset + (page - v.start) as u64;
+                    Source::File(Arc::clone(ip), off, v.prot)
+                }
+            },
+        }
     };
-    // Already mapped? Could happen if two harts faulted at once;
-    // bail rather than double-map.
+
+    let perm = match &source {
+        Source::Heap => PtePerm::URW,
+        Source::Anon(p) | Source::File(_, _, p) => vma_prot_to_pteperm(*p),
+    };
+
+    // Already mapped? Could happen if two harts faulted at once.
     {
         let pt = proc.pagetable.lock();
         if pt.translate(page).is_some() {
@@ -487,6 +529,21 @@ pub fn lazy_map_page(proc: &Arc<Proc>, fault_va: usize) -> bool {
     let Some(pa) = KFRAMES.alloc_zeroed() else {
         return false;
     };
+
+    // File-backed: fill the page from the inode before mapping.
+    if let Source::File(ip, file_off, _) = &source {
+        let li = fs::inode::ilock(ip).await;
+        let file_size = li.state().size as u64;
+        if *file_off < file_size {
+            let avail = (file_size - file_off).min(PGSIZE as u64) as usize;
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut(pa as *mut u8, avail)
+            };
+            let _ = fs::inode::readi(&li, dst, *file_off as u32).await;
+            // The rest of the page stays zero from alloc_zeroed.
+        }
+    }
+
     let mut pt = proc.pagetable.lock();
     if pt.map(page, pa, PGSIZE, perm, &KFRAMES).is_err() {
         unsafe { KFRAMES.free(pa) };
@@ -529,20 +586,41 @@ fn sys_mmap(
     length: usize,
     prot: i32,
     flags: i32,
-    _fd: i32,
-    _offset: i64,
+    fd: i32,
+    offset: i64,
 ) -> i64 {
     if length == 0 {
         return MAP_FAILED as i64;
     }
-    // Required flags for slice 1.
-    if (flags & MAP_ANONYMOUS) == 0 || (flags & MAP_PRIVATE) == 0 {
+    // We support MAP_PRIVATE only (anonymous OR file-backed).
+    if (flags & MAP_PRIVATE) == 0 {
         return MAP_FAILED as i64;
     }
     // Reject unknown prot bits.
     if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
         return MAP_FAILED as i64;
     }
+    if offset < 0 || (offset as usize) & (PGSIZE - 1) != 0 {
+        return MAP_FAILED as i64;
+    }
+    // File-backed: look up the fd and snapshot its inode. We hold
+    // an Arc<Inode> in the VMA so the file survives close(fd).
+    let file_inode = if (flags & MAP_ANONYMOUS) == 0 {
+        let Some(f) = proc.get_file(fd) else {
+            return MAP_FAILED as i64;
+        };
+        match &*f {
+            crate::file::File::Inode { ip, readable, .. } => {
+                if !*readable {
+                    return MAP_FAILED as i64;
+                }
+                Some(Arc::clone(ip))
+            }
+            _ => return MAP_FAILED as i64,
+        }
+    } else {
+        None
+    };
     let len_aligned = (length + PGSIZE - 1) & !(PGSIZE - 1);
     // Bump-allocate top-down.
     let new_base = match proc
@@ -554,7 +632,6 @@ fn sys_mmap(
         None => return MAP_FAILED as i64,
     };
     if new_base < (crate::user_vm::MMAP_TOP / 2) {
-        // Out of mmap address space.
         return MAP_FAILED as i64;
     }
     proc.mmap_base.store(new_base, Ordering::Release);
@@ -562,9 +639,10 @@ fn sys_mmap(
         start: new_base,
         end: new_base + len_aligned,
         prot,
+        file: file_inode,
+        file_offset: offset as u64,
     };
     let mut vmas = proc.vmas.lock();
-    // Insert sorted by start so lookups can short-circuit.
     let pos = vmas.partition_point(|v| v.start < vma.start);
     vmas.insert(pos, vma);
     new_base as i64
@@ -2393,6 +2471,105 @@ async fn sys_truncate(proc: &Arc<Proc>, path_va: usize, length: i64) -> i64 {
     }
     fs::log::end_op().await;
     0
+}
+
+/// POSIX `symlink(target, linkpath)` — create a `T_SYMLINK` inode at
+/// `linkpath` whose data payload is the string `target` (not
+/// resolved at creation time).
+async fn sys_symlink(proc: &Arc<Proc>, target_va: usize, link_va: usize) -> i64 {
+    let Some(target) = read_user_cstring(proc, target_va, 256) else {
+        return -1;
+    };
+    let Some(linkpath) = read_user_cstring(proc, link_va, 128) else {
+        return -1;
+    };
+    // Create the link as a T_SYMLINK (no special mode bits — POSIX
+    // ignores mode on symlinks; reads/writes go through readlink).
+    let ip = match create_at_path(
+        proc,
+        &linkpath,
+        xv6_fs_layout::T_SYMLINK,
+        0,
+        0,
+    )
+    .await
+    {
+        Some(i) => i,
+        None => return -1,
+    };
+    // Write the target string as the inode's file body.
+    fs::log::begin_op().await;
+    let result: i64 = {
+        let mut li = fs::inode::ilock(&ip).await;
+        let bytes = target.as_bytes();
+        let n = fs::inode::writei(&mut li, bytes, 0).await;
+        if n != bytes.len() {
+            -1
+        } else {
+            0
+        }
+    };
+    fs::log::end_op().await;
+    result
+}
+
+/// POSIX `readlink(path, buf, len)` — read the target string of a
+/// symlink. Returns bytes written (no NUL). -1 on non-symlink or
+/// missing path.
+async fn sys_readlink(
+    proc: &Arc<Proc>,
+    path_va: usize,
+    buf_va: usize,
+    len: usize,
+) -> i64 {
+    let Some(path) = read_user_cstring(proc, path_va, 128) else {
+        return -1;
+    };
+    // Use nofollow so we get the symlink itself (not its target).
+    let cwd = proc.cwd.lock().clone();
+    let ip = match cwd {
+        Some(c) => fs::path::namei_nofollow(c, &path).await,
+        None => fs::path::namei_nofollow(fs::inode::iget(0, 1), &path).await,
+    };
+    let Some(ip) = ip else { return -1 };
+    let (typ, size) = {
+        let li = fs::inode::ilock(&ip).await;
+        (li.state().typ, li.state().size as usize)
+    };
+    if typ != xv6_fs_layout::T_SYMLINK {
+        return -1;
+    }
+    let to_copy = size.min(len);
+    if to_copy == 0 {
+        return 0;
+    }
+    let mut tmp = alloc::vec![0u8; to_copy];
+    let n = {
+        let li = fs::inode::ilock(&ip).await;
+        fs::inode::readi(&li, &mut tmp, 0).await
+    };
+    for i in 0..n {
+        let Some(kva) = proc.translate_user_write(buf_va + i) else {
+            return -1;
+        };
+        unsafe { *(kva as *mut u8) = tmp[i] };
+    }
+    n as i64
+}
+
+/// POSIX `lstat(path, &stat)` — like `stat` but doesn't follow the
+/// final symlink. Reports the link itself.
+async fn sys_lstat(proc: &Arc<Proc>, path_va: usize, stat_va: usize) -> i64 {
+    let Some(path) = read_user_cstring(proc, path_va, 128) else {
+        return -1;
+    };
+    let cwd = proc.cwd.lock().clone();
+    let ip = match cwd {
+        Some(c) => fs::path::namei_nofollow(c, &path).await,
+        None => fs::path::namei_nofollow(fs::inode::iget(0, 1), &path).await,
+    };
+    let Some(ip) = ip else { return -1 };
+    stat_inode_into_user(proc, &ip, stat_va).await
 }
 
 async fn sys_stat(proc: &Arc<Proc>, path_va: usize, stat_va: usize) -> i64 {

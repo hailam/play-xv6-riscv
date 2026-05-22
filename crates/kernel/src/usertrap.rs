@@ -46,27 +46,11 @@ pub extern "C" fn rust_usertrap() -> ! {
             TrapEvent::Devintr
         }
         UserTrapCause::PageFault { va, write: _ } => {
-            // Lazy-sbrk region? Map a fresh zero frame and re-run
-            // the trapping instruction (don't advance epc).
-            let proc_arc = unsafe {
-                let raw = proc as *const Proc;
-                alloc::sync::Arc::increment_strong_count(raw);
-                alloc::sync::Arc::from_raw(raw)
-            };
-            let mapped = crate::syscall::lazy_map_page(&proc_arc, va);
-            if mapped {
-                TrapEvent::Timer
-            } else {
-                crate::println!(
-                    "usertrap: pid {} page fault va={:#x} epc={:#x} -> killed",
-                    proc.pid,
-                    va,
-                    tf.epc(),
-                );
-                proc.killed
-                    .store(true, core::sync::atomic::Ordering::Release);
-                TrapEvent::Timer
-            }
+            // Defer to proc_main's async loop so the handler can
+            // `.await` inode reads for file-backed mmap. Don't
+            // advance epc — re-execute the trapping instruction
+            // once the page is mapped.
+            TrapEvent::PageFault { va }
         }
         UserTrapCause::Unknown { code, va } => {
             crate::println!(

@@ -70,6 +70,41 @@ int main(int argc, char* argv[]) {
     }
     printf("stress 16x ok\n");
 
+    // 8) File-backed mmap. Create a file with known bytes, mmap it,
+    //    read through the mapping.
+    int wfd = open("/mmf", O_CREATE | O_RDWR);
+    if (wfd < 0) die("open(/mmf) failed");
+    char fdata[64];
+    for (int i = 0; i < 64; i++) fdata[i] = (char)('a' + (i % 26));
+    if (write(wfd, fdata, 64) != 64) die("write /mmf failed");
+    close(wfd);
+
+    int rfd = open("/mmf", O_RDONLY);
+    if (rfd < 0) die("re-open /mmf failed");
+    char* fm = (char*)mmap(0, 4096, PROT_READ, MAP_PRIVATE, rfd, 0);
+    if (fm == MAP_FAILED) die("file-backed mmap failed");
+    // Close the fd — the mapping must survive (Arc<Inode> in the
+    // VMA holds the file alive).
+    close(rfd);
+
+    // Note: our kernel-side `translate_user` doesn't fault-in VMA
+    // pages — only user-mode loads/stores do (via the usertrap
+    // page-fault path). Force a user-mode read of byte 0 so the
+    // page is mapped before write() tries to read it.
+    volatile char poke = fm[0];
+    (void)poke;
+    printf("file mmap[0..8] = ");
+    for (int i = 0; i < 8; i++) write(1, &fm[i], 1);
+    printf(" (expect abcdefgh)\n");
+    for (int i = 0; i < 64; i++) {
+        if (fm[i] != (char)('a' + (i % 26))) die("file mmap mismatch");
+    }
+    // Bytes past EOF in the page are zeros.
+    if (fm[100] != 0) die("post-EOF byte not zero");
+
+    munmap(fm, 4096);
+    unlink("/mmf");
+
     printf("mmaptest ok\n");
     return 0;
 }

@@ -71,7 +71,8 @@ fs.img: build $(MKFS)
 		ctimetest:$(USER_DIR)/ctimetest.elf \
 		envtest:$(USER_DIR)/envtest.elf \
 		posix6test:$(USER_DIR)/posix6test.elf \
-		mmaptest:$(USER_DIR)/mmaptest.elf
+		mmaptest:$(USER_DIR)/mmaptest.elf \
+		symlinktest:$(USER_DIR)/symlinktest.elf
 
 qemu: build fs.img
 	$(QEMU) $(QEMUOPTS)
@@ -127,7 +128,8 @@ fs-aarch64.img: build-aarch64 $(MKFS)
 		ctimetest:$(AARCH64_USER_DIR)/ctimetest.elf \
 		envtest:$(AARCH64_USER_DIR)/envtest.elf \
 		posix6test:$(AARCH64_USER_DIR)/posix6test.elf \
-		mmaptest:$(AARCH64_USER_DIR)/mmaptest.elf
+		mmaptest:$(AARCH64_USER_DIR)/mmaptest.elf \
+		symlinktest:$(AARCH64_USER_DIR)/symlinktest.elf
 
 qemu-aarch64: build-aarch64 fs-aarch64.img
 	$(QEMU_AARCH64) $(AARCH64_QEMUOPTS)

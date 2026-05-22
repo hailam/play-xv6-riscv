@@ -46,6 +46,9 @@ pub enum TrapEvent {
     Syscall { nr: usize },
     Timer,
     Devintr,
+    /// User-mode page fault. Handled asynchronously in `proc_main`
+    /// so file-backed mmap can `await` an inode read.
+    PageFault { va: usize },
 }
 
 pub struct Proc {
@@ -116,13 +119,19 @@ pub struct Proc {
     pub mmap_base: AtomicUsize,
 }
 
-/// Per-Proc memory region descriptor. Anonymous private mappings
-/// only in slice 1; file-backed adds another field in slice 2.
-#[derive(Clone, Copy)]
+/// Per-Proc memory region descriptor. Anonymous mappings carry just
+/// (start, end, prot); file-backed mappings additionally hold an
+/// `Arc<Inode>` (so the underlying file stays alive even after the
+/// mmap-time fd is closed) plus the offset within that file.
+#[derive(Clone)]
 pub struct Vma {
     pub start: usize,
     pub end: usize,
     pub prot: i32,
+    /// `Some` for file-backed mmap (MAP_PRIVATE without
+    /// MAP_ANONYMOUS), `None` for anonymous.
+    pub file: Option<Arc<crate::fs::inode::Inode>>,
+    pub file_offset: u64,
 }
 
 impl Proc {
@@ -493,6 +502,17 @@ async fn proc_main(proc: Arc<Proc>) {
                 proc.trapframe().set_arg(0, ret as u64);
             }
             TrapEvent::Timer | TrapEvent::Devintr => {}
+            TrapEvent::PageFault { va } => {
+                let mapped = syscall::lazy_map_page_async(&proc, va).await;
+                if !mapped {
+                    crate::println!(
+                        "usertrap: pid {} page fault va={:#x} -> killed",
+                        proc.pid,
+                        va,
+                    );
+                    proc.killed.store(true, Ordering::Release);
+                }
+            }
         }
         if proc.killed.load(Ordering::Acquire) && !proc.is_zombie() {
             let _ = syscall::sys_exit(&proc, -1).await;
