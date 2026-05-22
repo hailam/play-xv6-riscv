@@ -1,12 +1,38 @@
 # 16: POSIX-ish compatibility
 
-**Status:** Pending — **after [[15-xv6-compat]] and [[14-aarch64-completion]]**
-**Estimated:** Many sessions across multiple sub-todos; this is a
-sustained track, not a single feature.
-**Depends on:** xv6 compat lands first (gives us a real test
-harness via `usertests`); aarch64 lands second (proves the trait
-surface holds when we add new abstractions). POSIX work spans
-both arches once they're in.
+**Status:** Tiers 1–5 + 8 **done** (kernel-side syscall surface
+for newlib/musl bring-up is in place); Tier 6 (signals/concurrency
+bits beyond what landed) and Tier 7 (sockets) remain.
+**Estimated:** Originally "many sessions"; ~60 sub-features
+across 30+ syscalls landed in chunks over the past few weeks.
+
+## Done summary
+
+The kernel exposes **62 POSIX syscalls** across the libc-glue
+surface. A typical newlib/musl OS-glue layer can be wired against
+SYS_* directly — see the test programs under
+`crates/kernel/user/` for the patterns:
+
+- File I/O — `open/close/read/write/lseek/pread/pwrite/dup/dup2/`
+  `stat/fstat/lstat/chdir/getcwd/rename/unlink/link/symlink/`
+  `readlink/mkdir/rmdir/mknod/chmod/chown/umask/ftruncate/truncate/`
+  `getdents/fcntl(F_GETFD/SETFD/DUPFD/GETFL/SETFL)/ioctl(TCGETS/`
+  `TIOCGWINSZ/FIONREAD)`
+- Open-flag suite — `O_RDONLY/WRONLY/RDWR/CREATE/TRUNC/APPEND/`
+  `CLOEXEC/NONBLOCK`
+- Process — `fork/exec/execve/wait/waitpid/wait4/exit/sbrk/brk/`
+  `sleep/nanosleep/uptime/clock_gettime/gettimeofday/getpid/`
+  `getppid/kill/pause/alarm/sigaction/sigprocmask/sigreturn`
+- Credentials — `getuid/geteuid/getgid/getegid/setuid/setgid/umask`
+- Memory — `mmap` (anonymous **and** file-backed `MAP_PRIVATE`)
+  with lazy page-fault loading; `munmap`
+- I/O multiplex — `poll` (cooperative 10ms polling loop;
+  multi-waker `select` is a follow-on if perf matters)
+- Pipes — `pipe`
+
+Verified end-to-end on both **riscv64** and **aarch64** under
+QEMU virt machines. ~25 user-space test programs exercise the
+surface; all pass identically on both arches.
 
 ## Why
 
@@ -27,93 +53,83 @@ This todo isn't doing all of this. It's the *index* of what
 POSIX-ish work would look like, broken into sub-todos that can
 be picked off independently.
 
-### Tier 1 — file API parity  (~3 sub-todos)
+### Tier 1 — file API parity — **DONE**
 
-Closest to what xv6 already has:
+Landed:
+fcntl (F_GETFD/F_SETFD/F_DUPFD/F_DUPFD_CLOEXEC/F_GETFL/F_SETFL),
+O_APPEND/O_NONBLOCK/O_CLOEXEC, chmod, chown, umask, per-proc
+uid/gid + open-permission enforcement, stat/lstat/fstat,
+lseek/pread/pwrite, Stat struct extended to 48 bytes
+(mode + uid + gid + atime + mtime + ctime), ftruncate/truncate.
 
-- **fcntl + extended O_ flags** — `O_APPEND`, `O_NONBLOCK`,
-  `O_CLOEXEC`. Each needs honest semantics in our sys_write,
-  sys_read, sys_exec.
-- **Permission bits + chmod/chown** — adds `st_mode`, uid/gid
-  tracking per inode. `mode_t`, `chmod(2)`, `chown(2)`,
-  `umask(2)`. Per-proc uid/gid in `Proc`.
-- **`stat`/`lstat`** — separate from `fstat`. Adds `sys_stat`,
-  symlink handling.
-- **`lseek`** — random-access read/write on a file descriptor.
-  Routes through `File::Inode { off }` (already there as
-  `AtomicU32`).
-- **`pread`/`pwrite`** — explicit-offset variants.
-- **POSIX `struct stat`** — adds `st_atime/mtime/ctime/blksize/
-  blocks/mode/uid/gid`. Layout diverges from xv6 — gated behind
-  `--feature posix-stat` or a separate `posix_stat` syscall (it's
-  a bigger struct).
+### Tier 2 — signals — **DONE**
 
-### Tier 2 — signals  (~2 sub-todos)
+Landed: sigaction (with restorer stub in ulib), sigprocmask
+(SIG_BLOCK/UNBLOCK/SETMASK), sigreturn (snapshots trapframe,
+restores blocked mask), pending-bit dispatch in usertrap's
+return-to-user, handler-blocks-self semantics (sa_mask | sig
+ORed into blocked during handler). SIGKILL/SIGSTOP uncatchable.
+alarm + SIGALRM via the timer wheel. pause() blocks until
+deliverable signal. kill(pid, sig) replaces the old 1-arg kill.
 
-Signals are the second-biggest divergence from xv6. They need:
+### Tier 3 — environment + argv — **DONE**
 
-- **`sigaction`/`sigprocmask`/`sigreturn`** — kernel-side
-  signal-state in `Proc`. Per-proc pending bitmask. Deliver on
-  return-to-user by setting up a signal-frame on the user stack.
-- **`SIGINT`** from Ctrl-C in `console_in`, **`SIGCHLD`** when a
-  child exits, **`SIGALRM`** from `setitimer`.
-- Kill-with-signal-number — extend our `sys_kill` to take a
-  signo arg and store in target's pending bitmask.
+Landed: execve(path, argv, envp). User stack layout extended
+with envp[] array + strings. ulib's _start stores envp from
+x2/a2 into the global `environ`. ulib.c provides
+getenv/setenv/unsetenv (sbrk-backed pool for new strings).
 
-The async kernel makes signal delivery cleaner than xv6's — the
-"check signal" happens in `proc_main` right before
-`UserMode::run`.
+### Tier 4 — directory iteration — **DONE**
 
-### Tier 3 — environment + argv  (~1 sub-todo)
+Landed: getdents(fd, buf, len) returns a packed UserDirent
+record stream (ino/reclen/namelen/name). userspace can wrap
+into opendir/readdir/closedir at will.
 
-- **`envp` in exec** — third arg to `execve(path, argv, envp)`.
-  Store on user stack alongside argv; `__libc_init` reads it.
-- **`getenv`/`setenv`** in user libc.
+### Tier 5 — process info — **DONE**
 
-### Tier 4 — directory iteration  (~1 sub-todo)
+Landed: getppid (via Proc.parent: Weak<Proc>), getuid/geteuid/
+getgid/getegid/setuid/setgid (collapsed real/effective model —
+no setuid binaries means no separate saved-set ID), umask,
+getcwd (walks ..-chain from proc.cwd using a new
+dirlookup_by_inum helper), gettimeofday, clock_gettime
+(CLOCK_MONOTONIC), nanosleep.
 
-- **`opendir`/`readdir`/`closedir`** — provided by user libc
-  on top of our existing `open` + `read` on a directory.
+### Tier 6 — IPC + concurrency — **partially done**
 
-### Tier 5 — process info  (~2 sub-todos)
+Landed:
+- waitpid(pid, &status, options) with WNOHANG
+- wait4(pid, status, options, rusage) — rusage is zeroed (we
+  don't track resource accounting)
+- poll(fds, nfds, timeout_ms) — cooperative 10ms-poll loop
 
-- **`getppid`, `getuid`, `getgid`, `geteuid`, `getegid`,
-  `setuid`, `setgid`**.
-- **`getcwd(2)`** — currently no way to read cwd; needs to walk
-  back up `..` from `proc.cwd`.
+Not landed (deferred):
+- Unix-domain sockets — needs AF_UNIX socket type; not started
+- pthread_* — fundamentally at odds with our async-single-
+  task-per-proc model; recommended to skip rather than build
 
-### Tier 6 — IPC + concurrency  (~bigger; can defer)
+### Tier 7 — sockets — **not started**
 
-- **Unix-domain sockets** as named pipes through fs.
-- **`waitpid(pid, &status, options)`** — wait for a specific
-  child, optionally non-blocking. Generalises our `wait`.
-- Real **`select`/`poll`** on fds. Routes through the async
-  executor — fits naturally.
+TCP/IP stack + AF_INET. Likely smoltcp behind the HAL. A
+separate project — not gated by anything we have, but big.
 
-POSIX **`pthread_*`** is fundamentally at odds with our async-
-single-task-per-proc model. Either we don't do it (recommend),
-or we map pthread create to spawning sibling async tasks that
-share the user pagetable. The latter is research, not engineering.
+### Tier 8 — POSIX-ish libc — **kernel side done; libc port outstanding**
 
-### Tier 7 — sockets  (~biggest)
+The minimal glue set listed below is complete in the kernel.
+Actual newlib/musl bring-up is the outstanding work: pull in
+the library, point its syscall stubs at our SYS_* numbers,
+get a `hello world` and a small toolkit compiling against it.
 
-TCP/IP stack + AF_INET + bind/listen/accept/connect. This is a
-separate project. We could plug in `smoltcp` (Rust no_std TCP
-stack) as a kernel module behind the HAL.
-
-### Tier 8 — POSIX-ish libc  (~external)
-
-Port **newlib** or **musl** in user space. They use a small set
-of "OS-glue" syscalls; if we provide that set, off-the-shelf C
-programs (`busybox`, `coreutils`, anything `./configure
---host=riscv64-unknown-posix && make`) link cleanly.
-
-The minimal glue set is roughly: open, close, read, write, lseek,
-stat, fstat, mmap, munmap, brk, fork, execve, wait4, kill,
-sigaction, sigprocmask, getpid, getppid, gettimeofday, nanosleep,
-ioctl, fcntl, pipe, dup, dup2, mkdir, rmdir, unlink, link,
-symlink, readlink, chdir, getcwd, chmod, chown, getuid, geteuid,
-getgid, getegid, setuid, setgid. That's ~40 syscalls.
+The minimal glue set in our SYS_* (all 62 implemented):
+open, close, read, write, lseek, pread, pwrite, stat, fstat,
+lstat, mmap, munmap, brk, sbrk, fork, exec, execve, wait,
+waitpid, wait4, kill, sigaction, sigprocmask, sigreturn,
+alarm, pause, getpid, getppid, gettimeofday, clock_gettime,
+nanosleep, ioctl (TCGETS/TIOCGWINSZ/FIONREAD), fcntl
+(F_*FD + F_*FL + F_DUPFD*), pipe, dup, dup2, mkdir, rmdir,
+unlink, link, symlink, readlink, chdir, getcwd, rename,
+chmod, chown, getuid, geteuid, getgid, getegid, setuid,
+setgid, umask, getdents, ftruncate, truncate, sleep, uptime,
+poll.
 
 ## Architecture implications
 

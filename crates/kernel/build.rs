@@ -169,6 +169,8 @@ fn main() {
         ("symlinktest", "SYMLINKTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
         ("ioctltest", "IOCTLTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
         ("polltest", "POLLTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
+        ("pwd", "PWD_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
+        ("env", "ENV_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
     ];
     for (name, env_var, lang, with_ulib, supported_archs) in programs {
         if supported_archs.contains(&arch) {

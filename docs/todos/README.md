@@ -11,18 +11,18 @@ directory contains a `README.md` with the plan/summary, plus optional
 | Bucket | Count | What's in it |
 |---|---|---|
 | `done/` | 30 | Through aarch64 SMP — Phase A-F complete, interactive shell on -smp 4 |
-| `pending/` | 3 | xv6 compat tail + POSIX track + phase-2 GUI |
+| `pending/` | 3 | xv6 compat tail + POSIX (libc-glue done; libc port + sockets outstanding) + phase-2 GUI |
 | `revisit/` | 3 | Decisions to potentially revisit later |
 
 ## Pending — priority order
 
-1. [15-xv6-compat](pending/15-xv6-compat/) — close remaining
+1. [16-posix-compat](pending/16-posix-compat/) — Tiers 1-5 + 8
+   **kernel-side done**; 62 syscalls landed across both arches.
+   Outstanding: Tier 6 (Unix-domain sockets), Tier 7 (TCP/IP +
+   AF_INET), Tier 8's actual libc port (newlib/musl).
+2. [15-xv6-compat](pending/15-xv6-compat/) — close remaining
    cross-mount gaps (G1/G3/G9) and the lost-free-pages soft check
    under `usertests`.
-2. [16-posix-compat](pending/16-posix-compat/) — **NEXT** —
-   POSIX-ish track: permissions, signals, env/argv, libc port
-   (newlib/musl). Index of multiple sub-todos; not a single
-   deliverable.
 3. [12-phase2-gui](pending/12-phase2-gui/) — minimal
    framebuffer-backed display.
 
