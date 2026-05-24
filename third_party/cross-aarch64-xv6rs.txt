@@ -1,0 +1,30 @@
+# Meson cross-compilation file for building picolibc against our
+# xv6-rs kernel surface, aarch64 flavor.
+#
+# Compiler: clang --target=aarch64-none-elf (same one we use in
+# crates/kernel/build.rs for aarch64 user binaries — no brew
+# aarch64-elf-binutils required, everything ships with Xcode CLT
+# plus rustup's bundled LLVM tools).
+
+[binaries]
+c = ['clang', '--target=aarch64-none-elf']
+ar = '/Users/maix/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/llvm-ar'
+ld = '/Users/maix/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/gcc-ld/ld.lld'
+strip = '/Users/maix/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/llvm-strip'
+nm = '/Users/maix/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/llvm-nm'
+objcopy = '/Users/maix/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/llvm-objcopy'
+
+[host_machine]
+system = 'xv6rs'
+cpu_family = 'aarch64'
+cpu = 'cortex-a72'
+endian = 'little'
+
+[properties]
+needs_exe_wrapper = true
+sys_root = ''
+skip_sanity_check = true
+
+[built-in options]
+c_args = ['-march=armv8-a', '-nostdlib', '-fno-pie', '-static', '-ffreestanding', '-fno-stack-protector', '-fno-asynchronous-unwind-tables', '-fno-builtin', '-Os']
+c_link_args = ['-nostdlib', '-static']

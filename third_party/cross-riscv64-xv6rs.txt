@@ -1,0 +1,30 @@
+# Meson cross-compilation file for building picolibc against our
+# xv6-rs kernel surface, riscv64 flavor.
+#
+# Compiler is the homebrew riscv64-elf-gcc — same one we already
+# use to build user binaries via crates/kernel/build.rs.
+# system = 'xv6rs' is our made-up OS name so picolibc treats us
+# as a custom embedded target rather than a Linux variant.
+
+[binaries]
+c = 'riscv64-elf-gcc'
+ar = 'riscv64-elf-ar'
+ld = 'riscv64-elf-ld'
+strip = 'riscv64-elf-strip'
+nm = 'riscv64-elf-nm'
+objcopy = 'riscv64-elf-objcopy'
+
+[host_machine]
+system = 'xv6rs'
+cpu_family = 'riscv64'
+cpu = 'rv64gc'
+endian = 'little'
+
+[properties]
+needs_exe_wrapper = true
+sys_root = ''
+skip_sanity_check = true
+
+[built-in options]
+c_args = ['-march=rv64gc', '-mabi=lp64', '-mcmodel=medany', '-nostdlib', '-fno-pie', '-static', '-ffreestanding', '-fno-stack-protector', '-fno-asynchronous-unwind-tables', '-fno-builtin', '-Os']
+c_link_args = ['-nostdlib', '-static']

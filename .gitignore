@@ -2,3 +2,17 @@
 Cargo.lock
 *.img
 .DS_Store
+
+# xmake build artifacts + tool caches (xmake stores cross-build
+# state under .xmake/ at the project root, package installs under
+# ~/.xmake/, picolibc outputs under build/).
+/.xmake
+/build
+
+# picolibc upstream source — fetched on demand by xmake.lua, not
+# vendored. third_party/cross-*.txt and third_party/libc-glue/
+# ARE tracked.
+/third_party/picolibc-src
+
+# VS Code workspace settings (per-developer).
+/.vscode

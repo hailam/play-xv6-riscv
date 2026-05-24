@@ -130,5 +130,31 @@ pub unsafe fn init_intc_global() {
 }
 
 pub unsafe fn init_intc_per_hart() {
-    unsafe { gic::init_for_hart(UART0_IRQ, VIRTIO0_IRQ, VIRT_TIMER_PPI) }
+    unsafe {
+        gic::init_for_hart(UART0_IRQ, VIRTIO0_IRQ, VIRT_TIMER_PPI);
+        enable_fp_simd_for_el0_and_el1();
+    }
+}
+
+/// Set `CPACR_EL1.FPEN = 0b11` so FP/SIMD/NEON instructions don't
+/// trap at EL0 or EL1. entry.S already does this on the EL2→EL1
+/// drop path, but secondary-hart bringup via PSCI may land us at
+/// EL1 directly without that drop, leaving FPEN at its reset
+/// default (which traps). Re-setting here makes every hart safe.
+///
+/// Why this matters: clang on aarch64 emits NEON loads/stores
+/// (e.g. `stp q0, q1, [sp]`) for variadic-arg-passing in `printf`
+/// and for any FP code. Without FPEN=0b11, the first such
+/// instruction in user space (and the kernel!) faults with
+/// ESR.EC=0x07.
+unsafe fn enable_fp_simd_for_el0_and_el1() {
+    unsafe {
+        core::arch::asm!(
+            "mrs {t}, cpacr_el1",
+            "orr {t}, {t}, #(3 << 20)",
+            "msr cpacr_el1, {t}",
+            "isb",
+            t = out(reg) _,
+        );
+    }
 }
