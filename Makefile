@@ -76,7 +76,8 @@ fs.img: build $(MKFS)
 		ioctltest:$(USER_DIR)/ioctltest.elf \
 		polltest:$(USER_DIR)/polltest.elf \
 		pwd:$(USER_DIR)/pwd.elf \
-		env:$(USER_DIR)/env.elf
+		env:$(USER_DIR)/env.elf \
+		picohello:$(USER_DIR)/picohello.elf
 
 qemu: build fs.img
 	$(QEMU) $(QEMUOPTS)
@@ -137,7 +138,8 @@ fs-aarch64.img: build-aarch64 $(MKFS)
 		ioctltest:$(AARCH64_USER_DIR)/ioctltest.elf \
 		polltest:$(AARCH64_USER_DIR)/polltest.elf \
 		pwd:$(AARCH64_USER_DIR)/pwd.elf \
-		env:$(AARCH64_USER_DIR)/env.elf
+		env:$(AARCH64_USER_DIR)/env.elf \
+		picohello:$(AARCH64_USER_DIR)/picohello.elf
 
 qemu-aarch64: build-aarch64 fs-aarch64.img
 	$(QEMU_AARCH64) $(AARCH64_QEMUOPTS)

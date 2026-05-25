@@ -8,6 +8,16 @@ enum Lang {
     C,
 }
 
+/// Per-program C runtime choice. `Ulib` is our hand-rolled tiny
+/// runtime (the original xv6-style one). `Picolibc` links against
+/// the meson-built picolibc archive — adds `<stdio.h>`/`printf`/
+/// `malloc`/etc. but pulls ~10 KB into a stripped binary.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Runtime {
+    Ulib,
+    Picolibc,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Arch {
     Riscv64,
@@ -131,51 +141,65 @@ fn main() {
     }
 
     // hello.S and pipetest.S are riscv-only assembly demos — skip on
-    // aarch64. The rest is C, builds for both arches.
-    let programs: &[(&str, &str, Lang, bool, &[Arch])] = &[
-        ("echo", "ECHO_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("hello", "HELLO_BIN_PATH", Lang::Asm, false, &[Arch::Riscv64]),
-        ("pipetest", "PIPETEST_BIN_PATH", Lang::Asm, false, &[Arch::Riscv64]),
-        ("sh", "SH_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("cat", "CAT_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("ls", "LS_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("mkdir", "MKDIR_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("rm", "RM_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("wr", "WR_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("kill", "KILL_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("killtest", "KILLTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("malloctest", "MALLOCTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("smptest", "SMPTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("ln", "LN_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("faulttest", "FAULTTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("xv6test", "XV6TEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("lazytest", "LAZYTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("usertests", "USERTESTS_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("seektest", "SEEKTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("chmodtest", "CHMODTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("credtest", "CREDTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("cloexectest", "CLOEXECTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("trunctest", "TRUNCTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("stattime", "STATTIME_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("sigtest", "SIGTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("sigactest", "SIGACTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("sigmasktest", "SIGMASKTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("fdfiletest", "FDFILETEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("alarmtest", "ALARMTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("ctimetest", "CTIMETEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("envtest", "ENVTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("posix6test", "POSIX6TEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("mmaptest", "MMAPTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("symlinktest", "SYMLINKTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("ioctltest", "IOCTLTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("polltest", "POLLTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("pwd", "PWD_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
-        ("env", "ENV_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64]),
+    // aarch64. The rest is C, builds for both arches via the ulib
+    // runtime. picohello is the first user binary built against
+    // picolibc — uses `<stdio.h>`/`printf`, linked through xmake's
+    // libc.a.
+    let programs: &[(&str, &str, Lang, bool, &[Arch], Runtime)] = &[
+        ("echo", "ECHO_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("hello", "HELLO_BIN_PATH", Lang::Asm, false, &[Arch::Riscv64], Runtime::Ulib),
+        ("pipetest", "PIPETEST_BIN_PATH", Lang::Asm, false, &[Arch::Riscv64], Runtime::Ulib),
+        ("sh", "SH_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("cat", "CAT_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("ls", "LS_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("mkdir", "MKDIR_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("rm", "RM_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("wr", "WR_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("kill", "KILL_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("killtest", "KILLTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("malloctest", "MALLOCTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("smptest", "SMPTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("ln", "LN_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("faulttest", "FAULTTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("xv6test", "XV6TEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("lazytest", "LAZYTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("usertests", "USERTESTS_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("seektest", "SEEKTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("chmodtest", "CHMODTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("credtest", "CREDTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("cloexectest", "CLOEXECTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("trunctest", "TRUNCTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("stattime", "STATTIME_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("sigtest", "SIGTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("sigactest", "SIGACTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("sigmasktest", "SIGMASKTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("fdfiletest", "FDFILETEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("alarmtest", "ALARMTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("ctimetest", "CTIMETEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("envtest", "ENVTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("posix6test", "POSIX6TEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("mmaptest", "MMAPTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("symlinktest", "SYMLINKTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("ioctltest", "IOCTLTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("polltest", "POLLTEST_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("pwd", "PWD_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("env", "ENV_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        // picolibc-using programs. The compile/link path runs
+        // `xmake build picolibc-<arch>` lazily if libc.a isn't
+        // there yet. Programs marked Runtime::Picolibc get
+        // <stdio.h>, printf, malloc, FILE*, etc.
+        ("picohello", "PICOHELLO_BIN_PATH", Lang::C, false, &[Arch::Riscv64, Arch::Aarch64], Runtime::Picolibc),
     ];
-    for (name, env_var, lang, with_ulib, supported_archs) in programs {
+    for (name, env_var, lang, with_ulib, supported_archs, runtime) in programs {
         if supported_archs.contains(&arch) {
-            let bin =
-                build_user_program(arch, &out_dir, name, *lang, *with_ulib, &user_objs);
+            let bin = match runtime {
+                Runtime::Ulib => build_user_program(
+                    arch, &out_dir, name, *lang, *with_ulib, &user_objs,
+                ),
+                Runtime::Picolibc => build_user_program_picolibc(
+                    arch, &out_dir, name, &user_objs,
+                ),
+            };
             println!("cargo:rustc-env={env_var}={}", bin.display());
             if let Some(ud) = user_dir.as_ref() {
                 let _ = std::fs::copy(&bin, ud.join(format!("{name}.elf")));
@@ -317,4 +341,170 @@ fn run(prog: &str, args: &[&str]) {
         .status()
         .unwrap_or_else(|e| panic!("failed to run {prog}: {e}"));
     assert!(status.success(), "{prog} {args:?} exited with {status}");
+}
+
+/// Repo root (parent of `target/` and `crates/`).
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .expect("canonicalize repo root")
+}
+
+/// `build/picolibc-<arch>/install` produced by `xmake build
+/// picolibc-<arch>`. Headers under `include/`, archives under
+/// `lib/` (libc.a, libm.a, …).
+fn picolibc_install_dir(arch: Arch) -> PathBuf {
+    let arch_dir = match arch {
+        Arch::Riscv64 => "picolibc-riscv64",
+        Arch::Aarch64 => "picolibc-aarch64",
+    };
+    repo_root().join("build").join(arch_dir).join("install")
+}
+
+/// Ensure `build/picolibc-<arch>/install/lib/libc.a` exists, running
+/// `xmake build picolibc-<arch>` if not. xmake is responsible for
+/// fetching picolibc upstream + meson setup + ninja install.
+fn ensure_picolibc_built(arch: Arch) {
+    let libc = picolibc_install_dir(arch).join("lib").join("libc.a");
+    if libc.exists() {
+        return;
+    }
+    let target = match arch {
+        Arch::Riscv64 => "picolibc-riscv64",
+        Arch::Aarch64 => "picolibc-aarch64",
+    };
+    println!("cargo:warning=building picolibc for {target} (one-time)");
+    let status = Command::new("xmake")
+        .current_dir(repo_root())
+        .args(["build", "-y", target])
+        .status()
+        .unwrap_or_else(|e| panic!(
+            "failed to run xmake (install via `brew install xmake`): {e}"
+        ));
+    assert!(status.success(), "xmake build {target} failed");
+    assert!(libc.exists(), "xmake completed but {} is missing", libc.display());
+}
+
+fn build_user_program_picolibc(
+    arch: Arch,
+    out_dir: &Path,
+    name: &str,
+    runtime_objs: &[PathBuf],
+) -> PathBuf {
+    ensure_picolibc_built(arch);
+    let install = picolibc_install_dir(arch);
+    let include = install.join("include");
+    let lib_dir = install.join("lib");
+    let libc_a = lib_dir.join("libc.a");
+
+    let src = format!("user/{name}.c");
+    println!("cargo:rerun-if-changed={src}");
+    println!("cargo:rerun-if-changed={}", libc_a.display());
+
+    let obj = out_dir.join(format!("{name}-pico.o"));
+    let inc_arg = format!("-I{}", include.display());
+    match arch {
+        Arch::Riscv64 => run("riscv64-elf-gcc", &[
+            "-march=rv64gc", "-mabi=lp64", "-mcmodel=medany",
+            "-nostdlib", "-fno-pie", "-static",
+            "-ffreestanding", "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-Os", "-Wall",
+            &inc_arg,
+            "-c", "-o", obj.to_str().unwrap(),
+            &src,
+        ]),
+        Arch::Aarch64 => run("clang", &[
+            "--target=aarch64-none-elf", "-march=armv8-a",
+            "-nostdlib", "-fno-pie", "-static",
+            "-ffreestanding", "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-Os", "-Wall",
+            &inc_arg,
+            "-c", "-o", obj.to_str().unwrap(),
+            &src,
+        ]),
+    }
+
+    let elf = out_dir.join(format!("{name}.elf"));
+    let stripped = out_dir.join(format!("{name}-stripped.elf"));
+    let linker_script = match arch {
+        Arch::Riscv64 => "user/user.ld",
+        Arch::Aarch64 => "user/user-aarch64.ld",
+    };
+
+    // ulib runtime objects supply `_start`, the syscall stubs that
+    // picolibc's posix-console glue calls (read/write/lseek/close/
+    // _exit/sbrk/...), and `main` invocation. picolibc itself is the
+    // last archive — we pull `printf`, `malloc`, etc. out of it.
+    let mut ld_args: Vec<String> = vec![
+        "-T".into(), linker_script.into(),
+        "-N".into(),
+        "-o".into(), elf.to_str().unwrap().into(),
+    ];
+    for o in runtime_objs {
+        ld_args.push(o.to_str().unwrap().into());
+    }
+    ld_args.push(obj.to_str().unwrap().into());
+    ld_args.push(libc_a.to_str().unwrap().into());
+    // picolibc's dtoa-ryu uses 128-bit shifts (__lshrti3, __ashlti3)
+    // on riscv64 — supplied by libgcc.a. aarch64 has the same
+    // helpers in compiler-rt, which clang's driver finds; but here
+    // we link with `ld.lld` directly, so we have to add the
+    // compiler-rt builtins archive explicitly. Resolved lazily so
+    // riscv builds don't pay for a clang query.
+    match arch {
+        Arch::Riscv64 => {
+            let libgcc_out = Command::new("riscv64-elf-gcc")
+                .args(["-march=rv64gc", "-mabi=lp64", "-print-libgcc-file-name"])
+                .output()
+                .expect("riscv64-elf-gcc -print-libgcc-file-name");
+            let libgcc = String::from_utf8(libgcc_out.stdout)
+                .unwrap().trim().to_string();
+            ld_args.push(libgcc);
+        }
+        Arch::Aarch64 => {
+            // clang's builtins archive — aarch64 build of picolibc
+            // emits long-double soft-float helpers (__floatunditf,
+            // __divtf3, ...) that live here. The path is reported
+            // by `clang --target=aarch64-none-elf
+            // -print-libgcc-file-name`.
+            let cr_out = Command::new("clang")
+                .args(["--target=aarch64-none-elf", "-print-libgcc-file-name"])
+                .output()
+                .expect("clang -print-libgcc-file-name");
+            let cr = String::from_utf8(cr_out.stdout).unwrap().trim().to_string();
+            if !cr.is_empty() && std::path::Path::new(&cr).exists() {
+                ld_args.push(cr);
+            }
+        }
+    }
+    let ld_args_ref: Vec<&str> = ld_args.iter().map(|s| s.as_str()).collect();
+    match arch {
+        Arch::Riscv64 => run("riscv64-elf-ld", &ld_args_ref),
+        Arch::Aarch64 => {
+            let lld = rust_lld_path();
+            run(lld.to_str().unwrap(), &ld_args_ref)
+        }
+    }
+
+    match arch {
+        Arch::Riscv64 => run("riscv64-elf-objcopy", &[
+            "--strip-all",
+            elf.to_str().unwrap(),
+            stripped.to_str().unwrap(),
+        ]),
+        Arch::Aarch64 => {
+            let oc = rust_objcopy_path();
+            run(oc.to_str().unwrap(), &[
+                "--strip-all",
+                elf.to_str().unwrap(),
+                stripped.to_str().unwrap(),
+            ]);
+        }
+    }
+
+    stripped
 }
