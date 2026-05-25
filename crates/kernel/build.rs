@@ -121,7 +121,15 @@ fn main() {
     let ulib_c_obj = compile_to_obj(arch, &out_dir, "ulib", Lang::C);
     let umalloc_obj = compile_to_obj(arch, &out_dir, "umalloc", Lang::C);
     let printf_obj = compile_to_obj(arch, &out_dir, "printf", Lang::C);
-    let user_objs: Vec<PathBuf> = vec![ulib_asm_obj, ulib_c_obj, umalloc_obj, printf_obj];
+    let user_objs: Vec<PathBuf> =
+        vec![ulib_asm_obj.clone(), ulib_c_obj.clone(), umalloc_obj, printf_obj];
+    // For picolibc-using programs we want ONLY the syscall stubs +
+    // `_start` from ulib — picolibc supplies its own printf,
+    // malloc, strlen, memset, etc. Linking ulib's printf.o /
+    // umalloc.o ahead of libc.a would silently shadow picolibc's
+    // versions (object-files-before-archives), giving you the
+    // minimal `%d %s` formatter instead of picolibc's full one.
+    let pico_runtime_objs: Vec<PathBuf> = vec![ulib_asm_obj, ulib_c_obj];
 
     // initcode is the only user binary we currently emit for
     // aarch64. The rest of the C suite (sh, ls, cat, …) builds
@@ -189,6 +197,7 @@ fn main() {
         // there yet. Programs marked Runtime::Picolibc get
         // <stdio.h>, printf, malloc, FILE*, etc.
         ("picohello", "PICOHELLO_BIN_PATH", Lang::C, false, &[Arch::Riscv64, Arch::Aarch64], Runtime::Picolibc),
+        ("picotest", "PICOTEST_BIN_PATH", Lang::C, false, &[Arch::Riscv64, Arch::Aarch64], Runtime::Picolibc),
     ];
     for (name, env_var, lang, with_ulib, supported_archs, runtime) in programs {
         if supported_archs.contains(&arch) {
@@ -197,7 +206,7 @@ fn main() {
                     arch, &out_dir, name, *lang, *with_ulib, &user_objs,
                 ),
                 Runtime::Picolibc => build_user_program_picolibc(
-                    arch, &out_dir, name, &user_objs,
+                    arch, &out_dir, name, &pico_runtime_objs,
                 ),
             };
             println!("cargo:rustc-env={env_var}={}", bin.display());

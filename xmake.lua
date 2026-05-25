@@ -33,6 +33,11 @@ local PICOLIBC_OPTS = {
     -- variants picolibc builds unconditionally.
     "-Dpicocrt=false",
     "-Denable-malloc=true",
+    -- TLS off: we don't run threads, and aarch64 picolibc tags
+    -- `errno` as STT_TLS by default — which requires a PT_TLS
+    -- segment in the linker script + `_start` TLS init. Easier
+    -- to just turn it off; errno falls back to a plain global.
+    "-Dthread-local-storage=false",
 }
 
 -- Build helper. Because xmake's sandbox doesn't share the `os`
