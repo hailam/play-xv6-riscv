@@ -21,7 +21,7 @@ use crate::file::File;
 use crate::kalloc::KFRAMES;
 use crate::sync::SpinLock;
 use crate::syscall;
-use crate::user_vm::{self, STACK_VA_BASE};
+use crate::user_vm::{self, STACK_PAGES, STACK_VA_BASE};
 use crate::wait::WakerCell;
 
 use crate::arch::{trampoline_pa, PGSIZE, TRAMPOLINE, TRAPFRAME};
@@ -180,18 +180,22 @@ impl Proc {
             va += PGSIZE;
         }
 
-        // Stack page (fixed VA just below TRAPFRAME).
-        let (parent_stack_pa, stack_perm) = parent_pt.translate(STACK_VA_BASE)?;
-        let child_stack_pa = KFRAMES.alloc_zeroed()?;
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                parent_stack_pa as *const u8,
-                child_stack_pa as *mut u8,
-                PGSIZE,
-            );
+        // Stack pages (fixed [STACK_VA_BASE..STACK_VA_TOP) range,
+        // STACK_PAGES pages — each PA copied individually since
+        // they're allocated non-contiguously).
+        for i in 0..STACK_PAGES {
+            let va = STACK_VA_BASE + i * PGSIZE;
+            let (parent_pa, perm) = parent_pt.translate(va)?;
+            let child_pa = KFRAMES.alloc_zeroed()?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    parent_pa as *const u8,
+                    child_pa as *mut u8,
+                    PGSIZE,
+                );
+            }
+            pt.map(va, child_pa, PGSIZE, perm, &KFRAMES).ok()?;
         }
-        pt.map(STACK_VA_BASE, child_stack_pa, PGSIZE, stack_perm, &KFRAMES)
-            .ok()?;
 
         drop(parent_pt);
 

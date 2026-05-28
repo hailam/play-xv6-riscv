@@ -22,6 +22,11 @@ enum Runtime {
     /// picolibc. The same built binary is registered as both
     /// `/bc` and `/dc` — bc dispatches by argv[0].
     Bc,
+    /// Lua 5.4 single-file (`onelua.c`) compiled against picolibc
+    /// + picolibc's libm. Source cloned into
+    /// `build/lua-src-<arch>/`. Just a `lua` interpreter; luac
+    /// (bytecode compiler) is left out for size.
+    Lua,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -209,6 +214,7 @@ fn main() {
         // build_user_program_bc + ensure_bc_built below.
         ("bc", "BC_BIN_PATH", Lang::C, false, &[Arch::Riscv64, Arch::Aarch64], Runtime::Bc),
         ("dc", "DC_BIN_PATH", Lang::C, false, &[Arch::Riscv64, Arch::Aarch64], Runtime::Bc),
+        ("lua", "LUA_BIN_PATH", Lang::C, false, &[Arch::Riscv64, Arch::Aarch64], Runtime::Lua),
     ];
     for (name, env_var, lang, with_ulib, supported_archs, runtime) in programs {
         if supported_archs.contains(&arch) {
@@ -220,6 +226,9 @@ fn main() {
                     arch, &out_dir, name, &pico_runtime_objs,
                 ),
                 Runtime::Bc => build_user_program_bc(
+                    arch, &out_dir, name, &pico_runtime_objs,
+                ),
+                Runtime::Lua => build_user_program_lua(
                     arch, &out_dir, name, &pico_runtime_objs,
                 ),
             };
@@ -571,16 +580,17 @@ fn ensure_bc_built(arch: Arch, out_dir: &Path, pico_runtime_objs: &[PathBuf]) ->
     let pico_install = picolibc_install_dir(arch);
     let pico_inc = pico_install.join("include");
     let pico_lib = pico_install.join("lib").join("libc.a");
-    let glue_dir = repo.join("third_party").join("bc-glue");
-    let glue_header = glue_dir.join("bc_xv6rs.h");
-    let glue_c = glue_dir.join("bc_stubs.c");
+    let bc_glue_dir = repo.join("third_party").join("bc-glue");
+    let glue_header = bc_glue_dir.join("bc_xv6rs.h");
+    let glue_c = repo.join("third_party")
+        .join("libc-glue").join("picolibc_stubs.c");
     let linker_script = match arch {
         Arch::Riscv64 => repo.join("crates/kernel/user/user.ld"),
         Arch::Aarch64 => repo.join("crates/kernel/user/user-aarch64.ld"),
     };
 
-    // Pre-compile our glue stub (_exit, isatty) for this arch.
-    let stub_obj = out_dir.join("bc_stubs.o");
+    // Pre-compile our glue stub (_exit, isatty, times) for this arch.
+    let stub_obj = out_dir.join("picolibc_stubs.o");
     match arch {
         Arch::Riscv64 => run("riscv64-elf-gcc", &[
             "-march=rv64gc", "-mabi=lp64", "-mcmodel=medany",
@@ -622,7 +632,7 @@ fn ensure_bc_built(arch: Arch, out_dir: &Path, pico_runtime_objs: &[PathBuf]) ->
         "-nostdlib -fno-pie -static -ffreestanding -fno-stack-protector \
          -fno-asynchronous-unwind-tables -Os \
          -I{glue} -I{inc} -include {hdr}",
-        glue = glue_dir.display(),
+        glue = bc_glue_dir.display(),
         inc = pico_inc.display(),
         hdr = glue_header.display(),
     );
@@ -723,3 +733,155 @@ fn build_user_program_bc(
     stripped
 }
 
+
+fn lua_src_dir(arch: Arch) -> PathBuf {
+    let name = match arch {
+        Arch::Riscv64 => "lua-src-riscv64",
+        Arch::Aarch64 => "lua-src-aarch64",
+    };
+    repo_root().join("build").join(name)
+}
+
+const LUA_GIT_URL: &str = "https://github.com/lua/lua.git";
+const LUA_GIT_TAG: &str = "v5.4.7";
+
+fn build_user_program_lua(
+    arch: Arch,
+    out_dir: &Path,
+    name: &str,
+    pico_runtime_objs: &[PathBuf],
+) -> PathBuf {
+    ensure_picolibc_built(arch);
+    let src = lua_src_dir(arch);
+    let onelua = src.join("onelua.c");
+    if !onelua.exists() {
+        std::fs::create_dir_all(src.parent().unwrap()).ok();
+        println!("cargo:warning=cloning lua source for {arch:?}");
+        run("git", &[
+            "clone", "--depth=1", "--branch", LUA_GIT_TAG,
+            LUA_GIT_URL, src.to_str().unwrap(),
+        ]);
+    }
+    println!("cargo:rerun-if-changed={}", onelua.display());
+
+    let repo = repo_root();
+    let pico_install = picolibc_install_dir(arch);
+    let pico_inc = pico_install.join("include");
+    let pico_libc = pico_install.join("lib").join("libc.a");
+    let pico_libm = pico_install.join("lib").join("libm.a");
+    let stubs_c = repo.join("third_party").join("libc-glue")
+        .join("picolibc_stubs.c");
+
+    // Pre-compile shared stubs if not already (bc path may have).
+    let stub_obj = out_dir.join("picolibc_stubs.o");
+    if !stub_obj.exists() {
+        match arch {
+            Arch::Riscv64 => run("riscv64-elf-gcc", &[
+                "-march=rv64gc", "-mabi=lp64", "-mcmodel=medany",
+                "-nostdlib", "-fno-pie", "-static",
+                "-ffreestanding", "-fno-stack-protector",
+                "-fno-asynchronous-unwind-tables",
+                "-Os",
+                "-c", "-o", stub_obj.to_str().unwrap(),
+                stubs_c.to_str().unwrap(),
+            ]),
+            Arch::Aarch64 => run("clang", &[
+                "--target=aarch64-none-elf", "-march=armv8-a",
+                "-nostdlib", "-fno-pie", "-static",
+                "-ffreestanding", "-fno-stack-protector",
+                "-fno-asynchronous-unwind-tables",
+                "-Os",
+                "-c", "-o", stub_obj.to_str().unwrap(),
+                stubs_c.to_str().unwrap(),
+            ]),
+        }
+    }
+
+    let linker_script = match arch {
+        Arch::Riscv64 => repo.join("crates/kernel/user/user.ld"),
+        Arch::Aarch64 => repo.join("crates/kernel/user/user-aarch64.ld"),
+    };
+
+    let elf = out_dir.join(format!("{name}-pico.elf"));
+    let inc_arg = format!("-I{}", pico_inc.display());
+
+    // Build command line. Lua's onelua.c is one big compile-link,
+    // standard c99, with picolibc's libm + libc archives last.
+    let mut args: Vec<String> = Vec::new();
+    let push = |a: &mut Vec<String>, s: &str| a.push(s.to_string());
+    match arch {
+        Arch::Riscv64 => {
+            for s in [
+                "-march=rv64gc", "-mabi=lp64", "-mcmodel=medany",
+                "-nostdlib", "-fno-pie", "-static",
+                "-ffreestanding", "-fno-stack-protector",
+                "-fno-asynchronous-unwind-tables",
+                "-Os", "-std=c99",
+                &inc_arg,
+                "-T", linker_script.to_str().unwrap(), "-N",
+                "-o", elf.to_str().unwrap(),
+            ] { push(&mut args, s); }
+            for o in pico_runtime_objs {
+                args.push(o.to_string_lossy().into());
+            }
+            args.push(stub_obj.to_string_lossy().into());
+            args.push(onelua.to_string_lossy().into());
+            args.push(pico_libm.to_string_lossy().into());
+            args.push(pico_libc.to_string_lossy().into());
+            args.push(libgcc_riscv64());
+            let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            run("riscv64-elf-gcc", &args_ref);
+        }
+        Arch::Aarch64 => {
+            for s in [
+                "--target=aarch64-none-elf", "-march=armv8-a",
+                "-nostdlib", "-fno-pie", "-static",
+                "-ffreestanding", "-fno-stack-protector",
+                "-fno-asynchronous-unwind-tables",
+                "-Os", "-std=c99",
+                &inc_arg,
+            ] { push(&mut args, s); }
+            // Linker args via -Wl, (clang driver does the link).
+            args.push(format!("-Wl,-T,{}", linker_script.display()));
+            push(&mut args, "-Wl,-N");
+            push(&mut args, "-o");
+            args.push(elf.to_string_lossy().into());
+            for o in pico_runtime_objs {
+                args.push(o.to_string_lossy().into());
+            }
+            args.push(stub_obj.to_string_lossy().into());
+            args.push(onelua.to_string_lossy().into());
+            args.push(pico_libm.to_string_lossy().into());
+            args.push(pico_libc.to_string_lossy().into());
+            // Tell clang where ld.lld lives — driver picks it up.
+            let lld_dir = rust_lld_path().parent().unwrap().to_path_buf();
+            let cur = std::env::var("PATH").unwrap_or_default();
+            let new_path = format!("{}:{cur}", lld_dir.display());
+            let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            let status = Command::new("clang")
+                .env("PATH", new_path)
+                .args(&args_ref)
+                .status()
+                .unwrap_or_else(|e| panic!("clang failed: {e}"));
+            assert!(status.success(), "clang lua link failed");
+        }
+    }
+
+    let stripped = out_dir.join(format!("{name}-stripped.elf"));
+    match arch {
+        Arch::Riscv64 => run("riscv64-elf-objcopy", &[
+            "--strip-all",
+            elf.to_str().unwrap(),
+            stripped.to_str().unwrap(),
+        ]),
+        Arch::Aarch64 => {
+            let oc = rust_objcopy_path();
+            run(oc.to_str().unwrap(), &[
+                "--strip-all",
+                elf.to_str().unwrap(),
+                stripped.to_str().unwrap(),
+            ]);
+        }
+    }
+    stripped
+}

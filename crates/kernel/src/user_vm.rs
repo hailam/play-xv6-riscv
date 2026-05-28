@@ -22,7 +22,15 @@ use crate::kalloc::KFRAMES;
 use crate::arch::{trampoline_pa, PGSIZE, TRAMPOLINE, TRAPFRAME};
 
 pub const STACK_VA_TOP: usize = TRAPFRAME;
-pub const STACK_VA_BASE: usize = STACK_VA_TOP - PGSIZE;
+/// Number of pages in the fixed user stack region. 8 pages (32 KiB)
+/// is enough for moderately recursive interpreters (lua, awk) and
+/// xv6's usertests; single-page was the original xv6 size but
+/// blows up immediately under any picolibc-stdio + libm code path.
+pub const STACK_PAGES: usize = 8;
+pub const STACK_VA_BASE: usize = STACK_VA_TOP - STACK_PAGES * PGSIZE;
+/// VA of the topmost (highest-address) stack page. argv/envp layout
+/// always lands in this page.
+pub const STACK_TOP_PAGE_VA: usize = STACK_VA_TOP - PGSIZE;
 /// Top of the mmap region. Leave a 16 MiB guard below the stack
 /// page so a wild sbrk into the stack-guard area isn't immediately
 /// indistinguishable from an mmap region.
@@ -59,15 +67,27 @@ pub fn build_image_from_elf(
     let (entry, code_end) =
         elf::load_program(&mut pt, elf_bytes).map_err(UserVmError::Elf)?;
 
-    let stack_pa = KFRAMES.alloc_zeroed().ok_or(UserVmError::Oom)?;
-    pt.map(STACK_VA_BASE, stack_pa, PGSIZE, PtePerm::URW, &KFRAMES)
-        .map_err(|_| UserVmError::MapFailed)?;
+    // Allocate STACK_PAGES separate physical frames, map them
+    // consecutively into [STACK_VA_BASE, STACK_VA_TOP). The TOP page
+    // is what argv/envp layout uses; lower pages give us recursion
+    // headroom.
+    let mut top_stack_pa: usize = 0;
+    for i in 0..STACK_PAGES {
+        let pa = KFRAMES.alloc_zeroed().ok_or(UserVmError::Oom)?;
+        let va = STACK_VA_BASE + i * PGSIZE;
+        pt.map(va, pa, PGSIZE, PtePerm::URW, &KFRAMES)
+            .map_err(|_| UserVmError::MapFailed)?;
+        if i == STACK_PAGES - 1 {
+            top_stack_pa = pa;
+        }
+    }
+    debug_assert!(top_stack_pa != 0);
 
     Ok(UserImage {
         pagetable: pt,
         entry,
         code_end,
-        stack_pa,
+        stack_pa: top_stack_pa,
     })
 }
 
@@ -109,14 +129,18 @@ pub fn place_argv_envp_on_stack(
     let envp_array_va = if envc == 0 { 0 } else { argv_array_va + argv_array_bytes };
     let strings_start_va = sp_va + 8 + argv_array_bytes + envp_array_bytes;
 
-    let sp_off = sp_va - STACK_VA_BASE;
-    let argv_off = argv_array_va - STACK_VA_BASE;
+    // argv/envp layout always lives in the topmost stack page; that
+    // page's PA is what the caller hands us as `stack_pa`. Offset
+    // from the TOP-page VA base, not from STACK_VA_BASE (which now
+    // points to the lowest of N pages and would underflow).
+    let sp_off = sp_va - STACK_TOP_PAGE_VA;
+    let argv_off = argv_array_va - STACK_TOP_PAGE_VA;
     let envp_off = if envp_array_va == 0 {
         0
     } else {
-        envp_array_va - STACK_VA_BASE
+        envp_array_va - STACK_TOP_PAGE_VA
     };
-    let strings_off = strings_start_va - STACK_VA_BASE;
+    let strings_off = strings_start_va - STACK_TOP_PAGE_VA;
 
     unsafe {
         core::ptr::write_unaligned((stack_pa + sp_off) as *mut u64, argc as u64);

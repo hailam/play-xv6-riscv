@@ -80,7 +80,8 @@ fs.img: build $(MKFS)
 		picohello:$(USER_DIR)/picohello.elf \
 		picotest:$(USER_DIR)/picotest.elf \
 		bc:$(USER_DIR)/bc.elf \
-		dc:$(USER_DIR)/dc.elf
+		dc:$(USER_DIR)/dc.elf \
+		lua:$(USER_DIR)/lua.elf
 
 qemu: build fs.img
 	$(QEMU) $(QEMUOPTS)
@@ -145,7 +146,8 @@ fs-aarch64.img: build-aarch64 $(MKFS)
 		picohello:$(AARCH64_USER_DIR)/picohello.elf \
 		picotest:$(AARCH64_USER_DIR)/picotest.elf \
 		bc:$(AARCH64_USER_DIR)/bc.elf \
-		dc:$(AARCH64_USER_DIR)/dc.elf
+		dc:$(AARCH64_USER_DIR)/dc.elf \
+		lua:$(AARCH64_USER_DIR)/lua.elf
 
 qemu-aarch64: build-aarch64 fs-aarch64.img
 	$(QEMU_AARCH64) $(AARCH64_QEMUOPTS)

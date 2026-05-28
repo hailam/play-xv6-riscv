@@ -201,12 +201,19 @@ impl Hal for Riscv64 {
 
     unsafe fn return_to_user(tf: &mut Self::TrapFrame, user_satp: usize) -> !{
         // sstatus: clear SPP (return to U-mode), set SPIE (re-enable
-        // SIE on sret).
+        // SIE on sret), set FS=Initial so user-mode FP/D doesn't
+        // trap. We don't context-switch FP regs across processes
+        // yet — fine because only one user task touches FP at a
+        // time today (lua). When multi-FP-process scheduling lands,
+        // save/restore the F regs in usertrap.
         const SSTATUS_SPP: usize = 1 << 8;
         const SSTATUS_SPIE: usize = 1 << 5;
+        const SSTATUS_FS_MASK: usize = 0b11 << 13;
+        const SSTATUS_FS_INITIAL: usize = 0b01 << 13;
         let mut sstatus = csr::read_sstatus();
         sstatus &= !SSTATUS_SPP;
         sstatus |= SSTATUS_SPIE;
+        sstatus = (sstatus & !SSTATUS_FS_MASK) | SSTATUS_FS_INITIAL;
         unsafe { csr::write_sstatus(sstatus) };
 
         unsafe { csr::write_sepc(tf.epc() as usize) };
