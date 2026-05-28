@@ -15,7 +15,9 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::{Context, Poll};
 
-use xv6_fs_layout::{DInode, BSIZE, IPB, NDIRECT, NINDIRECT};
+use xv6_fs_layout::{
+    DInode, BSIZE, IPB, MAXFILE, NDIRECT, NDOUBLE_SLOT, NINDIRECT,
+};
 
 use crate::driver::bio;
 use crate::fs::superblock;
@@ -45,7 +47,7 @@ pub struct InodeState {
     pub atime: u32,
     pub mtime: u32,
     pub ctime: u32,
-    pub addrs: [u32; NDIRECT + 1],
+    pub addrs: [u32; NDIRECT + 2],
 }
 
 /// Current "time" — uptime in TIMER_INTERVAL units, truncated to
@@ -91,7 +93,7 @@ impl Inode {
                 atime: 0,
                 mtime: 0,
                 ctime: 0,
-                addrs: [0; NDIRECT + 1],
+                addrs: [0; NDIRECT + 2],
             }),
         }
     }
@@ -294,17 +296,35 @@ async fn bmap(li: &LockedInode<'_>, bn: u32) -> u32 {
     if (bn as usize) < NDIRECT {
         return state_addrs[bn as usize];
     }
-    let idx = (bn as usize) - NDIRECT;
-    assert!(idx < NINDIRECT, "bmap: file too big");
-    let ind_blkno = state_addrs[NDIRECT];
-    assert!(ind_blkno != 0, "bmap: missing indirect block for bn={}", bn);
-    let ind_buf = bio::bread(ind_blkno).await;
-    let o = idx * 4;
-    u32::from_le_bytes(ind_buf.data()[o..o + 4].try_into().unwrap())
+    // Single-indirect range: NDIRECT .. NDIRECT+NINDIRECT.
+    if (bn as usize) < NDIRECT + NINDIRECT {
+        let idx = (bn as usize) - NDIRECT;
+        let ind_blkno = state_addrs[NDIRECT];
+        assert!(ind_blkno != 0, "bmap: missing indirect block for bn={}", bn);
+        let ind_buf = bio::bread(ind_blkno).await;
+        let o = idx * 4;
+        return u32::from_le_bytes(ind_buf.data()[o..o + 4].try_into().unwrap());
+    }
+    // Double-indirect range: NDIRECT+NINDIRECT .. MAXFILE. Walk
+    // root → leaf-indirect → data block.
+    assert!(bn < MAXFILE, "bmap: file too big (bn={})", bn);
+    let off = (bn as usize) - NDIRECT - NINDIRECT;
+    let outer = off / NINDIRECT;
+    let inner = off % NINDIRECT;
+    let root_blkno = state_addrs[NDOUBLE_SLOT];
+    assert!(root_blkno != 0, "bmap: missing double-indirect root bn={}", bn);
+    let root_buf = bio::bread(root_blkno).await;
+    let leaf_blkno = u32::from_le_bytes(
+        root_buf.data()[outer * 4..outer * 4 + 4].try_into().unwrap(),
+    );
+    assert!(leaf_blkno != 0, "bmap: missing double-indirect leaf bn={}", bn);
+    let leaf_buf = bio::bread(leaf_blkno).await;
+    let o = inner * 4;
+    u32::from_le_bytes(leaf_buf.data()[o..o + 4].try_into().unwrap())
 }
 
-/// Like `bmap` but allocates the block (and an indirect block if
-/// needed) when it isn't present. Returns `None` on disk-full.
+/// Like `bmap` but allocates the block (and any indirect blocks
+/// along the way) when it isn't present. Returns `None` on disk-full.
 /// Caller must hold an open log transaction.
 async fn bmap_or_alloc(li: &mut LockedInode<'_>, bn: u32) -> Option<u32> {
     let dev = li.dev();
@@ -317,27 +337,72 @@ async fn bmap_or_alloc(li: &mut LockedInode<'_>, bn: u32) -> Option<u32> {
         li.state_mut().addrs[bn as usize] = new_blk;
         return Some(new_blk);
     }
-    let idx = (bn as usize) - NDIRECT;
-    assert!(idx < NINDIRECT, "bmap_or_alloc: file too big");
-    let ind_blkno = li.state().addrs[NDIRECT];
-    let ind_blkno = if ind_blkno != 0 {
-        ind_blkno
+    if (bn as usize) < NDIRECT + NINDIRECT {
+        let idx = (bn as usize) - NDIRECT;
+        let ind_blkno = li.state().addrs[NDIRECT];
+        let ind_blkno = if ind_blkno != 0 {
+            ind_blkno
+        } else {
+            let new_ind = crate::fs::bmap::balloc(dev).await?;
+            li.state_mut().addrs[NDIRECT] = new_ind;
+            new_ind
+        };
+        let ind_buf = bio::bread(ind_blkno).await;
+        let o = idx * 4;
+        let cur = u32::from_le_bytes(ind_buf.data()[o..o + 4].try_into().unwrap());
+        if cur != 0 {
+            return Some(cur);
+        }
+        let new_blk = crate::fs::bmap::balloc(dev).await?;
+        unsafe {
+            ind_buf.data_mut()[o..o + 4].copy_from_slice(&new_blk.to_le_bytes());
+        }
+        crate::fs::log::log_write(&ind_buf);
+        return Some(new_blk);
+    }
+    // Double-indirect range. Two on-disk blocks may need allocating:
+    // the root (one slot in addrs[]) and a leaf-indirect block (one
+    // slot in the root). Allocate lazily.
+    assert!(bn < MAXFILE, "bmap_or_alloc: file too big (bn={})", bn);
+    let off = (bn as usize) - NDIRECT - NINDIRECT;
+    let outer = off / NINDIRECT;
+    let inner = off % NINDIRECT;
+
+    let root_blkno = li.state().addrs[NDOUBLE_SLOT];
+    let root_blkno = if root_blkno != 0 {
+        root_blkno
     } else {
-        let new_ind = crate::fs::bmap::balloc(dev).await?;
-        li.state_mut().addrs[NDIRECT] = new_ind;
-        new_ind
+        let new_root = crate::fs::bmap::balloc(dev).await?;
+        li.state_mut().addrs[NDOUBLE_SLOT] = new_root;
+        new_root
     };
-    let ind_buf = bio::bread(ind_blkno).await;
-    let o = idx * 4;
-    let cur = u32::from_le_bytes(ind_buf.data()[o..o + 4].try_into().unwrap());
+    let root_buf = bio::bread(root_blkno).await;
+    let ro = outer * 4;
+    let leaf_blkno = u32::from_le_bytes(
+        root_buf.data()[ro..ro + 4].try_into().unwrap(),
+    );
+    let leaf_blkno = if leaf_blkno != 0 {
+        leaf_blkno
+    } else {
+        let new_leaf = crate::fs::bmap::balloc(dev).await?;
+        unsafe {
+            root_buf.data_mut()[ro..ro + 4].copy_from_slice(&new_leaf.to_le_bytes());
+        }
+        crate::fs::log::log_write(&root_buf);
+        new_leaf
+    };
+
+    let leaf_buf = bio::bread(leaf_blkno).await;
+    let lo = inner * 4;
+    let cur = u32::from_le_bytes(leaf_buf.data()[lo..lo + 4].try_into().unwrap());
     if cur != 0 {
         return Some(cur);
     }
     let new_blk = crate::fs::bmap::balloc(dev).await?;
     unsafe {
-        ind_buf.data_mut()[o..o + 4].copy_from_slice(&new_blk.to_le_bytes());
+        leaf_buf.data_mut()[lo..lo + 4].copy_from_slice(&new_blk.to_le_bytes());
     }
-    crate::fs::log::log_write(&ind_buf);
+    crate::fs::log::log_write(&leaf_buf);
     Some(new_blk)
 }
 
@@ -457,7 +522,7 @@ pub async fn itrunc_to(li: &mut LockedInode<'_>, new_size: u32) {
     //    free just the leaves at indices ≥ (keep_blocks - NDIRECT).
     if addrs[NDIRECT] != 0 {
         let ind_blkno = addrs[NDIRECT];
-        let ind_keep = keep_blocks.saturating_sub(NDIRECT);
+        let ind_keep = keep_blocks.saturating_sub(NDIRECT).min(NINDIRECT);
         if ind_keep == 0 {
             // Free the whole indirect tree.
             let ind_buf = bio::bread(ind_blkno).await;
@@ -472,7 +537,7 @@ pub async fn itrunc_to(li: &mut LockedInode<'_>, new_size: u32) {
             }
             crate::fs::bmap::bfree(dev, ind_blkno).await;
             addrs[NDIRECT] = 0;
-        } else {
+        } else if ind_keep < NINDIRECT {
             // Free leaves at indices ≥ ind_keep; zero out their
             // slots in the indirect block so writers don't reuse
             // stale block numbers.
@@ -498,6 +563,109 @@ pub async fn itrunc_to(li: &mut LockedInode<'_>, new_size: u32) {
         }
     }
 
+    // 3) Double-indirect tree. Same structure, one level deeper.
+    if addrs[NDOUBLE_SLOT] != 0 {
+        let root_blkno = addrs[NDOUBLE_SLOT];
+        let di_keep = keep_blocks.saturating_sub(NDIRECT + NINDIRECT);
+        let leaves_keep = (di_keep + NINDIRECT - 1) / NINDIRECT;
+        let inner_keep_in_last = di_keep - leaves_keep.saturating_sub(1) * NINDIRECT;
+
+        if di_keep == 0 {
+            // Free the entire double-indirect subtree.
+            let root_buf = bio::bread(root_blkno).await;
+            let mut leaves: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+            for j in 0..NINDIRECT {
+                let o = j * 4;
+                let b = u32::from_le_bytes(
+                    root_buf.data()[o..o + 4].try_into().unwrap(),
+                );
+                if b != 0 {
+                    leaves.push(b);
+                }
+            }
+            for leaf_blk in leaves {
+                let leaf_buf = bio::bread(leaf_blk).await;
+                for k in 0..NINDIRECT {
+                    let o = k * 4;
+                    let b = u32::from_le_bytes(
+                        leaf_buf.data()[o..o + 4].try_into().unwrap(),
+                    );
+                    if b != 0 {
+                        crate::fs::bmap::bfree(dev, b).await;
+                    }
+                }
+                crate::fs::bmap::bfree(dev, leaf_blk).await;
+            }
+            crate::fs::bmap::bfree(dev, root_blkno).await;
+            addrs[NDOUBLE_SLOT] = 0;
+        } else {
+            // Partial truncate. Free whole leaf-indirects past
+            // `leaves_keep`, then trim the tail of leaf
+            // `leaves_keep - 1` to `inner_keep_in_last`.
+            let root_buf = bio::bread(root_blkno).await;
+            let mut leaves_to_free: alloc::vec::Vec<(usize, u32)> = alloc::vec::Vec::new();
+            for j in leaves_keep..NINDIRECT {
+                let o = j * 4;
+                let b = u32::from_le_bytes(
+                    root_buf.data()[o..o + 4].try_into().unwrap(),
+                );
+                if b != 0 {
+                    leaves_to_free.push((j, b));
+                }
+            }
+            unsafe {
+                let data = root_buf.data_mut();
+                for (j, _) in &leaves_to_free {
+                    let o = j * 4;
+                    data[o..o + 4].copy_from_slice(&[0u8; 4]);
+                }
+            }
+            crate::fs::log::log_write(&root_buf);
+            for (_, leaf_blk) in leaves_to_free {
+                let leaf_buf = bio::bread(leaf_blk).await;
+                for k in 0..NINDIRECT {
+                    let o = k * 4;
+                    let b = u32::from_le_bytes(
+                        leaf_buf.data()[o..o + 4].try_into().unwrap(),
+                    );
+                    if b != 0 {
+                        crate::fs::bmap::bfree(dev, b).await;
+                    }
+                }
+                crate::fs::bmap::bfree(dev, leaf_blk).await;
+            }
+            // Tail-trim the last kept leaf.
+            if inner_keep_in_last < NINDIRECT && leaves_keep > 0 {
+                let last_leaf_idx = leaves_keep - 1;
+                let o_root = last_leaf_idx * 4;
+                let leaf_blkno = u32::from_le_bytes(
+                    root_buf.data()[o_root..o_root + 4].try_into().unwrap(),
+                );
+                if leaf_blkno != 0 {
+                    let leaf_buf = bio::bread(leaf_blkno).await;
+                    let mut to_free = alloc::vec::Vec::new();
+                    unsafe {
+                        let data = leaf_buf.data_mut();
+                        for k in inner_keep_in_last..NINDIRECT {
+                            let o = k * 4;
+                            let b = u32::from_le_bytes(
+                                data[o..o + 4].try_into().unwrap(),
+                            );
+                            if b != 0 {
+                                to_free.push(b);
+                                data[o..o + 4].copy_from_slice(&[0u8; 4]);
+                            }
+                        }
+                    }
+                    crate::fs::log::log_write(&leaf_buf);
+                    for b in to_free {
+                        crate::fs::bmap::bfree(dev, b).await;
+                    }
+                }
+            }
+        }
+    }
+
     // mtime/ctime change whenever truncate touches data layout.
     {
         let now = now_secs();
@@ -514,7 +682,7 @@ pub async fn itrunc_to(li: &mut LockedInode<'_>, new_size: u32) {
         if in_blk_off > 0 && in_blk_off < BSIZE {
             let blk_no = if tail_blk_idx < NDIRECT {
                 addrs[tail_blk_idx]
-            } else {
+            } else if tail_blk_idx < NDIRECT + NINDIRECT {
                 let ind_idx = tail_blk_idx - NDIRECT;
                 if addrs[NDIRECT] == 0 {
                     0
@@ -524,6 +692,29 @@ pub async fn itrunc_to(li: &mut LockedInode<'_>, new_size: u32) {
                     u32::from_le_bytes(
                         ind_buf.data()[o..o + 4].try_into().unwrap(),
                     )
+                }
+            } else {
+                // Tail-block lives in the double-indirect tree.
+                let off = tail_blk_idx - NDIRECT - NINDIRECT;
+                let outer = off / NINDIRECT;
+                let inner = off % NINDIRECT;
+                if addrs[NDOUBLE_SLOT] == 0 {
+                    0
+                } else {
+                    let root_buf = bio::bread(addrs[NDOUBLE_SLOT]).await;
+                    let leaf_blkno = u32::from_le_bytes(
+                        root_buf.data()[outer * 4..outer * 4 + 4]
+                            .try_into().unwrap(),
+                    );
+                    if leaf_blkno == 0 {
+                        0
+                    } else {
+                        let leaf_buf = bio::bread(leaf_blkno).await;
+                        u32::from_le_bytes(
+                            leaf_buf.data()[inner * 4..inner * 4 + 4]
+                                .try_into().unwrap(),
+                        )
+                    }
                 }
             };
             if blk_no != 0 {

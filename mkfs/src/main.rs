@@ -154,7 +154,21 @@ impl FsBuilder {
         dino.size = data.len() as u32;
 
         let nblocks = (data.len() + BSIZE - 1) / BSIZE;
+        assert!(
+            (nblocks as u32) <= xv6_fs_layout::MAXFILE,
+            "file too big: {} blocks > MAXFILE {}",
+            nblocks,
+            xv6_fs_layout::MAXFILE
+        );
+
+        // Block layout: direct (0..NDIRECT) | indirect-leaf
+        // (NDIRECT..NDIRECT+NINDIRECT) | double-indirect-leaf (rest).
+        // We build the indirect/double-indirect blocks in memory and
+        // flush at the end so we don't re-read them from disk.
         let mut indirect: Option<Vec<u8>> = None;
+        let mut double_indirect_root: Option<Vec<u8>> = None;
+        let mut double_indirect_leaves: Vec<Option<Vec<u8>>> =
+            vec![None; xv6_fs_layout::NINDIRECT];
 
         for i in 0..nblocks {
             let blkno = self.alloc_block();
@@ -166,7 +180,7 @@ impl FsBuilder {
 
             if i < NDIRECT {
                 dino.addrs[i] = blkno;
-            } else {
+            } else if i < NDIRECT + xv6_fs_layout::NINDIRECT {
                 if indirect.is_none() {
                     let ind_blk = self.alloc_block();
                     dino.addrs[NDIRECT] = ind_blk;
@@ -175,12 +189,48 @@ impl FsBuilder {
                 let idx = (i - NDIRECT) * 4;
                 indirect.as_mut().unwrap()[idx..idx + 4]
                     .copy_from_slice(&(blkno as u32).to_le_bytes());
+            } else {
+                // double-indirect leaf
+                let off = i - NDIRECT - xv6_fs_layout::NINDIRECT;
+                let outer = off / xv6_fs_layout::NINDIRECT;
+                let inner = off % xv6_fs_layout::NINDIRECT;
+                if double_indirect_root.is_none() {
+                    let root_blk = self.alloc_block();
+                    dino.addrs[xv6_fs_layout::NDOUBLE_SLOT] = root_blk;
+                    double_indirect_root = Some(vec![0u8; BSIZE]);
+                }
+                if double_indirect_leaves[outer].is_none() {
+                    let leaf_blk = self.alloc_block();
+                    let root = double_indirect_root.as_mut().unwrap();
+                    let o = outer * 4;
+                    root[o..o + 4].copy_from_slice(&leaf_blk.to_le_bytes());
+                    double_indirect_leaves[outer] = Some(vec![0u8; BSIZE]);
+                }
+                let leaf = double_indirect_leaves[outer].as_mut().unwrap();
+                let lo = inner * 4;
+                leaf[lo..lo + 4].copy_from_slice(&blkno.to_le_bytes());
             }
         }
 
         if let Some(ind) = indirect {
             let ind_blk = dino.addrs[NDIRECT];
             self.write_block(ind_blk, &ind);
+        }
+        if let Some(root) = double_indirect_root {
+            let root_blk = dino.addrs[xv6_fs_layout::NDOUBLE_SLOT];
+            // Need each leaf block-no before flushing the root.
+            // We already stored them into `root` as we allocated each
+            // leaf, so just flush root + each non-None leaf.
+            for (outer, leaf_opt) in double_indirect_leaves.into_iter().enumerate() {
+                if let Some(leaf) = leaf_opt {
+                    let o = outer * 4;
+                    let leaf_blk = u32::from_le_bytes(
+                        root[o..o + 4].try_into().unwrap(),
+                    );
+                    self.write_block(leaf_blk, &leaf);
+                }
+            }
+            self.write_block(root_blk, &root);
         }
 
         self.write_inode(inum, &dino);

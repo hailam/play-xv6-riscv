@@ -16,9 +16,15 @@ enum Lang {
 enum Runtime {
     Ulib,
     Picolibc,
+    /// Third-party bc (Gavin Howard's `bc`/`dc`). Source is cloned
+    /// on first build into `build/bc-src-<arch>/`; bc's own
+    /// configure.sh + Makefile do the cross-compile against our
+    /// picolibc. The same built binary is registered as both
+    /// `/bc` and `/dc` — bc dispatches by argv[0].
+    Bc,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Arch {
     Riscv64,
     Aarch64,
@@ -198,6 +204,11 @@ fn main() {
         // <stdio.h>, printf, malloc, FILE*, etc.
         ("picohello", "PICOHELLO_BIN_PATH", Lang::C, false, &[Arch::Riscv64, Arch::Aarch64], Runtime::Picolibc),
         ("picotest", "PICOTEST_BIN_PATH", Lang::C, false, &[Arch::Riscv64, Arch::Aarch64], Runtime::Picolibc),
+        // bc + dc: same binary, dispatched by argv[0]. Built from
+        // upstream gavinhoward/bc against picolibc; see
+        // build_user_program_bc + ensure_bc_built below.
+        ("bc", "BC_BIN_PATH", Lang::C, false, &[Arch::Riscv64, Arch::Aarch64], Runtime::Bc),
+        ("dc", "DC_BIN_PATH", Lang::C, false, &[Arch::Riscv64, Arch::Aarch64], Runtime::Bc),
     ];
     for (name, env_var, lang, with_ulib, supported_archs, runtime) in programs {
         if supported_archs.contains(&arch) {
@@ -206,6 +217,9 @@ fn main() {
                     arch, &out_dir, name, *lang, *with_ulib, &user_objs,
                 ),
                 Runtime::Picolibc => build_user_program_picolibc(
+                    arch, &out_dir, name, &pico_runtime_objs,
+                ),
+                Runtime::Bc => build_user_program_bc(
                     arch, &out_dir, name, &pico_runtime_objs,
                 ),
             };
@@ -517,3 +531,195 @@ fn build_user_program_picolibc(
 
     stripped
 }
+
+
+/// Per-arch bc source directory. We keep riscv and aarch64 in
+/// separate trees so a configure for one does not perturb the
+/// other.
+fn bc_src_dir(arch: Arch) -> PathBuf {
+    let name = match arch {
+        Arch::Riscv64 => "bc-src-riscv64",
+        Arch::Aarch64 => "bc-src-aarch64",
+    };
+    repo_root().join("build").join(name)
+}
+
+const BC_GIT_URL: &str = "https://github.com/gavinhoward/bc.git";
+const BC_GIT_TAG: &str = "7.1.0";
+
+fn libgcc_riscv64() -> String {
+    let out = Command::new("riscv64-elf-gcc")
+        .args(["-march=rv64gc", "-mabi=lp64", "-print-libgcc-file-name"])
+        .output()
+        .expect("riscv64-elf-gcc -print-libgcc-file-name");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// Ensure build/bc-src-<arch>/bin/bc exists; clone + configure +
+/// make if not. Re-runs only when the binary is missing — bc takes
+/// ~10s to build on apple silicon.
+fn ensure_bc_built(arch: Arch, out_dir: &Path, pico_runtime_objs: &[PathBuf]) -> PathBuf {
+    ensure_picolibc_built(arch);
+    let src = bc_src_dir(arch);
+    let bin = src.join("bin").join("bc");
+    if bin.exists() {
+        return bin;
+    }
+
+    println!("cargo:warning=building bc for {arch:?} (one-time, ~10s)");
+    let repo = repo_root();
+    let pico_install = picolibc_install_dir(arch);
+    let pico_inc = pico_install.join("include");
+    let pico_lib = pico_install.join("lib").join("libc.a");
+    let glue_dir = repo.join("third_party").join("bc-glue");
+    let glue_header = glue_dir.join("bc_xv6rs.h");
+    let glue_c = glue_dir.join("bc_stubs.c");
+    let linker_script = match arch {
+        Arch::Riscv64 => repo.join("crates/kernel/user/user.ld"),
+        Arch::Aarch64 => repo.join("crates/kernel/user/user-aarch64.ld"),
+    };
+
+    // Pre-compile our glue stub (_exit, isatty) for this arch.
+    let stub_obj = out_dir.join("bc_stubs.o");
+    match arch {
+        Arch::Riscv64 => run("riscv64-elf-gcc", &[
+            "-march=rv64gc", "-mabi=lp64", "-mcmodel=medany",
+            "-nostdlib", "-fno-pie", "-static",
+            "-ffreestanding", "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-Os",
+            "-c", "-o", stub_obj.to_str().unwrap(),
+            glue_c.to_str().unwrap(),
+        ]),
+        Arch::Aarch64 => run("clang", &[
+            "--target=aarch64-none-elf", "-march=armv8-a",
+            "-nostdlib", "-fno-pie", "-static",
+            "-ffreestanding", "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-Os",
+            "-c", "-o", stub_obj.to_str().unwrap(),
+            glue_c.to_str().unwrap(),
+        ]),
+    }
+
+    // Clone bc (shallow, pinned tag).
+    if !src.exists() {
+        std::fs::create_dir_all(src.parent().unwrap()).ok();
+        run("git", &[
+            "clone", "--depth=1", "--branch", BC_GIT_TAG,
+            BC_GIT_URL,
+            src.to_str().unwrap(),
+        ]);
+    }
+
+    // CFLAGS / LDFLAGS for the cross-build. Two gotchas baked in:
+    //  - HOSTCFLAGS=" " (space) — bc configure.s default is $CFLAGS,
+    //    which would feed our cross-flags to the host clang.
+    //  - aarch64 link goes via clang (Makefile uses $(CC) for the
+    //    link step); linker flags need -Wl, and -nostdlib passes
+    //    straight through.
+    let cflags_common = format!(
+        "-nostdlib -fno-pie -static -ffreestanding -fno-stack-protector \
+         -fno-asynchronous-unwind-tables -Os \
+         -I{glue} -I{inc} -include {hdr}",
+        glue = glue_dir.display(),
+        inc = pico_inc.display(),
+        hdr = glue_header.display(),
+    );
+    let mut runtime_args = String::new();
+    for o in pico_runtime_objs {
+        runtime_args.push(' ');
+        runtime_args.push_str(o.to_str().unwrap());
+    }
+    runtime_args.push(' ');
+    runtime_args.push_str(stub_obj.to_str().unwrap());
+    runtime_args.push(' ');
+    runtime_args.push_str(pico_lib.to_str().unwrap());
+
+    let (cc, cflags, ldflags) = match arch {
+        Arch::Riscv64 => {
+            let libgcc = libgcc_riscv64();
+            (
+                "riscv64-elf-gcc".to_string(),
+                format!("-march=rv64gc -mabi=lp64 -mcmodel=medany {cflags_common}"),
+                format!(
+                    "-T{} -N -nostdlib{} {}",
+                    linker_script.display(),
+                    runtime_args,
+                    libgcc,
+                ),
+            )
+        }
+        Arch::Aarch64 => (
+            "clang --target=aarch64-none-elf".to_string(),
+            format!("-march=armv8-a {cflags_common}"),
+            format!(
+                "-nostdlib -Wl,-T,{} -Wl,-N{}",
+                linker_script.display(),
+                runtime_args,
+            ),
+        ),
+    };
+
+    let configure = src.join("configure.sh");
+    let configure_status = Command::new(configure)
+        .current_dir(&src)
+        .env("CC", &cc)
+        .env("HOSTCC", "cc")
+        .env("HOSTCFLAGS", " ")
+        .env("CFLAGS", &cflags)
+        .env("LDFLAGS", &ldflags)
+        .args([
+            "--disable-history", "--disable-nls", "--disable-man-pages",
+            "--disable-strip", "--disable-generated-tests",
+        ])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("bc configure.sh: {e}"));
+    assert!(configure_status.success(), "bc configure.sh failed");
+
+    let mut make = Command::new("make");
+    make.current_dir(&src);
+    if matches!(arch, Arch::Aarch64) {
+        // clangs internal linker lookup needs ld.lld on PATH.
+        let lld_dir = rust_lld_path().parent().unwrap().to_path_buf();
+        let cur = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{cur}", lld_dir.display());
+        make.env("PATH", new_path);
+    }
+    let make_status = make
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("bc make: {e}"));
+    assert!(make_status.success(), "bc make failed");
+
+    assert!(bin.exists(), "bc built but {} missing", bin.display());
+    bin
+}
+
+fn build_user_program_bc(
+    arch: Arch,
+    out_dir: &Path,
+    name: &str,
+    pico_runtime_objs: &[PathBuf],
+) -> PathBuf {
+    let bc_bin = ensure_bc_built(arch, out_dir, pico_runtime_objs);
+    let stripped = out_dir.join(format!("{name}-stripped.elf"));
+    std::fs::copy(&bc_bin, &stripped)
+        .unwrap_or_else(|e| panic!("copy bc to {}: {e}", stripped.display()));
+    match arch {
+        Arch::Riscv64 => run("riscv64-elf-objcopy", &[
+            "--strip-all",
+            stripped.to_str().unwrap(),
+        ]),
+        Arch::Aarch64 => {
+            let oc = rust_objcopy_path();
+            run(oc.to_str().unwrap(), &[
+                "--strip-all",
+                stripped.to_str().unwrap(),
+            ]);
+        }
+    }
+    stripped
+}
+

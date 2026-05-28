@@ -8,7 +8,14 @@ pub const FSMAGIC: u32 = 0x10203040;
 pub const NINODES: u32 = 200;
 pub const NDIRECT: usize = 12;
 pub const NINDIRECT: usize = BSIZE / 4;
-pub const MAXFILE: u32 = (NDIRECT + NINDIRECT) as u32;
+/// Slot index in `addrs[]` that holds the double-indirect block.
+/// (`addrs[NDIRECT]` holds the single-indirect block.)
+pub const NDOUBLE_SLOT: usize = NDIRECT + 1;
+/// Number of leaf blocks reachable via the double-indirect tree:
+/// one indirect block of `NINDIRECT` pointers, each pointing at an
+/// indirect block of `NINDIRECT` leaves.
+pub const NDOUBLE_INDIRECT: usize = NINDIRECT * NINDIRECT;
+pub const MAXFILE: u32 = (NDIRECT + NINDIRECT + NDOUBLE_INDIRECT) as u32;
 pub const LOGSIZE: u32 = 30;
 pub const DIRSIZ: usize = 14;
 
@@ -53,8 +60,14 @@ impl Superblock {
 /// Layout:
 ///   typ/major/minor/nlink/mode/uid/gid + 1 reserved u16  =  16 B
 ///   size + 3 reserved u32 (atime/mtime/ctime placeholder) =  16 B
-///   addrs [u32; 13]                                       =  52 B
-///   _reserved [u8; 44]                                    =  44 B
+///   addrs [u32; 14]                                       =  56 B
+///       — addrs[0..NDIRECT]      = direct
+///       — addrs[NDIRECT]         = single-indirect block
+///       — addrs[NDIRECT+1]       = double-indirect block (root of
+///                                  one-level tree: each leaf of the
+///                                  root points at another indirect
+///                                  block of `NINDIRECT` data blocks)
+///   _reserved [u8; 40]                                    =  40 B
 ///                                                          ----
 ///                                                          128 B
 #[repr(C)]
@@ -70,8 +83,8 @@ pub struct DInode {
     pub _reserved0: u16,
     pub size: u32,
     pub _reserved_time: [u32; 3],
-    pub addrs: [u32; NDIRECT + 1],
-    pub _reserved_tail: [u8; 44],
+    pub addrs: [u32; NDIRECT + 2],
+    pub _reserved_tail: [u8; 40],
 }
 
 impl Default for DInode {
@@ -87,8 +100,8 @@ impl Default for DInode {
             _reserved0: 0,
             size: 0,
             _reserved_time: [0; 3],
-            addrs: [0; NDIRECT + 1],
-            _reserved_tail: [0; 44],
+            addrs: [0; NDIRECT + 2],
+            _reserved_tail: [0; 40],
         }
     }
 }
