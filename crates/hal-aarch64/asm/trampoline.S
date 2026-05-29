@@ -86,6 +86,22 @@ uservec_sync:
         // x0 = TRAPFRAME VA (kernel saved here before eret).
         mrs     x0, tpidr_el1
 
+        // Save ESR_EL1 + ELR_EL1 immediately — before *anything*
+        // that could even theoretically take a sub-exception
+        // (sub-traps overwrite both with the new exception's
+        // values). x1 holds user state; stash it to TPIDR_EL1
+        // briefly so we don't clobber it.
+        msr     tpidr_el1, x1
+        mrs     x1, esr_el1
+        str     x1, [x0, #304]
+        mrs     x1, elr_el1
+        str     x1, [x0, #32]
+        // trap_kind = 0 (synchronous).
+        str     xzr, [x0, #312]
+        mrs     x1, tpidr_el1
+        // Restore TPIDR_EL1 to TRAPFRAME VA.
+        msr     tpidr_el1, x0
+
         // Save x1..x30 at offsets 64..296.
         stp     x1,  x2,  [x0, #64]
         stp     x3,  x4,  [x0, #80]
@@ -107,11 +123,11 @@ uservec_sync:
         mrs     x1, tpidrro_el0
         str     x1, [x0, #56]
 
-        // Save SP_EL0, ELR_EL1, SPSR_EL1.
+        // Save SP_EL0, SPSR_EL1. (ESR_EL1 and ELR_EL1 were saved
+        // at the top to capture them before any chance of sub-trap
+        // clobbering.)
         mrs     x1, sp_el0
         str     x1, [x0, #40]
-        mrs     x1, elr_el1
-        str     x1, [x0, #32]
         mrs     x1, spsr_el1
         str     x1, [x0, #48]
 
@@ -140,9 +156,59 @@ uservec_sync:
 
 .global uservec_irq
 uservec_irq:
-        // For now route to the same Rust dispatcher — decode_user_trap
-        // checks ESR_EL1 and figures out what to do.
-        b       uservec_sync
+        // IRQ from EL0. ESR_EL1 is UNKNOWN per ARM ARM, so we must
+        // tag the trapframe to tell decode_user_trap "ignore ESR;
+        // this was an IRQ". Mirror uservec_sync's register save
+        // plumbing otherwise.
+        msr     tpidrro_el0, x0
+        mrs     x0, tpidr_el1
+
+        // Stash ELR (still valid for IRQ — pre-exception PC) and
+        // mark trap_kind = 1 (IRQ). Skip ESR entirely.
+        msr     tpidr_el1, x1
+        mrs     x1, elr_el1
+        str     x1, [x0, #32]
+        mov     x1, #1
+        str     x1, [x0, #312]
+        mrs     x1, tpidr_el1
+        msr     tpidr_el1, x0
+
+        // Save x1..x30.
+        stp     x1,  x2,  [x0, #64]
+        stp     x3,  x4,  [x0, #80]
+        stp     x5,  x6,  [x0, #96]
+        stp     x7,  x8,  [x0, #112]
+        stp     x9,  x10, [x0, #128]
+        stp     x11, x12, [x0, #144]
+        stp     x13, x14, [x0, #160]
+        stp     x15, x16, [x0, #176]
+        stp     x17, x18, [x0, #192]
+        stp     x19, x20, [x0, #208]
+        stp     x21, x22, [x0, #224]
+        stp     x23, x24, [x0, #240]
+        stp     x25, x26, [x0, #256]
+        stp     x27, x28, [x0, #272]
+        stp     x29, x30, [x0, #288]
+        mrs     x1, tpidrro_el0
+        str     x1, [x0, #56]
+
+        // SP_EL0, SPSR_EL1 — needed for return-to-user.
+        mrs     x1, sp_el0
+        str     x1, [x0, #40]
+        mrs     x1, spsr_el1
+        str     x1, [x0, #48]
+
+        // Load kernel state and jump into rust_usertrap.
+        ldr     x1, [x0, #0]
+        ldr     x2, [x0, #8]
+        ldr     x3, [x0, #16]
+        msr     ttbr0_el1, x1
+        dsb     ish
+        tlbi    vmalle1is
+        dsb     ish
+        isb
+        mov     sp, x2
+        br      x3
 
 .global bad_trampoline_trap
 bad_trampoline_trap:

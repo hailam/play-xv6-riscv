@@ -202,10 +202,22 @@ impl Hal for AArch64 {
     }
 
     fn decode_user_trap(_tf: &mut Self::TrapFrame) -> UserTrapCause {
-        // The trampoline already saved ELR_EL1/SPSR_EL1/SP_EL0 into
-        // the trapframe before we got here. ESR_EL1 and FAR_EL1 are
-        // still live (interrupts are off across the dispatch).
-        let esr = csr::read_esr_el1();
+        // The trampoline tagged this trap as sync (0) or IRQ (1).
+        // IRQ entry path leaves ESR_EL1 in an UNKNOWN state per
+        // ARM ARM, so we *must* dispatch on trap_kind, not ESR.
+        if _tf.trap_kind == 1 {
+            // IRQ from EL0. Defer the GIC-claim / dispatch to
+            // Hal::handle_external_irq (the same path kernel-mode
+            // IRQs use). Just signal Devintr; the executor's
+            // usertrap loop will call handle_external_irq.
+            return UserTrapCause::Devintr;
+        }
+        // ESR captured at trap time by trampoline (`tf.esr_el1`).
+        // Reading the live CSR was racy: an IRQ during the
+        // trap-dispatch window leaves ESR_EL1 UNKNOWN. FAR_EL1 is
+        // overwritten only by faulting accesses, so reading it
+        // from CSR is still fine for page-fault paths.
+        let esr = _tf.esr_el1;
         let far = csr::read_far_el1();
         let ec = (esr >> 26) & 0x3F;
         match ec {
@@ -270,3 +282,4 @@ impl Hal for AArch64 {
         pagetable::install_free_frame(free);
     }
 }
+

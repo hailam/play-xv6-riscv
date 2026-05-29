@@ -14,7 +14,18 @@ pub struct TrapFrame {
     pub elr_el1: u64,        // ELR_EL1 = epc
     pub sp_el0: u64,         // SP_EL0 = user sp
     pub spsr_el1: u64,
-    pub x: [u64; 31],        // x0..x30
+    pub x: [u64; 31],        // x0..x30  — offsets 56..304
+    /// ESR_EL1 captured at trap time by the trampoline. We must
+    /// stash this because per ARM ARM, an IRQ taken to EL1 leaves
+    /// ESR_EL1 in an UNKNOWN state, and even a brief window
+    /// between the user-mode SVC and `decode_user_trap` is enough
+    /// to lose the original syscall EC bits — surfacing as
+    /// sporadic "unknown syscall nr" log lines under any load.
+    pub esr_el1: u64,        // offset 304
+    /// Trap kind, written by the trampoline:
+    ///   0 = synchronous (use esr_el1 for EC decode)
+    ///   1 = IRQ (esr_el1 is UNKNOWN per ARM ARM; ignore it)
+    pub trap_kind: u64,      // offset 312
 }
 
 impl TrapFrameAccess for TrapFrame {
