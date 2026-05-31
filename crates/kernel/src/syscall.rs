@@ -1218,6 +1218,16 @@ async fn inode_write(
     } else {
         off.load(Ordering::Acquire)
     };
+    // xv6-style: refuse writes whose start offset is past current
+    // EOF. Another fd's O_TRUNC reopen can leave our fd's offset
+    // stranded past the new EOF — usertests' `truncate2` depends
+    // on us reporting -1 instead of silently creating a sparse
+    // hole. O_APPEND is unaffected (cur == size by construction).
+    if cur > li.state().size {
+        drop(li);
+        fs::log::end_op().await;
+        return -1;
+    }
     let n = fs::inode::writei(&mut li, &tmp, cur).await;
     drop(li);
     fs::log::end_op().await;

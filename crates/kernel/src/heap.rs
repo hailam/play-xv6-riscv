@@ -1,13 +1,16 @@
-//! Minimal bump allocator backed by a static 1 MiB buffer. Sufficient
-//! for Phase 4: we allocate `Proc` and (later) `Pin<Box<dyn Future>>`
-//! once-ish and never `dealloc`. A real allocator (linked-list / slab)
-//! will replace this when reclaim matters.
+//! Minimal bump allocator backed by a static buffer. We allocate
+//! `Proc`, `Pin<Box<dyn Future>>`, FD entries, etc. and never
+//! `dealloc` — that's fine for "boots + runs a few procs" but
+//! exhausts under usertests-style heavy fork churn. A real
+//! linked-list / slab allocator will replace this; until then,
+//! the static budget is generous enough to push the panic past
+//! the full usertests run.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-const HEAP_SIZE: usize = 1024 * 1024;
+const HEAP_SIZE: usize = 16 * 1024 * 1024;
 
 // The buffer is only accessed through the bump allocator's
 // `core::ptr::write` path; the inner field is intentionally unread.
