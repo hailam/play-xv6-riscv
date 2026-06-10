@@ -1,8 +1,34 @@
 # 15: xv6 binary + source compatibility
 
-**Status:** In progress — all named gaps fixed except deferred-disk-format (G1/G3/G9); 8 distinct usertests pass.
-**Estimated remaining:** open-ended usertests sweep; each new failing
-test is its own bug to chase.
+**Status:** DONE (2026-06-10) — the full ported `usertests` suite
+(69 tests) prints **ALL TESTS PASSED on riscv64 AND aarch64**
+(`-smp 1`), including the final lost-free-pages accounting. The last
+13 failures were root-caused and fixed by the kernel-wide correctness
+audit — see [17-correctness-audit](../17-correctness-audit/) for the
+full bug list (lost-wakeup waker class, begin_op livelock, fd
+offset-sharing, fault-type checks, lazy-sbrk/fork interactions, OOM
+leaks, heap allocator replacement, >14-char name truncation).
+
+**G1/G3/G9 (BSIZE 1024 / LOGBLOCKS / sb.nlog): OBSOLETE, won't do.**
+Re-verified before closing: `writebig`/`bigfile` pass at BSIZE=512
+because double-indirect blocks (landed 2026-05-28, after this todo was
+written) raised MAXFILE to ~8 MB — and cross-mounting xv6's actual
+fs.img is impossible regardless of BSIZE because our on-disk inode is
+128 bytes (POSIX mode/uid/gid/timestamps) vs xv6's 64. The disk format
+stays internally consistent at BSIZE=512.
+
+**Deliberate layout divergence (documented, not a bug):** the user
+stack is a fixed 8-page region directly below TRAPFRAME with a guard
+page under it, and sbrk is capped at `HEAPTOP = TRAPFRAME - 9*PGSIZE`
+(xv6 grows heap to TRAPFRAME with the stack low). The ported
+usertests carry this via `USERSTACK 8` / `HEAPTOP` / per-arch `MAXVA`
+defines in `user/usertests.c`.
+
+---
+
+*(Historical write-up below — gap list and progress as of the original
+audit; the "aarch64 unmap_page is a skeleton" note in the bonus-fixes
+section is stale, it has since been fully implemented.)*
 **Depends on:** —
 **Unblocks:** running unmodified xv6 user programs and (eventually)
 xv6's full `usertests.c` against our kernel; mounting xv6's own

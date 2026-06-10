@@ -81,10 +81,12 @@ pub async fn dirlookup(dir: &LockedInode<'_>, name: &str) -> Option<Arc<Inode>> 
 }
 
 fn dirent_name_matches(entry: &Dirent, name: &str) -> bool {
-    let nb = name.as_bytes();
-    if nb.len() > DIRSIZ {
-        return false;
-    }
+    // xv6 silently truncates path components to DIRSIZ everywhere
+    // (namex copies at most DIRSIZ bytes before dirlookup), and
+    // `dirlink` below stores a truncated name — so lookups must
+    // truncate too, or a file created via a >14-char name could never
+    // be opened/unlinked by it (usertests `fourteen`).
+    let nb = &name.as_bytes()[..name.len().min(DIRSIZ)];
     for i in 0..DIRSIZ {
         let want = nb.get(i).copied().unwrap_or(0);
         if entry.name[i] != want {
@@ -95,7 +97,7 @@ fn dirent_name_matches(entry: &Dirent, name: &str) -> bool {
         }
     }
     // Filled the whole name field (no null terminator) and matched.
-    nb.len() == DIRSIZ
+    true
 }
 
 /// Add `(name, inum)` to directory `dir`. Reuses the first free slot

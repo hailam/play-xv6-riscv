@@ -3,7 +3,7 @@
 //! Each entry is an `Arc<Inode>`. Lookups are linear (the pool is
 //! ~50 entries; xv6 does the same). The "sleeplock" that protects
 //! mutable inode state is implemented with `locked: AtomicBool` +
-//! `WakerCell` — `ilock(&ip).await` parks until the lock is free,
+//! `WakerList` — `ilock(&ip).await` parks until the lock is free,
 //! loads from disk if `!valid`, then hands back a `LockedInode<'a>`
 //! RAII guard. Drop releases the lock and wakes any waiter.
 
@@ -22,7 +22,7 @@ use xv6_fs_layout::{
 use crate::driver::bio;
 use crate::fs::superblock;
 use crate::sync::SpinLock;
-use crate::wait::WakerCell;
+use crate::wait::WakerList;
 
 const NINODE_CACHE: usize = 50;
 const INUM_FREE: u32 = u32::MAX;
@@ -63,7 +63,10 @@ pub struct Inode {
     pub inum: AtomicU32,
     pub valid: AtomicBool,
     pub locked: AtomicBool,
-    pub lock_waker: WakerCell,
+    /// Multi-waiter: several tasks can contend for one inode at once
+    /// (e.g. siblings creating files in the same directory) — wake
+    /// them all on unlock; losers re-park.
+    pub lock_waker: WakerList,
     state: UnsafeCell<InodeState>,
 }
 
@@ -80,7 +83,7 @@ impl Inode {
             inum: AtomicU32::new(INUM_FREE),
             valid: AtomicBool::new(false),
             locked: AtomicBool::new(false),
-            lock_waker: WakerCell::new(),
+            lock_waker: WakerList::new(),
             state: UnsafeCell::new(InodeState {
                 typ: 0,
                 major: 0,
@@ -132,7 +135,7 @@ impl<'a> LockedInode<'a> {
 impl<'a> Drop for LockedInode<'a> {
     fn drop(&mut self) {
         self.inode.locked.store(false, Ordering::Release);
-        self.inode.lock_waker.wake();
+        self.inode.lock_waker.wake_all();
     }
 }
 
@@ -780,4 +783,80 @@ pub async fn ialloc(dev: u32, typ: u16, mode: u16) -> Option<Arc<Inode>> {
         }
     }
     None
+}
+
+// ---------- deferred iput (xv6's "last close frees") -----------------------
+
+/// Inodes whose last in-kernel holder may have just dropped while
+/// `nlink == 0`. `Drop` impls (File, Vma, cwd release) can't run an
+/// async log transaction, so they push here and the reaper task —
+/// spawned at boot — does the actual truncate-and-free. False
+/// positives are fine: the reaper re-checks everything under the
+/// inode lock.
+static REAP_QUEUE: SpinLock<Vec<Arc<Inode>>> = SpinLock::new(Vec::new());
+/// Single waiter (the reaper task) by construction, so a one-shot
+/// cell suffices.
+static REAP_WAKER: crate::wait::WakerCell = crate::wait::WakerCell::new();
+
+/// Hand an inode to the reaper. Cheap (lock, push, wake — no awaits),
+/// callable from any Drop impl.
+pub fn iput_deferred(ip: Arc<Inode>) {
+    REAP_QUEUE.lock().push(ip);
+    REAP_WAKER.wake();
+}
+
+struct ReapWait;
+
+impl Future for ReapWait {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // Register first, then re-check (close the wake-loss race).
+        REAP_WAKER.register(cx.waker());
+        if REAP_QUEUE.lock().is_empty() {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+}
+
+/// Kernel task: frees disk inodes whose link count hit zero once the
+/// last holder lets go. Mirrors `unlink_inside_op`'s immediate-free
+/// path (itrunc + typ=0 + iupdate); unlink defers to us whenever fds
+/// are still open on the doomed file.
+pub async fn inode_reaper() {
+    loop {
+        ReapWait.await;
+        loop {
+            let popped = REAP_QUEUE.lock().pop();
+            let Some(ip) = popped else { break };
+            maybe_free(ip).await;
+        }
+    }
+}
+
+async fn maybe_free(ip: Arc<Inode>) {
+    // Anyone else still holding it? cache slot + our Arc = 2; more
+    // means open fds / cwd / VMAs — and THEIR final drop re-enqueues.
+    if Arc::strong_count(&ip) > 2 {
+        return;
+    }
+    let (nlink, typ) = {
+        let li = ilock(&ip).await;
+        (li.state().nlink, li.state().typ)
+    };
+    if nlink != 0 || typ == 0 {
+        return;
+    }
+    // Unlinked files can't be re-opened (no dir entry), so nothing
+    // can gain a new reference between the checks and the free.
+    crate::fs::log::begin_op().await;
+    let mut li = ilock(&ip).await;
+    if li.state().nlink == 0 && li.state().typ != 0 {
+        itrunc(&mut li).await;
+        li.state_mut().typ = 0;
+        iupdate(&li).await;
+    }
+    drop(li);
+    crate::fs::log::end_op().await;
 }

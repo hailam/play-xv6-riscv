@@ -27,7 +27,7 @@ use core::task::{Context, Poll};
 
 use crate::driver::bio::{self, Buffer, BSIZE};
 use crate::sync::SpinLock;
-use crate::wait::WakerCell;
+use crate::wait::WakerList;
 
 pub const LOGSIZE: usize = 30;
 /// Max blocks any one fs operation may write. `begin_op` refuses to
@@ -78,10 +78,11 @@ impl LogState {
 }
 
 static LOG: SpinLock<LogState> = SpinLock::new(LogState::zero());
-/// One-shot waker. Phase 6.5: only one task should be parked here at a
-/// time (`WakerCell` overwrites on second registration). Multi-waiter
-/// queueing is a follow-up.
-static COMMIT_WAKER: WakerCell = WakerCell::new();
+/// Wakes every proc parked in `begin_op` waiting for log space. Several
+/// can be waiting at once (e.g. `fourfiles`/`forkforkfork` run many
+/// concurrent fs ops), so this must be a multi-waiter list — a one-shot
+/// cell would drop all but the last waiter and hang the rest.
+static COMMIT_WAKER: WakerList = WakerList::new();
 
 // ---------- init + recovery ------------------------------------------------
 
@@ -153,9 +154,16 @@ impl Future for WaitCommit {
         // Register first, then re-check — closes the wake-loss race.
         COMMIT_WAKER.register(cx.waker());
         let log = LOG.lock();
-        let busy = log.committing
-            || log.lh.n + MAXOPBLOCKS > LOGSIZE as u32;
-        if !busy {
+        // This MUST mirror begin_op's admission test exactly —
+        // including `outstanding`. An optimistic version that ignored
+        // outstanding returned Ready while begin_op still refused
+        // admission, so the begin_op loop spun synchronously without
+        // ever yielding, and on a cooperative single hart the
+        // in-flight ops never ran to end_op: a total livelock
+        // (usertests fourfiles/manywrites).
+        let admissible = !log.committing
+            && log.lh.n + (log.outstanding + 1) * MAXOPBLOCKS <= LOGSIZE as u32;
+        if admissible {
             return Poll::Ready(());
         }
         Poll::Pending
@@ -192,7 +200,7 @@ pub async fn end_op() {
         } else {
             // Some headroom may have just become available (no, only
             // commit frees the log). But wake waiters defensively.
-            COMMIT_WAKER.wake();
+            COMMIT_WAKER.wake_all();
             false
         }
     };
@@ -202,7 +210,7 @@ pub async fn end_op() {
             let mut log = LOG.lock();
             log.committing = false;
         }
-        COMMIT_WAKER.wake();
+        COMMIT_WAKER.wake_all();
     }
 }
 

@@ -116,8 +116,12 @@ pub struct PageTable {
 
 impl Drop for PageTable {
     fn drop(&mut self) {
-        unsafe {
-            free_subtree(self.root_pa, 2);
+        // root_pa == 0 is the allocation-free `empty()` placeholder; it
+        // owns no frames, so there is nothing to walk or free.
+        if self.root_pa != 0 {
+            unsafe {
+                free_subtree(self.root_pa, 2);
+            }
         }
     }
 }
@@ -197,6 +201,10 @@ impl PageTableOps for PageTable {
     fn new(alloc: &dyn FrameAllocator) -> Result<Self, VmError> {
         let pa = alloc.alloc_zeroed().ok_or(VmError::Oom)?;
         Ok(Self { root_pa: pa })
+    }
+
+    fn empty() -> Self {
+        Self { root_pa: 0 }
     }
 
     fn map(

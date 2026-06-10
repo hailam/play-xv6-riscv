@@ -118,9 +118,18 @@ async fn bringup_then_init() {
         sb.bmapstart + 1,
     );
 
+    // The inode reaper frees unlinked inodes whose last holder just
+    // dropped (Drop impls can't run log transactions themselves).
+    executor::spawn_kernel_on(0, || {
+        alloc::boxed::Box::pin(fs::inode::inode_reaper())
+    });
+
     println!("spawning init proc ({} bytes)", embed::INITCODE.len());
     let init = Arc::new(Proc::new_initcode(embed::INITCODE));
     *init.cwd.lock() = Some(fs::inode::iget(0, 1));
+    // initcode execs /init in place, so this Proc IS init (pid 1) —
+    // exiting procs reparent their children to it.
+    proc::set_init_proc(&init);
     proc::spawn_proc_main(init);
 }
 

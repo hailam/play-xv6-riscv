@@ -1,12 +1,9 @@
-//! Buffer cache. Phase 6c: a fixed-size pool of `Arc<Buffer>`, with
-//! `async fn bread` that returns a buffer ready for use (cached or
-//! freshly read via virtio). Concurrent `bread` calls for the same
-//! block coalesce on the buffer's `io_waker` so only one disk I/O is
-//! issued.
-//!
-//! No eviction yet — NBUF slots are populated lazily and never
-//! reclaimed. Real eviction lands when the inode layer starts
-//! pressuring the cache.
+//! Buffer cache: a fixed-size pool of `Arc<Buffer>`, with `async fn
+//! bread` that returns a buffer ready for use (cached or freshly read
+//! via virtio). Concurrent `bread` calls for the same block coalesce
+//! on the buffer's `io_waker` so only one disk I/O is issued; idle
+//! buffers are evicted LRU. When every buffer is held, `bread` yields
+//! and retries instead of failing.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -21,10 +18,13 @@ use hal::Hal;
 use crate::arch::Arch;
 use crate::driver::virtio_blk;
 use crate::sync::SpinLock;
-use crate::wait::WakerCell;
+use crate::wait::{yield_now, WakerList};
 
 pub const BSIZE: usize = 512;
-const NBUF: usize = 32;
+/// 64 buffers: a committing log transaction pins up to LOGSIZE (30)
+/// of them while concurrent readers hold more; the original 32 ran
+/// out under usertests' multi-proc fs tests.
+const NBUF: usize = 64;
 const BLOCK_INVALID: u32 = u32::MAX;
 
 pub struct Buffer {
@@ -35,8 +35,11 @@ pub struct Buffer {
     data: UnsafeCell<[u8; BSIZE]>,
     pub valid: AtomicBool,
     pub loading: AtomicBool,
-    /// Woken whenever `loading` transitions to false.
-    pub io_waker: WakerCell,
+    /// Woken whenever `loading` transitions to false. Multi-waiter:
+    /// several tasks can miss on the same block at once — one becomes
+    /// the loader and the rest ALL park here, so a single-slot cell
+    /// would lose every waiter but the last.
+    pub io_waker: WakerList,
     /// Monotonic counter bumped on each `bread` hit/load — used for LRU.
     pub last_used: AtomicU64,
 }
@@ -51,7 +54,7 @@ impl Buffer {
             data: UnsafeCell::new([0; BSIZE]),
             valid: AtomicBool::new(false),
             loading: AtomicBool::new(false),
-            io_waker: WakerCell::new(),
+            io_waker: WakerList::new(),
             last_used: AtomicU64::new(0),
         }
     }
@@ -70,8 +73,9 @@ impl Buffer {
     /// either:
     ///   (a) holds the only `Arc<Buffer>` (refcount == 1) — common when
     ///       a single task is preparing a write; or
-    ///   (b) coordinates externally (the future log layer holds a
-    ///       transaction-scoped lock when mutating).
+    ///   (b) coordinates externally (the inode lock for file blocks,
+    ///       `BITMAP_LOCK` for bitmap blocks, the log's commit
+    ///       exclusion for log blocks).
     pub unsafe fn data_mut(&self) -> &mut [u8; BSIZE] {
         &mut *self.data.get()
     }
@@ -113,10 +117,12 @@ enum Role {
 ///
 /// Eviction: an idle valid slot can be repurposed iff its
 /// `Arc::strong_count == 1` (only the cache holds it). Among idle
-/// slots the one with the lowest `last_used` wins.
+/// slots the one with the lowest `last_used` wins. If every buffer is
+/// currently held, yield to the executor and retry — holders release
+/// at their next await.
 pub async fn bread(block_no: u32) -> Arc<Buffer> {
     loop {
-        let (buf, role) = {
+        let decision = {
             let cache = CACHE.lock();
             // 1) Hit?
             let mut hit = None;
@@ -131,7 +137,7 @@ pub async fn bread(block_no: u32) -> Arc<Buffer> {
             if let Some(i) = hit {
                 let b = cache.bufs[i].clone();
                 b.touch();
-                (b, Role::Hit)
+                Some((b, Role::Hit))
             } else {
                 // 2) In-progress loader of the same block?
                 let mut loading = None;
@@ -144,11 +150,9 @@ pub async fn bread(block_no: u32) -> Arc<Buffer> {
                     }
                 }
                 if let Some(i) = loading {
-                    (cache.bufs[i].clone(), Role::Waiter)
-                } else {
-                    // 3) Pick an eviction slot.
-                    let slot = pick_evict_slot(&cache.bufs)
-                        .expect("bio: no evictable buffer (all in use)");
+                    Some((cache.bufs[i].clone(), Role::Waiter))
+                } else if let Some(slot) = pick_evict_slot(&cache.bufs) {
+                    // 3) Claim an eviction slot.
                     let buf = cache.bufs[slot].clone();
                     // Mark invalid + loading inside the lock so a
                     // concurrent `bread` for the old block can't hit
@@ -157,9 +161,19 @@ pub async fn bread(block_no: u32) -> Arc<Buffer> {
                     buf.block_no.store(block_no, Ordering::Release);
                     buf.loading.store(true, Ordering::Release);
                     buf.touch();
-                    (buf, Role::Loader)
+                    Some((buf, Role::Loader))
+                } else {
+                    // Every buffer is held by some task right now.
+                    None
                 }
             }
+        };
+        let Some((buf, role)) = decision else {
+            // All NBUF buffers in use — holders drop their Arcs at
+            // their next await point; one trip around the ready queue
+            // is enough for progress. Never panic here.
+            yield_now().await;
+            continue;
         };
 
         match role {
@@ -171,7 +185,7 @@ pub async fn bread(block_no: u32) -> Arc<Buffer> {
                     .expect("disk read failed");
                 buf.valid.store(true, Ordering::Release);
                 buf.loading.store(false, Ordering::Release);
-                buf.io_waker.wake();
+                buf.io_waker.wake_all();
                 return buf;
             }
             Role::Waiter => {
@@ -218,8 +232,8 @@ fn pick_evict_slot(bufs: &[Arc<Buffer>]) -> Option<usize> {
 /// Flush a buffer's contents back to disk.
 ///
 /// No dirty-bit / writeback batching yet — the caller decides when to
-/// flush. The log layer (Phase 6c.5) will wrap groups of `bwrite`s in a
-/// transaction so they commit atomically.
+/// flush. The log layer wraps groups of `bwrite`s in a transaction so
+/// they commit atomically.
 pub async fn bwrite(buf: &Arc<Buffer>) -> Result<(), virtio_blk::DiskError> {
     let block_no = buf.block_no.load(Ordering::Acquire);
     let addr = buf.data_addr();

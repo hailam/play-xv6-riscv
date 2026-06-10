@@ -165,6 +165,7 @@ fn main() {
     // picolibc — uses `<stdio.h>`/`printf`, linked through xmake's
     // libc.a.
     let programs: &[(&str, &str, Lang, bool, &[Arch], Runtime)] = &[
+        ("init", "INIT_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
         ("echo", "ECHO_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
         ("hello", "HELLO_BIN_PATH", Lang::Asm, false, &[Arch::Riscv64], Runtime::Ulib),
         ("pipetest", "PIPETEST_BIN_PATH", Lang::Asm, false, &[Arch::Riscv64], Runtime::Ulib),

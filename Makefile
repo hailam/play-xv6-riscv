@@ -38,7 +38,7 @@ $(MKFS):
 fs.img: build $(MKFS)
 	$(MKFS) $@ \
 		README:crates/kernel/user/README \
-		init:$(USER_DIR)/initcode.elf \
+		init:$(USER_DIR)/init.elf \
 		echo:$(USER_DIR)/echo.elf \
 		sh:$(USER_DIR)/sh.elf \
 		cat:$(USER_DIR)/cat.elf \
@@ -106,7 +106,7 @@ build-aarch64:
 fs-aarch64.img: build-aarch64 $(MKFS)
 	$(MKFS) $@ \
 		README:crates/kernel/user/README \
-		init:$(AARCH64_USER_DIR)/initcode.elf \
+		init:$(AARCH64_USER_DIR)/init.elf \
 		echo:$(AARCH64_USER_DIR)/echo.elf \
 		sh:$(AARCH64_USER_DIR)/sh.elf \
 		cat:$(AARCH64_USER_DIR)/cat.elf \

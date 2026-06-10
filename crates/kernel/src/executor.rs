@@ -64,6 +64,11 @@ struct PerCpuExec {
     tasks: SpinLock<Vec<Option<Task>>>,
     ready: SpinLock<VecDeque<TaskId>>,
     next_slot: AtomicU32,
+    /// Slots whose task completed — reused by `insert_task` so the
+    /// `tasks` Vec (and the 24-bit slot space) doesn't grow forever
+    /// under fork churn. A stale tid for a reused slot just causes a
+    /// spurious poll, which every future tolerates.
+    free_slots: SpinLock<Vec<u32>>,
 }
 
 impl PerCpuExec {
@@ -72,6 +77,7 @@ impl PerCpuExec {
             tasks: SpinLock::new(Vec::new()),
             ready: SpinLock::new(VecDeque::new()),
             next_slot: AtomicU32::new(0),
+            free_slots: SpinLock::new(Vec::new()),
         }
     }
 }
@@ -114,9 +120,9 @@ where
 {
     let home = pick_home_cpu();
     let future = future_fn(proc.clone());
-    let tid = insert_task(home, Task { proc: Some(proc.clone()), future });
-    proc.task_id.store(tid, Ordering::Relaxed);
-    tid
+    // `insert_task` publishes proc.task_id before the task becomes
+    // runnable — don't store it here, that would be after the enqueue.
+    insert_task(home, Task { proc: Some(proc.clone()), future })
 }
 
 /// Spawn a kernel-only task on a specific CPU — no Proc, no
@@ -135,8 +141,21 @@ where
 
 fn insert_task(home: usize, task: Task) -> TaskId {
     let exec = &EXECUTORS[home];
-    let slot = exec.next_slot.fetch_add(1, Ordering::Relaxed);
+    let slot = exec
+        .free_slots
+        .lock()
+        .pop()
+        .unwrap_or_else(|| exec.next_slot.fetch_add(1, Ordering::Relaxed));
+    // Hard check (the make_tid debug_assert vanishes in release): a
+    // 2^24-slot overflow would silently corrupt the tid's cpu field.
+    assert!(slot <= SLOT_MASK, "executor: out of task slots");
     let tid = make_tid(home, slot);
+    // Publish the tid on the proc BEFORE the task is reachable from a
+    // ready queue: once enqueued, another hart can run it, trap, and
+    // need `proc.task_id` for the wake — a late store loses that wake.
+    if let Some(p) = &task.proc {
+        p.task_id.store(tid, Ordering::Release);
+    }
     {
         let mut tasks = exec.tasks.lock();
         while tasks.len() <= slot as usize {
@@ -205,6 +224,12 @@ pub fn run() -> ! {
 
         if poll.is_pending() {
             exec.tasks.lock()[slot] = Some(task);
+        } else {
+            // Task finished — `task` (and its Arc<Proc>) drops here.
+            // Clear the raw current-proc pointer so it can't dangle,
+            // and recycle the slot.
+            cpu::set_current_proc(core::ptr::null_mut());
+            exec.free_slots.lock().push(slot as u32);
         }
 
         if let Some(target) = cpu::take_user_target() {

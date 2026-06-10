@@ -115,8 +115,13 @@ pub fn load_program(
         let mut va = seg_start;
         while va < seg_end {
             let pa = KFRAMES.alloc_zeroed().ok_or(ElfError::Oom)?;
-            pt.map(va, pa, PGSIZE, perm, &KFRAMES)
-                .map_err(|_| ElfError::MapFailed)?;
+            if pt.map(va, pa, PGSIZE, perm, &KFRAMES).is_err() {
+                // `pa` never became reachable from the pagetable —
+                // free it or each failed exec leaks a frame
+                // (usertests `execout` counts free pages).
+                unsafe { KFRAMES.free(pa) };
+                return Err(ElfError::MapFailed);
+            }
 
             // Copy file bytes into the new page where they overlap
             // with [vaddr, vaddr+filesz). Anything outside is zero from

@@ -209,6 +209,12 @@ pub enum VmError {
 pub trait PageTableOps: Sized {
     fn new(alloc_frame: &dyn FrameAllocator) -> Result<Self, VmError>;
 
+    /// An empty placeholder table that owns no frames: allocation-free to
+    /// construct and a no-op to drop. Used to vacate a proc's pagetable
+    /// during exit teardown without allocating under memory pressure — the
+    /// old table is swapped out for this, then dropped to reclaim frames.
+    fn empty() -> Self;
+
     /// Map `va..va+size` to `pa..pa+size` with the given perms.
     /// `va`, `pa`, `size` must each be page-aligned.
     fn map(

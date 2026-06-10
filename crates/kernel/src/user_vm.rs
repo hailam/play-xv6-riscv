@@ -75,8 +75,12 @@ pub fn build_image_from_elf(
     for i in 0..STACK_PAGES {
         let pa = KFRAMES.alloc_zeroed().ok_or(UserVmError::Oom)?;
         let va = STACK_VA_BASE + i * PGSIZE;
-        pt.map(va, pa, PGSIZE, PtePerm::URW, &KFRAMES)
-            .map_err(|_| UserVmError::MapFailed)?;
+        if pt.map(va, pa, PGSIZE, PtePerm::URW, &KFRAMES).is_err() {
+            // Not reachable from the pagetable on failure — free it
+            // or each failed exec leaks a frame.
+            unsafe { KFRAMES.free(pa) };
+            return Err(UserVmError::MapFailed);
+        }
         if i == STACK_PAGES - 1 {
             top_stack_pa = pa;
         }

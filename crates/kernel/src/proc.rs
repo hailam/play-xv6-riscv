@@ -47,8 +47,35 @@ pub enum TrapEvent {
     Timer,
     Devintr,
     /// User-mode page fault. Handled asynchronously in `proc_main`
-    /// so file-backed mmap can `await` an inode read.
-    PageFault { va: usize },
+    /// so file-backed mmap can `await` an inode read. `write`
+    /// distinguishes store faults so a write to a mapped read-only
+    /// page is killed instead of being "handled" into an infinite
+    /// fault loop.
+    PageFault { va: usize, write: bool },
+}
+
+/// Maximum number of live processes (running + zombie-not-yet-reaped),
+/// matching xv6's NPROC. `fork` returns -1 once this many exist, so a
+/// fork bomb (e.g. usertests' `forkforkfork`) fails gracefully instead
+/// of exhausting memory. `usertests.c` references the same value.
+pub const NPROC: usize = 64;
+
+/// Count of live `Proc`s. Incremented in `with_layout` (the single
+/// constructor) and decremented in `Drop for Proc`.
+static LIVE_PROCS: AtomicUsize = AtomicUsize::new(0);
+
+/// The init process (pid 1). Exiting procs reparent their children
+/// here (xv6 semantics) so orphans are reaped promptly by init's
+/// wait loop instead of pinning zombie subtrees — and the NPROC cap —
+/// until some ancestor is reaped.
+static INIT_PROC: SpinLock<Option<Arc<Proc>>> = SpinLock::new(None);
+
+pub fn set_init_proc(p: &Arc<Proc>) {
+    *INIT_PROC.lock() = Some(Arc::clone(p));
+}
+
+pub fn init_proc() -> Option<Arc<Proc>> {
+    INIT_PROC.lock().clone()
 }
 
 pub struct Proc {
@@ -134,6 +161,19 @@ pub struct Vma {
     pub file_offset: u64,
 }
 
+impl Drop for Vma {
+    fn drop(&mut self) {
+        // A file-backed VMA can be the last holder of an unlinked
+        // inode (mmap then close(fd) then unlink) — hand it to the
+        // reaper so the disk inode gets freed. False positives are
+        // fine; the reaper re-checks. (Vma is Clone — fork/munmap
+        // clones also enqueue, harmlessly.)
+        if let Some(ip) = self.file.take() {
+            crate::fs::inode::iput_deferred(ip);
+        }
+    }
+}
+
 impl Proc {
     pub fn new_initcode(initcode_elf: &[u8]) -> Self {
         let tf_pa = KFRAMES.alloc_zeroed().expect("kalloc TRAPFRAME");
@@ -153,9 +193,29 @@ impl Proc {
     }
 
     pub fn fork_from(parent: &Arc<Proc>) -> Option<Self> {
+        // Enforce the live-process cap so a fork bomb fails with -1
+        // rather than exhausting memory (xv6 caps the proc table at
+        // NPROC). Zombies count until reaped, matching xv6.
+        if LIVE_PROCS.load(Ordering::Acquire) >= NPROC {
+            return None;
+        }
+        let tf_pa = KFRAMES.alloc_zeroed()?;
+        match Self::fork_from_inner(parent, tf_pa) {
+            Some(child) => Some(child),
+            None => {
+                // The trapframe is mapped non-USER, so the pagetable
+                // Drop inside fork_from_inner deliberately skips it —
+                // free it explicitly or every failed fork leaks a
+                // frame (usertests `execout` counts free pages).
+                unsafe { KFRAMES.free(tf_pa) };
+                None
+            }
+        }
+    }
+
+    fn fork_from_inner(parent: &Arc<Proc>, tf_pa: usize) -> Option<Self> {
         let code_end = parent.size.load(Ordering::Relaxed);
 
-        let tf_pa = KFRAMES.alloc_zeroed()?;
         let mut pt = <Arch as Hal>::PageTable::new(&KFRAMES).ok()?;
         pt.map(TRAMPOLINE, trampoline_pa(), PGSIZE, PtePerm::RX, &KFRAMES)
             .ok()?;
@@ -164,10 +224,16 @@ impl Proc {
 
         let parent_pt = parent.pagetable.lock();
 
-        // Code/data pages.
+        // Code/data pages. A lazy sbrk region can leave holes below
+        // `size` that were never faulted in — skip them so the child
+        // inherits the hole (it'll demand-fault its own zero page),
+        // instead of failing the whole fork (usertests lazy_copy).
         let mut va = 0;
         while va < code_end {
-            let (parent_pa, perm) = parent_pt.translate(va)?;
+            let Some((parent_pa, perm)) = parent_pt.translate(va) else {
+                va += PGSIZE;
+                continue;
+            };
             let child_pa = KFRAMES.alloc_zeroed()?;
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -204,22 +270,13 @@ impl Proc {
         *child_tf = *parent_tf;
         child_tf.set_arg(0, 0);
 
-        // Fork copies the fd table — each child slot gets a fresh
-        // `Arc<File>` cloned from the parent's (so pipe ref counts
-        // bump in `File::Clone`), while the cloexec/nonblock flags
-        // carry over byte-for-byte.
-        let child_files: Vec<Option<crate::file::FdEntry>> = parent
-            .files
-            .lock()
-            .iter()
-            .map(|slot| {
-                slot.as_ref().map(|e| crate::file::FdEntry {
-                    file: Arc::new((*e.file).clone()),
-                    cloexec: e.cloexec,
-                    nonblock: e.nonblock,
-                })
-            })
-            .collect();
+        // Fork SHARES each open file description with the child:
+        // `FdEntry::clone` Arc-clones the `File`, so the seek offset
+        // is shared (POSIX; usertests sharedfd) and pipe end counts —
+        // one per description — are untouched. The count drops only
+        // when the last fd anywhere closes (`Drop for File`).
+        let child_files: Vec<Option<crate::file::FdEntry>> =
+            parent.files.lock().iter().map(|slot| slot.clone()).collect();
 
         let child = Self::with_layout(pt, tf_pa, code_end, child_files);
         // Child inherits the parent's cwd (Arc clone — same inode).
@@ -246,6 +303,7 @@ impl Proc {
         size: usize,
         files: Vec<Option<crate::file::FdEntry>>,
     ) -> Self {
+        LIVE_PROCS.fetch_add(1, Ordering::AcqRel);
         Self {
             pid: next_pid(),
             state: AtomicI32::new(ProcState::Runnable as i32),
@@ -468,6 +526,7 @@ impl Proc {
 
 impl Drop for Proc {
     fn drop(&mut self) {
+        LIVE_PROCS.fetch_sub(1, Ordering::AcqRel);
         // The pagetable's own Drop already frees user pages +
         // intermediate tables; the trapframe was allocated separately
         // (it's mapped into the pagetable without PTE_U so the
@@ -506,8 +565,8 @@ async fn proc_main(proc: Arc<Proc>) {
                 proc.trapframe().set_arg(0, ret as u64);
             }
             TrapEvent::Timer | TrapEvent::Devintr => {}
-            TrapEvent::PageFault { va } => {
-                let mapped = syscall::lazy_map_page_async(&proc, va).await;
+            TrapEvent::PageFault { va, write } => {
+                let mapped = syscall::lazy_map_page_async(&proc, va, write).await;
                 if !mapped {
                     crate::println!(
                         "usertrap: pid {} page fault va={:#x} -> killed",

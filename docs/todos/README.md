@@ -10,20 +10,26 @@ directory contains a `README.md` with the plan/summary, plus optional
 
 | Bucket | Count | What's in it |
 |---|---|---|
-| `done/` | 30 | Through aarch64 SMP — Phase A-F complete, interactive shell on -smp 4 |
-| `pending/` | 3 | xv6 compat tail + POSIX (libc-glue done; libc port + sockets outstanding) + phase-2 GUI |
+| `done/` | 33 | Through proc/file lifecycle (real init + reparenting + inode reaper) — **full suite (70 tests) passes on riscv64 AND aarch64** (`-smp 1`) |
+| `pending/` | 4 | SMP hardening + fs/console robustness + POSIX sockets + phase-2 GUI |
 | `revisit/` | 3 | Decisions to potentially revisit later |
 
 ## Pending — priority order
 
-1. [16-posix-compat](pending/16-posix-compat/) — Tiers 1-5 + 8
-   **kernel-side done**; 62 syscalls landed across both arches.
-   Outstanding: Tier 6 (Unix-domain sockets), Tier 7 (TCP/IP +
-   AF_INET), Tier 8's actual libc port (newlib/musl).
-2. [15-xv6-compat](pending/15-xv6-compat/) — close remaining
-   cross-mount gaps (G1/G3/G9) and the lost-free-pages soft check
-   under `usertests`.
-3. [12-phase2-gui](pending/12-phase2-gui/) — minimal
+1. [19-smp-hardening](pending/19-smp-hardening/) — cross-hart wake
+   IPI, mid-poll proc visibility (cross-hart kill / alarm drops),
+   shared-buffer write discipline. **Known starting point: `usertests`
+   at `-smp 3` hangs early** (passes at `-smp 1`). Gate: full suite at
+   `-smp 3/4`, both arches.
+2. [20-fs-console-robustness](pending/20-fs-console-robustness/) —
+   sparse-hole reads (user-reachable bmap asserts / boot-block reads
+   via ftruncate), iget cache-full wait, lazy demand-map in
+   copyin/copyout, console line discipline (^D/erase/echo),
+   console_write chunking, poll waker registration.
+3. [16-posix-compat](pending/16-posix-compat/) — re-scoped: picolibc +
+   bc/dc/lua already run in-tree; what remains is sockets (AF_UNIX,
+   then TCP/IP via smoltcp + virtio-net).
+4. [12-phase2-gui](pending/12-phase2-gui/) — minimal
    framebuffer-backed display.
 
 ## Done — chronological
@@ -59,18 +65,27 @@ directory contains a `README.md` with the plan/summary, plus optional
 | 26 | [smp-user-procs](done/26-smp-user-procs/) | +150 (+25 user) |
 | 27 | [aarch64-hal-skeleton](done/27-aarch64-hal-skeleton/) | +210 (hal-aarch64) |
 | 28 | [fs-polish](done/28-fs-polish/) | +180 (+80 user) |
-| 29 | [aarch64-completion](done/14-aarch64-completion/) | +1500 (hal-aarch64 + user-aarch64) — boots interactive shell under qemu-system-aarch64 -smp 4 |
+| 29 | [aarch64-completion](done/14-aarch64-completion/) | +1500 — boots interactive shell under qemu-system-aarch64 -smp 4 |
+| 30 | [xv6-compat](done/15-xv6-compat/) | (spread) — **full usertests suite passes, both arches**; G1/G3/G9 ruled obsolete |
+| 31 | [correctness-audit](done/17-correctness-audit/) | +750/−287 — kernel-wide audit; lost-wakeup waker class, begin_op livelock, free-list heap allocator, fd description sharing, fault-type checks, OOM leak fixes |
+| 32 | [proc-lifecycle](done/18-proc-lifecycle/) | ~+330 — real init (pid 1) + orphan reparenting, deferred-iput inode reaper, executor slot reuse; +2 regression tests |
 
-Current kernel totals: **~6,555 LoC, ~158 unsafe-ish lines** (~2.4%,
-well inside the 700-line budget). Plus ~270 LoC host code in `mkfs/`,
-~40 LoC in the shared `xv6-fs-layout` crate, ~575 LoC user code, and
-~210 LoC in `hal-aarch64` (skeleton).
+(Rows 30/31 live in `done/15-xv6-compat` and `done/17-correctness-audit`
+— their numeric directory prefixes collide with older done entries; the
+table is chronological.)
 
 ## Revisit
 
-- [futures-task-dep](revisit/futures-task-dep/) — hand-rolled waker plumbing; consider `futures-task` if it bites
-- [strip-elf-size](revisit/strip-elf-size/) — `sh.elf` is 1.2 KB after `--strip-all`; could be smaller
-- [sync-virtio-fallback](revisit/sync-virtio-fallback/) — `sync_read_block` exists but no longer used
+- [futures-task-dep](revisit/futures-task-dep/) — hand-rolled waker
+  plumbing; consider `futures-task` if it bites. *(2026-06-10 note:
+  its "our WakerCell is fine as-is" claim aged poorly — the audit
+  found five multi-waiter sites that needed a hand-rolled `WakerList`
+  with wake_all. The hand-rolled path still held up; revisit only if
+  waker complexity keeps growing.)*
+- [strip-elf-size](revisit/strip-elf-size/) — `sh.elf` is 1.2 KB after
+  `--strip-all`; could be smaller
+- [sync-virtio-fallback](revisit/sync-virtio-fallback/) —
+  `sync_read_block` exists but no longer used
 
 ## Workflow
 

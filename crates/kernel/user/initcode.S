@@ -1,5 +1,6 @@
 #
-# initcode — first user proc; immediately execs /sh.
+# initcode — first user proc; immediately execs /init (the real init,
+# which forks /sh and loops in wait() reaping reparented orphans).
 #
 
 .attribute arch, "rv64gc"
@@ -7,7 +8,7 @@
 .section .text
 .global _start
 _start:
-        la      a0, sh_path
+        la      a0, init_path
         li      a1, 0
         li      a7, 7                # SYS_EXEC
         ecall
@@ -16,5 +17,5 @@ _start:
         ecall
 1:      j       1b
 
-sh_path:
-        .asciz "/sh"
+init_path:
+        .asciz "/init"

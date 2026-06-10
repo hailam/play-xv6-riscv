@@ -45,12 +45,14 @@ pub extern "C" fn rust_usertrap() -> ! {
             Arch::handle_external_irq();
             TrapEvent::Devintr
         }
-        UserTrapCause::PageFault { va, write: _ } => {
+        UserTrapCause::PageFault { va, write } => {
             // Defer to proc_main's async loop so the handler can
             // `.await` inode reads for file-backed mmap. Don't
             // advance epc — re-execute the trapping instruction
-            // once the page is mapped.
-            TrapEvent::PageFault { va }
+            // once the page is mapped. `write` rides along so a
+            // store to a mapped read-only page is killed rather
+            // than retried forever.
+            TrapEvent::PageFault { va, write }
         }
         UserTrapCause::Unknown { code, va } => {
             crate::println!(

@@ -17,7 +17,7 @@ use hal::Hal;
 
 use crate::arch::Arch;
 use crate::sync::SpinLock;
-use crate::wait::WakerCell;
+use crate::wait::{WakerCell, WakerList};
 
 use crate::arch::VIRTIO0;
 
@@ -179,6 +179,10 @@ static DISK: SpinLock<DiskState> = SpinLock::new(DiskState {
 
 static COMPLETED: [AtomicBool; NUM] = [const { AtomicBool::new(false) }; NUM];
 static WAKERS: [WakerCell; NUM] = [const { WakerCell::new() }; NUM];
+/// Tasks parked waiting for free descriptors. With NUM=8 and 3
+/// descriptors per request, only two requests fit in flight; further
+/// concurrent submitters wait here until `finish` frees a chain.
+static DESC_WAITERS: WakerList = WakerList::new();
 
 /// Count of submitted I/O ops since boot — used by bio's smoke test
 /// to observe cache hits (no new I/O issued).
@@ -343,7 +347,7 @@ pub async fn read_block_async(
     sector: u64,
     buf_addr: usize,
 ) -> Result<(), DiskError> {
-    let head = submit_chain(sector, buf_addr as *mut u8, false)?;
+    let head = submit_chain_wait(sector, buf_addr, false).await;
     BlockOp { head }.await;
     finish(head)
 }
@@ -353,9 +357,39 @@ pub async fn write_block_async(
     sector: u64,
     buf_addr: usize,
 ) -> Result<(), DiskError> {
-    let head = submit_chain(sector, buf_addr as *mut u8, true)?;
+    let head = submit_chain_wait(sector, buf_addr, true).await;
     BlockOp { head }.await;
     finish(head)
+}
+
+/// Submit a request, parking until descriptors are available instead
+/// of failing: descriptor exhaustion is a transient queue-full state,
+/// not an error the fs layer can act on (`bread` used to panic on it
+/// whenever a third concurrent disk op was issued).
+async fn submit_chain_wait(sector: u64, buf_addr: usize, write: bool) -> usize {
+    loop {
+        match submit_chain(sector, buf_addr as *mut u8, write) {
+            Ok(head) => return head,
+            Err(DiskError::NoFreeDescriptor) => DescWait.await,
+            Err(e) => panic!("virtio submit: {e:?}"),
+        }
+    }
+}
+
+struct DescWait;
+
+impl Future for DescWait {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // Register first, then re-check (close the wake-loss race).
+        DESC_WAITERS.register(cx.waker());
+        let state = DISK.lock();
+        let free = state.free.iter().filter(|f| **f).count();
+        if free >= 3 {
+            return Poll::Ready(());
+        }
+        Poll::Pending
+    }
 }
 
 struct BlockOp {
@@ -451,6 +485,8 @@ fn finish(head: usize) -> Result<(), DiskError> {
         let mut state = DISK.lock();
         free_chain(&mut state, head);
     }
+    // Descriptors freed — wake everyone parked in `submit_chain_wait`.
+    DESC_WAITERS.wake_all();
     if status == 0 {
         Ok(())
     } else {

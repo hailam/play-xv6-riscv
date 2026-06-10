@@ -413,7 +413,10 @@ async fn sys_sbrk(proc: &Arc<Proc>, n: i64, lazy: i64) -> i64 {
     if n < 0 {
         let shrink = (-n) as usize;
         if shrink > old {
-            return -1;
+            // xv6 semantics: an over-shrink is a no-op returning the
+            // old break (uvmdealloc clamps), not an error — usertests
+            // lazy_copy does sbrk(-(sbrk(0)+1)) and expects this.
+            return old as i64;
         }
         let new_size = old - shrink;
         // Unmap every fully-shrunk page and return its frame to the
@@ -498,7 +501,11 @@ async fn sys_sbrk(proc: &Arc<Proc>, n: i64, lazy: i64) -> i64 {
 /// Async page-fault handler called from `proc_main` on a
 /// `TrapEvent::PageFault`. File-backed mmap reads from disk → must
 /// be awaitable.
-pub async fn lazy_map_page_async(proc: &Arc<Proc>, fault_va: usize) -> bool {
+pub async fn lazy_map_page_async(
+    proc: &Arc<Proc>,
+    fault_va: usize,
+    write: bool,
+) -> bool {
     let page = fault_va & !(PGSIZE - 1);
     let size = proc.size.load(Ordering::Acquire);
 
@@ -536,10 +543,21 @@ pub async fn lazy_map_page_async(proc: &Arc<Proc>, fault_va: usize) -> bool {
         Source::Anon(p) | Source::File(_, _, p) => vma_prot_to_pteperm(*p),
     };
 
-    // Already mapped? Could happen if two harts faulted at once.
+    // Already mapped? Then this fault is a PERMISSION fault — e.g. a
+    // store to the R-X code page (usertests `nowrite` writes to VA 0)
+    // or a user access to a non-USER page like TRAPFRAME. "Handling"
+    // it would re-execute the same instruction into an infinite fault
+    // loop, so only a genuinely sufficient mapping (benign race with
+    // another hart's fault) counts as handled.
     {
         let pt = proc.pagetable.lock();
-        if pt.translate(page).is_some() {
+        if let Some((_, mapped_perm)) = pt.translate(page) {
+            if mapped_perm.0 & PtePerm::USER == 0 {
+                return false;
+            }
+            if write && mapped_perm.0 & PtePerm::WRITE == 0 {
+                return false;
+            }
             return true;
         }
     }
@@ -832,9 +850,42 @@ async fn sys_exit_inner(proc: &Arc<Proc>, code: i32) -> i64 {
     // user data pages, heap, and L1/L0 table pages. After this the
     // proc is a Zombie; its parent will reap the (already-small)
     // remaining `Proc` via `wait`.
-    let fresh = <Arch as Hal>::PageTable::new(&KFRAMES).expect("exit: dummy pt");
+    // Vacate the user pagetable with an allocation-free placeholder, then
+    // drop the old one to reclaim its frames. Allocating here (as `new`
+    // would) can OOM during teardown under memory pressure (e.g. the
+    // `forkforkfork` fork bomb) — and exit's whole job is to *free* memory,
+    // so it must not itself require any.
+    let fresh = <Arch as Hal>::PageTable::empty();
     let old_pt = core::mem::replace(&mut *proc.pagetable.lock(), fresh);
     drop(old_pt); // <- triggers `Drop for PageTable`
+
+    // Release the cwd inode reference and let the reaper check it —
+    // a proc can exit with its cwd inside an unlinked directory.
+    if let Some(cwd) = proc.cwd.lock().take() {
+        fs::inode::iput_deferred(cwd);
+    }
+
+    // Reparent children to init (xv6 semantics): orphans get reaped
+    // promptly by init's wait loop instead of pinning whole zombie
+    // subtrees — and the NPROC cap — until an ancestor is reaped.
+    let kids = core::mem::take(&mut *proc.children.lock());
+    if !kids.is_empty() {
+        if let Some(init) =
+            crate::proc::init_proc().filter(|i| !Arc::ptr_eq(i, proc))
+        {
+            let weak = Arc::downgrade(&init);
+            for k in kids.iter() {
+                *k.parent.lock() = Some(weak.clone());
+            }
+            init.children.lock().extend(kids);
+            // Wake unconditionally — a child may have turned zombie
+            // between any scan and the splice.
+            init.wait_waker.wake();
+        }
+        // No init (or init itself exiting — shouldn't happen):
+        // dropping the Arcs frees zombies immediately; running
+        // children keep their executor Arc and free themselves.
+    }
 
     proc.exit_code.store(code, Ordering::Relaxed);
     proc.state.store(ProcState::Zombie as i32, Ordering::Release);
@@ -874,6 +925,13 @@ async fn sys_waitpid(
 ) -> i64 {
     let filter = if pid > 0 { Some(pid as usize) } else { None };
     let nonblock = (options & WNOHANG) != 0;
+    // Validate the status pointer BEFORE reaping: failing afterwards
+    // would lose the child's exit status forever (it's already been
+    // removed from `children`). The mapping can't change while we're
+    // parked — only this proc's own syscalls modify its pagetable.
+    if status_va != 0 && proc.translate_user_write(status_va).is_none() {
+        return -1;
+    }
     let (reaped_pid, code) =
         match (WaitFor { proc, filter, nonblock }).await {
             WaitOutcome::Reaped(p, c) => (p, c),
@@ -934,6 +992,12 @@ impl Future for WaitFor<'_> {
             let dead = children.remove(i);
             let pid = dead.pid;
             let code = dead.exit_code.load(Ordering::Relaxed);
+            // Drop the reaped Arc OUTSIDE the children lock: this can
+            // cascade-free a whole zombie subtree (recursive Proc +
+            // pagetable Drops), and SpinLock guards keep interrupts
+            // off the entire time.
+            drop(children);
+            drop(dead);
             return Poll::Ready(WaitOutcome::Reaped(pid, code));
         }
         // Filter named a specific pid but we have no child with that
@@ -1189,6 +1253,13 @@ async fn sys_write(proc: &Arc<Proc>, fd: i32, buf_va: usize, len: usize) -> i64 
     }
 }
 
+/// Largest byte count one log transaction may write: xv6 filewrite's
+/// rule — each op may dirty at most a handful of blocks or a single
+/// big `write()` would blow past `begin_op`'s MAXOPBLOCKS reservation
+/// and the LOGSIZE cap ("log overflow" panic).
+const WRITE_CHUNK: usize =
+    ((fs::log::MAXOPBLOCKS as usize - 1 - 1 - 2) / 2) * xv6_fs_layout::BSIZE;
+
 async fn inode_write(
     proc: &Arc<Proc>,
     ip: Arc<crate::fs::inode::Inode>,
@@ -1197,45 +1268,61 @@ async fn inode_write(
     len: usize,
     append: bool,
 ) -> i64 {
-    // Copy user bytes into a kernel buffer first so that writei (which
-    // does many awaits) doesn't have to keep crossing into user VA.
-    let mut tmp = alloc::vec![0u8; len];
-    for i in 0..len {
-        let Some(kva) = proc.translate_user(buf_va + i) else {
-            return -1;
-        };
-        tmp[i] = unsafe { *(kva as *const u8) };
-    }
+    // Split the write into log-sized transactions. The kernel-side
+    // staging buffer is fixed-size — never sized from user `len`
+    // (write(fd, p, -1) must not drive a kernel allocation).
+    let mut tmp = [0u8; WRITE_CHUNK];
+    let mut written = 0usize;
+    while written < len {
+        let chunk = (len - written).min(WRITE_CHUNK);
+        // Copy user bytes in before taking any locks; fail fast on a
+        // bad pointer (partial writes return the partial count, like
+        // xv6 short writes).
+        for i in 0..chunk {
+            let Some(kva) = proc.translate_user(buf_va + written + i) else {
+                return if written == 0 { -1 } else { written as i64 };
+            };
+            tmp[i] = unsafe { *(kva as *const u8) };
+        }
 
-    fs::log::begin_op().await;
-    let mut li = fs::inode::ilock(&ip).await;
-    // O_APPEND: re-read the inode's size *under the lock* and write
-    // from there, ignoring whatever offset the fd holds. This is
-    // POSIX's atomicity guarantee — concurrent appenders never
-    // overwrite each other.
-    let cur = if append {
-        li.state().size
-    } else {
-        off.load(Ordering::Acquire)
-    };
-    // xv6-style: refuse writes whose start offset is past current
-    // EOF. Another fd's O_TRUNC reopen can leave our fd's offset
-    // stranded past the new EOF — usertests' `truncate2` depends
-    // on us reporting -1 instead of silently creating a sparse
-    // hole. O_APPEND is unaffected (cur == size by construction).
-    if cur > li.state().size {
+        fs::log::begin_op().await;
+        let mut li = fs::inode::ilock(&ip).await;
+        // O_APPEND: re-read the inode's size *under the lock* and
+        // write from there (POSIX atomic-append). Plain writes read
+        // the SHARED fd offset under the same lock so concurrent
+        // sharers (fork/dup) serialize instead of clobbering.
+        let cur = if append {
+            li.state().size
+        } else {
+            off.load(Ordering::Acquire)
+        };
+        // xv6-style: refuse writes whose start offset is past current
+        // EOF. Another fd's O_TRUNC reopen can leave our fd's offset
+        // stranded past the new EOF — usertests' `truncate2` depends
+        // on us reporting -1 instead of silently creating a sparse
+        // hole. O_APPEND is unaffected (cur == size by construction).
+        if cur > li.state().size {
+            drop(li);
+            fs::log::end_op().await;
+            return if written == 0 { -1 } else { written as i64 };
+        }
+        let n = fs::inode::writei(&mut li, &tmp[..chunk], cur).await;
+        if n > 0 && !append {
+            // Advance the shared offset before releasing the inode
+            // lock so other sharers never observe a stale value.
+            off.store(cur + n as u32, Ordering::Release);
+        }
         drop(li);
         fs::log::end_op().await;
-        return -1;
+        written += n;
+        if n < chunk {
+            // Disk full or per-file size cap — report the short count.
+            break;
+        }
     }
-    let n = fs::inode::writei(&mut li, &tmp, cur).await;
-    drop(li);
-    fs::log::end_op().await;
-    if n > 0 {
-        off.store(cur + n as u32, Ordering::Release);
-    }
-    n as i64
+    written as i64
 }
+
 
 fn console_write(proc: &Proc, buf_va: usize, len: usize) -> i64 {
     let mut va = buf_va;
@@ -1286,27 +1373,44 @@ async fn inode_read(
     buf_va: usize,
     len: usize,
 ) -> i64 {
-    let cur = off.load(Ordering::Acquire);
-    let mut tmp = alloc::vec![0u8; len];
+    // Inode lock FIRST: the offset read-modify-write and the size
+    // clamp must be atomic across sharers of this open file
+    // description (fork/dup share `off`).
     let li = fs::inode::ilock(&ip).await;
+    let cur = off.load(Ordering::Acquire);
+    let size = li.state().size;
+    if cur >= size {
+        return 0;
+    }
+    // Clamp BEFORE allocating: `len` is raw user input — read(fd,
+    // buf, -1) must not size a kernel allocation (usertests argptest
+    // panicked on exactly that).
+    let want = len.min((size - cur) as usize);
+    let mut tmp = alloc::vec![0u8; want];
     let n = fs::inode::readi(&li, &mut tmp, cur).await;
-    drop(li);
     if n == 0 {
         return 0;
     }
-    // Copy the bytes out into the user buffer, page-aware. Use the
-    // write-checking translate so we refuse to scribble on user
-    // code / RO pages.
+    // Copy out + advance the offset before releasing the lock so
+    // sharers never observe a stale offset (no awaits below). The
+    // write-checking translate refuses to scribble on user code / RO
+    // pages; on a bad buffer we return -1 without advancing, like
+    // xv6's readi-copyout failure.
     let mut copied = 0usize;
+    let mut ret = n as i64;
     while copied < n {
         let Some(kva) = proc.translate_user_write(buf_va + copied) else {
-            return -1;
+            ret = -1;
+            break;
         };
         unsafe { *(kva as *mut u8) = tmp[copied] };
         copied += 1;
     }
-    off.store(cur + n as u32, Ordering::Release);
-    n as i64
+    if ret > 0 {
+        off.store(cur + n as u32, Ordering::Release);
+    }
+    drop(li);
+    ret
 }
 
 async fn console_read(proc: &Proc, buf_va: usize, len: usize, nonblock: bool) -> i64 {
@@ -1384,6 +1488,10 @@ async fn sys_pipe(proc: &Arc<Proc>, pipefd_va: usize) -> i64 {
     for (i, fd) in [rfd, wfd].iter().enumerate() {
         let va = pipefd_va + i * 4;
         let Some(kva) = proc.translate_user_write(va) else {
+            // Bad user pointer: close both ends or the fds leak until
+            // exit (xv6 closes them too).
+            proc.close_fd(rfd);
+            proc.close_fd(wfd);
             return -1;
         };
         unsafe { *(kva as *mut i32) = *fd };
@@ -1424,8 +1532,14 @@ async fn sys_pread(
         return -1;
     }
     let cur = offset as u32;
-    let mut tmp = alloc::vec![0u8; len];
     let li = fs::inode::ilock(ip).await;
+    let size = li.state().size;
+    if cur >= size {
+        return 0;
+    }
+    // Clamp before allocating — `len` is raw user input.
+    let want = len.min((size - cur) as usize);
+    let mut tmp = alloc::vec![0u8; want];
     let n = fs::inode::readi(&li, &mut tmp, cur).await;
     drop(li);
     if n == 0 {
@@ -1469,20 +1583,31 @@ async fn sys_pwrite(
     if !*writable {
         return -1;
     }
-    let mut tmp = alloc::vec![0u8; len];
-    for i in 0..len {
-        let Some(kva) = proc.translate_user(buf_va + i) else {
-            return -1;
-        };
-        tmp[i] = unsafe { *(kva as *const u8) };
+    // Chunked like inode_write: bounded staging buffer (never sized
+    // from user `len`) and one log transaction per chunk so a big
+    // pwrite can't overflow the log.
+    let mut tmp = [0u8; WRITE_CHUNK];
+    let mut written = 0usize;
+    while written < len {
+        let chunk = (len - written).min(WRITE_CHUNK);
+        for i in 0..chunk {
+            let Some(kva) = proc.translate_user(buf_va + written + i) else {
+                return if written == 0 { -1 } else { written as i64 };
+            };
+            tmp[i] = unsafe { *(kva as *const u8) };
+        }
+        let cur = offset as u32 + written as u32;
+        fs::log::begin_op().await;
+        let mut li = fs::inode::ilock(ip).await;
+        let n = fs::inode::writei(&mut li, &tmp[..chunk], cur).await;
+        drop(li);
+        fs::log::end_op().await;
+        written += n;
+        if n < chunk {
+            break;
+        }
     }
-    let cur = offset as u32;
-    fs::log::begin_op().await;
-    let mut li = fs::inode::ilock(ip).await;
-    let n = fs::inode::writei(&mut li, &tmp, cur).await;
-    drop(li);
-    fs::log::end_op().await;
-    n as i64
+    written as i64
 }
 
 /// POSIX `lseek(int fd, off_t offset, int whence)`. Supports
@@ -1518,13 +1643,18 @@ async fn sys_lseek(proc: &Arc<Proc>, fd: i32, offset: i64, whence: i32) -> i64 {
 }
 
 async fn sys_dup(proc: &Arc<Proc>, fd: i32) -> i64 {
-    let Some(file) = proc.get_file(fd) else {
+    let Some(entry) = proc.get_fd_entry(fd) else {
         return -1;
     };
-    // Give the new fd its own `Arc<File>` so its close drops
-    // independently. `File::Clone` bumps pipe counts.
-    let new_file = Arc::new((*file).clone());
-    proc.alloc_fd(new_file).map(|f| f as i64).unwrap_or(-1)
+    // POSIX dup: the new fd SHARES the open file description (offset,
+    // status flags) — Arc::clone, never a deep copy. FD_CLOEXEC is
+    // per-fd and starts clear on the new fd.
+    let new_entry = crate::file::FdEntry {
+        file: entry.file,
+        cloexec: false,
+        nonblock: entry.nonblock,
+    };
+    proc.alloc_fd_entry(new_entry).map(|f| f as i64).unwrap_or(-1)
 }
 
 /// POSIX `dup2(oldfd, newfd)` — duplicate `oldfd` onto `newfd`,
@@ -1536,7 +1666,7 @@ fn sys_dup2(proc: &Arc<Proc>, oldfd: i32, newfd: i32) -> i64 {
         return -1;
     }
     // oldfd must be open.
-    let Some(file) = proc.get_file(oldfd) else {
+    let Some(entry) = proc.get_fd_entry(oldfd) else {
         return -1;
     };
     if oldfd == newfd {
@@ -1546,13 +1676,18 @@ fn sys_dup2(proc: &Arc<Proc>, oldfd: i32, newfd: i32) -> i64 {
     if (newfd as usize) >= crate::proc::NOFILE {
         return -1;
     }
-    // Close any existing entry at newfd (ignoring error — entry
-    // may already be empty), then install a fresh FdEntry.
+    // Close any existing entry at newfd (ignoring error — entry may
+    // already be empty), then install an entry SHARING the open file
+    // description (POSIX: dup2 keeps the offset and status flags;
+    // FD_CLOEXEC starts clear on the new fd).
     let _ = proc.close_fd(newfd);
-    let new_file = Arc::new((*file).clone());
     {
         let mut files = proc.files.lock();
-        files[newfd as usize] = Some(crate::file::FdEntry::new(new_file));
+        files[newfd as usize] = Some(crate::file::FdEntry {
+            file: entry.file,
+            cloexec: false,
+            nonblock: entry.nonblock,
+        });
     }
     newfd as i64
 }
@@ -1582,7 +1717,7 @@ async fn pipe_write(
             if buf.len() < pipe.cap() {
                 buf.push_back(byte);
                 drop(buf);
-                pipe.read_waker.wake();
+                pipe.read_waker.wake_all();
                 n += 1;
                 continue;
             }
@@ -1622,7 +1757,7 @@ impl Future for PipeWriteByte {
         if buf.len() < self.pipe.cap() {
             buf.push_back(self.byte);
             drop(buf);
-            self.pipe.read_waker.wake();
+            self.pipe.read_waker.wake_all();
             return Poll::Ready(true);
         }
         // No readers left? Writers should fail rather than block.
@@ -1649,9 +1784,12 @@ async fn pipe_read(
             let popped = pipe.buf.lock().pop_front();
             match popped {
                 Some(b) => {
-                    pipe.write_waker.wake();
+                    pipe.write_waker.wake_all();
                     let Some(kva) = proc.translate_user_write(buf_va + n) else {
-                        return -1;
+                        // Byte already consumed; report what we have
+                        // rather than discarding the count (xv6
+                        // returns the partial count).
+                        return if n == 0 { -1 } else { n as i64 };
                     };
                     unsafe { *(kva as *mut u8) = b };
                     n += 1;
@@ -1673,7 +1811,8 @@ async fn pipe_read(
         match (PipeReadByte { pipe: pipe.clone() }).await {
             Some(b) => {
                 let Some(kva) = proc.translate_user_write(buf_va + n) else {
-                    return -1;
+                    // Byte already consumed; report the partial count.
+                    return if n == 0 { -1 } else { n as i64 };
                 };
                 unsafe { *(kva as *mut u8) = b };
                 n += 1;
@@ -1705,7 +1844,7 @@ impl Future for PipeReadByte {
         self.pipe.read_waker.register(cx.waker());
         let popped = self.pipe.buf.lock().pop_front();
         if let Some(b) = popped {
-            self.pipe.write_waker.wake();
+            self.pipe.write_waker.wake_all();
             return Poll::Ready(Some(b));
         }
         if self.pipe.writers.load(Ordering::Acquire) == 0 {
@@ -1935,10 +2074,13 @@ async fn create_at_path(
     minor: u16,
 ) -> Option<Arc<crate::fs::inode::Inode>> {
     let (dir, name) = nameiparent_via_cwd(proc, path).await?;
-    if name.is_empty() || name == "." || name == ".." || name.len() > xv6_fs_layout::DIRSIZ
-    {
+    if name.is_empty() || name == "." || name == ".." {
         return None;
     }
+    // Names longer than DIRSIZ are silently truncated, not rejected —
+    // xv6 semantics (skipelem truncates during resolution; dirlink
+    // stores at most DIRSIZ bytes and dirent_name_matches compares
+    // the same prefix — usertests `fourteen`).
     // POSIX default mode by file type, then mask with the proc's
     // umask. With the default umask=0o022 this matches what we used
     // to hard-code (0o644 file, 0o755 dir).
@@ -3206,7 +3348,12 @@ async fn sys_chdir(proc: &Arc<Proc>, path_va: usize) -> i64 {
             return -1;
         }
     }
-    *proc.cwd.lock() = Some(ip);
+    // The old cwd may have been the last reference to an unlinked
+    // directory — let the reaper check it.
+    let old = core::mem::replace(&mut *proc.cwd.lock(), Some(ip));
+    if let Some(old) = old {
+        fs::inode::iput_deferred(old);
+    }
     0
 }
 

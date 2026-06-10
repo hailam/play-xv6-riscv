@@ -8,10 +8,19 @@
 
 #define MAXOPBLOCKS 10
 #define BSIZE       512               // our value; xv6 upstream is 1024
+#if defined(__aarch64__)
+#define MAXVA       (1L << 47)        // aarch64: user half is [0, 1<<47)
+#else
 #define MAXVA       (1L << 38)        // Sv39
+#endif
 #define PGSIZE      4096
 #define TRAPFRAME   (MAXVA - 2*PGSIZE)
 #define TRAMPOLINE  (MAXVA - PGSIZE)
+// Our kernel's user layout diverges from xv6: a fixed 8-page stack
+// sits directly below TRAPFRAME, and sbrk is capped one (guard) page
+// below the stack base. HEAPTOP is that cap — the highest the break
+// can go.
+#define HEAPTOP     (TRAPFRAME - 9*PGSIZE)
 
 #define SYS_fork    1
 #define SYS_exit    2
@@ -40,7 +49,7 @@
 #define MAXARG      32
 #define MAXFILE     (12 + 256)        // NDIRECT + NINDIRECT
 #define NINODE      50
-#define USERSTACK   1                 // we allocate 1 stack page (xv6 too)
+#define USERSTACK   8                 // our kernel maps an 8-page stack (xv6 maps 1)
 #define KERNBASE    0x80000000L
 #define NPROC       64                // not enforced today; usertests references it
 
@@ -2732,9 +2741,12 @@ lazy_copy(char *s)
 
   
   // read() and write() to these addresses should fail.
+  // (xv6 uses 0x3fffffc000/0x3fffffd000 here, but those are mapped
+  // stack pages in our 8-page-stack layout — probe the unmapped
+  // region below the stack and the guard page instead.)
   unsigned long bad[] = {
-    0x3fffffc000,
-    0x3fffffd000,
+    0x3fffff0000,
+    0x3fffff5000,
     0x3fffffe000,
     0x3ffffff000,
     0x4000000000,
@@ -2769,7 +2781,9 @@ lazy_sbrk(char *s)
     p = sbrklazy(0);
   }
 
-  int n = TRAPFRAME-PGSIZE-(uint64)p;
+  // Grow lazily to one page short of our kernel's break cap
+  // (xv6 grows to TRAPFRAME-PGSIZE; our cap is HEAPTOP).
+  int n = HEAPTOP-PGSIZE-(uint64)p;
 
   char *p1 = sbrklazy(n);
   if (p1 < 0 || p1 != p) {
@@ -2778,8 +2792,8 @@ lazy_sbrk(char *s)
   }
 
   p = sbrk(PGSIZE);
-  if (p < 0 || (uint64)p != TRAPFRAME-PGSIZE) {
-    printf("sbrk(%d) returned %p, not expected TRAPFRAME-PGSIZE\n", PGSIZE, p);
+  if (p < 0 || (uint64)p != HEAPTOP-PGSIZE) {
+    printf("sbrk(%d) returned %p, not expected HEAPTOP-PGSIZE\n", PGSIZE, p);
     exit(1);
   }
 
@@ -2802,6 +2816,78 @@ lazy_sbrk(char *s)
   }
 
   exit(0);
+}
+
+// A child outliving its parent must be reparented to init (pid 1)
+// and reaped there. The grandchild reports its observed getppid()
+// through a pipe so the test actually fails if reparenting is broken.
+void
+orphanppid(char *s)
+{
+  int fds[2];
+  if(pipe(fds) < 0){
+    printf("%s: pipe failed\n", s);
+    exit(1);
+  }
+  int p1 = fork();
+  if(p1 < 0){
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if(p1 == 0){
+    int p2 = fork();
+    if(p2 < 0)
+      exit(1);
+    if(p2 == 0){
+      // Grandchild: wait until orphaned, then report.
+      close(fds[0]);
+      char b = 'N';
+      for(int i = 0; i < 100; i++){
+        if(getppid() == 1){
+          b = 'Y';
+          break;
+        }
+        xv6_pause(1);
+      }
+      write(fds[1], &b, 1);
+      close(fds[1]);
+      exit(0);
+    }
+    exit(0); // child exits immediately, orphaning the grandchild
+  }
+  close(fds[1]);
+  int st;
+  wait(&st);
+  char b = 0;
+  if(read(fds[0], &b, 1) != 1 || b != 'Y'){
+    printf("%s: orphan saw getppid()=%d-ish, expected 1\n", s, (int)b);
+    exit(1);
+  }
+  close(fds[0]);
+}
+
+// unlink-while-open must free the inode when the last fd closes
+// (xv6's iput). 250 iterations > NINODE(200): if the close path
+// leaks unlinked inodes, ialloc runs dry partway through.
+void
+unlinkedfree(char *s)
+{
+  for(int i = 0; i < 250; i++){
+    int fd = open("uf", O_CREATE | O_RDWR);
+    if(fd < 0){
+      printf("%s: open failed at iter %d (inode leak?)\n", s, i);
+      exit(1);
+    }
+    if(unlink("uf") < 0){
+      printf("%s: unlink failed at iter %d\n", s, i);
+      exit(1);
+    }
+    if(write(fd, "x", 1) != 1){
+      printf("%s: write failed at iter %d\n", s, i);
+      exit(1);
+    }
+    close(fd);
+  }
 }
 
 struct test {
@@ -2835,6 +2921,8 @@ struct test {
   {forkfork, "forkfork"},
   {forkforkfork, "forkforkfork"},
   {reparent2, "reparent2"},
+  {orphanppid, "orphanppid"},
+  {unlinkedfree, "unlinkedfree"},
   {mem, "mem"},
   {sharedfd, "sharedfd"},
   {fourfiles, "fourfiles"},

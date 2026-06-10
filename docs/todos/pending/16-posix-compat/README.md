@@ -1,10 +1,20 @@
 # 16: POSIX-ish compatibility
 
-**Status:** Tiers 1–5 + 8 **done** (kernel-side syscall surface
-for newlib/musl bring-up is in place); Tier 6 (signals/concurrency
-bits beyond what landed) and Tier 7 (sockets) remain.
-**Estimated:** Originally "many sessions"; ~60 sub-features
-across 30+ syscalls landed in chunks over the past few weeks.
+**Status (re-scoped 2026-06-10):** Tiers 1–5 **done**; Tier 8 is
+**further along than this doc originally claimed** — a picolibc-based
+toolchain is already integrated in-tree (`third_party/`, `picohello`/
+`picotest` user programs) and real ported software runs on it: `bc`,
+`dc`, and **lua** are built into fs.img on both arches. The remaining
+scope of this todo is effectively **sockets**:
+  * Tier 6 remainder — AF_UNIX domain sockets (pthread_* stays
+    out-of-scope by design: cooperative one-task-per-proc model).
+  * Tier 7 — TCP/IP + AF_INET (virtio-net behind the HAL + smoltcp;
+    this is the point where the "no external crates" rule gets lifted).
+Also note: fd semantics were corrected by
+[17-correctness-audit](../../done/17-correctness-audit/) — fork/dup/dup2
+now share one open file description (shared offset) per POSIX.
+**Estimated:** sockets are a multi-session project; everything else
+here is done.
 
 ## Done summary
 

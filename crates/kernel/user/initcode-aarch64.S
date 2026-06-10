@@ -3,8 +3,9 @@
 //
 // Prints a hello banner via sys_write so we can verify that the
 // trampoline + svc + sys_write actually deliver data to the
-// console, then attempts to exec("/sh", 0). If exec fails (no
-// aarch64-native /sh on disk yet), exits with -1.
+// console, then execs /init (the real init, which forks /sh and
+// loops in wait() reaping reparented orphans). If exec fails,
+// exits with -1.
 //
 // AArch64 ABI: syscall # in x8; args x0..x7; return x0; svc #0.
 
@@ -18,8 +19,8 @@ _start:
         mov     x8, #16              // SYS_WRITE
         svc     #0
 
-        // exec("/sh", 0)
-        adr     x0, sh_path
+        // exec("/init", 0)
+        adr     x0, init_path
         mov     x1, #0
         mov     x8, #7               // SYS_EXEC
         svc     #0
@@ -34,5 +35,5 @@ _start:
 msg:
         .ascii  "hello from aarch64 init (svc dispatched)\n"
 msg_end:
-sh_path:
-        .asciz  "/sh"
+init_path:
+        .asciz  "/init"
