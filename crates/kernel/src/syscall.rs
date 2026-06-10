@@ -13,7 +13,7 @@ use hal::{FrameAllocator, Hal, PageTableOps, PtePerm, TrapFrameAccess};
 use crate::arch::Arch;
 use crate::cpu;
 use crate::executor;
-use crate::file::{File, PipeInner};
+use crate::file::{File, PipeInner, SockEnd, SockState, Socket};
 use crate::fs;
 use crate::kalloc::KFRAMES;
 use crate::proc::{Proc, ProcState};
@@ -41,6 +41,8 @@ use crate::uapi::{
     TIOCGWINSZ, TCGETS, TCSETS, TCSETSW, TCSETSF, FIONREAD,
     Winsize, Termios,
     SYS_POLL, POLLIN, POLLOUT, POLLERR, POLLHUP, POLLNVAL, PollFd,
+    SYS_SOCKET, SYS_BIND, SYS_LISTEN, SYS_ACCEPT, SYS_CONNECT,
+    SYS_SOCKETPAIR, AF_UNIX, SOCK_STREAM,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -388,6 +390,30 @@ pub async fn dispatch(proc: &Arc<Proc>, nr: usize) -> i64 {
             let timeout_ms = tf.arg(2) as i32;
             sys_poll(proc, fds_va, nfds, timeout_ms).await
         }
+        SYS_SOCKET => {
+            let tf = proc.trapframe();
+            sys_socket(proc, tf.arg(0) as i32, tf.arg(1) as i32, tf.arg(2) as i32)
+        }
+        SYS_BIND => {
+            let tf = proc.trapframe();
+            sys_bind(proc, tf.arg(0) as i32, tf.arg(1) as usize).await
+        }
+        SYS_LISTEN => {
+            let tf = proc.trapframe();
+            sys_listen(proc, tf.arg(0) as i32, tf.arg(1) as i32)
+        }
+        SYS_ACCEPT => {
+            let tf = proc.trapframe();
+            sys_accept(proc, tf.arg(0) as i32).await
+        }
+        SYS_CONNECT => {
+            let tf = proc.trapframe();
+            sys_connect(proc, tf.arg(0) as i32, tf.arg(1) as usize).await
+        }
+        SYS_SOCKETPAIR => {
+            let tf = proc.trapframe();
+            sys_socketpair(proc, tf.arg(0) as usize)
+        }
         _ => {
             crate::println!("syscall: unknown nr {}", nr);
             -1
@@ -587,7 +613,7 @@ pub async fn lazy_map_page_async(
     true
 }
 
-fn vma_prot_to_pteperm(prot: i32) -> PtePerm {
+pub(crate) fn vma_prot_to_pteperm(prot: i32) -> PtePerm {
     use hal::PtePerm as PP;
     let mut bits = PP::USER;
     if prot & PROT_READ != 0 {
@@ -1233,9 +1259,16 @@ async fn sys_write(proc: &Arc<Proc>, fd: i32, buf_va: usize, len: usize) -> i64 
     };
     let nonblock = entry.nonblock;
     match &*entry.file {
-        File::Console => console_write(proc, buf_va, len),
+        File::Console => console_write(proc, buf_va, len).await,
         File::PipeWrite(p) => pipe_write(p.clone(), proc, buf_va, len, nonblock).await,
         File::PipeRead(_) => -1,
+        File::Socket(sock) => {
+            let end = match &*sock.state.lock() {
+                SockState::Connected(e) => Arc::clone(e),
+                _ => return -1,
+            };
+            pipe_write(Arc::clone(&end.tx), proc, buf_va, len, nonblock).await
+        }
         File::Inode {
             ip,
             off,
@@ -1322,17 +1355,31 @@ async fn inode_write(
 }
 
 
-fn console_write(proc: &Proc, buf_va: usize, len: usize) -> i64 {
-    let mut va = buf_va;
+async fn console_write(proc: &Proc, buf_va: usize, len: usize) -> i64 {
+    // Chunked: copy a bounded run in, emit it under the console lock
+    // (so user output doesn't interleave byte-wise with kernel
+    // println!), then yield. The old version looped the whole user
+    // buffer synchronously — a big write monopolized the hart on a
+    // cooperative executor.
+    const CHUNK: usize = 256;
+    let mut tmp = [0u8; CHUNK];
     let mut written: usize = 0;
     while written < len {
-        let Some(kva) = proc.translate_user(va) else {
-            return -1;
-        };
-        let byte = unsafe { *(kva as *const u8) };
-        Arch::console_putc(byte);
-        va += 1;
-        written += 1;
+        let n = (len - written).min(CHUNK);
+        for i in 0..n {
+            let Some(kva) = proc.translate_user(buf_va + written + i) else {
+                return if written == 0 { -1 } else { written as i64 };
+            };
+            tmp[i] = unsafe { *(kva as *const u8) };
+        }
+        crate::console::write_bytes(&tmp[..n]);
+        written += n;
+        if written < len {
+            if proc.killed.load(Ordering::Acquire) {
+                return written as i64;
+            }
+            crate::wait::yield_now().await;
+        }
     }
     written as i64
 }
@@ -1349,6 +1396,15 @@ async fn sys_read(proc: &Arc<Proc>, fd: i32, buf_va: usize, len: usize) -> i64 {
         File::Console => console_read(proc, buf_va, len, nonblock).await,
         File::PipeRead(p) => pipe_read(p.clone(), proc, buf_va, len, nonblock).await,
         File::PipeWrite(_) => -1,
+        File::Socket(sock) => {
+            // A connected socket reads from its rx pipe — identical
+            // blocking/EOF semantics to a pipe read.
+            let end = match &*sock.state.lock() {
+                SockState::Connected(e) => Arc::clone(e),
+                _ => return -1,
+            };
+            pipe_read(Arc::clone(&end.rx), proc, buf_va, len, nonblock).await
+        }
         File::Inode {
             ip,
             off,
@@ -1421,6 +1477,14 @@ async fn console_read(proc: &Proc, buf_va: usize, len: usize, nonblock: bool) ->
         if nonblock {
             match crate::console_in::try_pop() {
                 Some(b) => {
+                    if b == crate::console_in::EOF_SENTINEL {
+                        // ^D: EOF. With data already read, save the
+                        // mark for the next read (which returns 0).
+                        if n > 0 {
+                            crate::console_in::unget(b);
+                        }
+                        break;
+                    }
                     let Some(kva) = proc.translate_user_write(buf_va + n) else {
                         return -1;
                     };
@@ -1438,6 +1502,12 @@ async fn console_read(proc: &Proc, buf_va: usize, len: usize, nonblock: bool) ->
             let Some(b) = ConsoleByte.await else {
                 return -1; // killed
             };
+            if b == crate::console_in::EOF_SENTINEL {
+                if n > 0 {
+                    crate::console_in::unget(b);
+                }
+                break;
+            }
             let Some(kva) = proc.translate_user_write(buf_va + n) else {
                 return -1;
             };
@@ -1707,10 +1777,15 @@ async fn pipe_write(
         };
         let byte = unsafe { *(kva as *const u8) };
         if nonblock {
+            // EPIPE first: no readers means the write must fail even
+            // with buffer space (POSIX; xv6 pipewrite checks readopen
+            // before anything else).
+            if pipe.readers.load(Ordering::Acquire) == 0 {
+                return -1;
+            }
             // Fast-path: try to push directly without awaiting.
             // If the buffer is full and readers are still attached,
-            // bail with EAGAIN (or partial); on no-readers, normal
-            // failure path.
+            // bail with EAGAIN (or partial).
             let mut buf = pipe.buf.lock();
             if buf.len() < pipe.cap() {
                 buf.push_back(byte);
@@ -1750,6 +1825,14 @@ impl Future for PipeWriteByte {
         if current_proc_killed() {
             return Poll::Ready(false);
         }
+        // EPIPE before anything else: a write to a pipe/socket whose
+        // reading side is fully closed fails immediately, buffer
+        // space or not (POSIX; xv6 checks readopen up front). The
+        // old buffer-full-only check let writes to a dead peer
+        // "succeed" until the buffer filled.
+        if self.pipe.readers.load(Ordering::Acquire) == 0 {
+            return Poll::Ready(false);
+        }
         self.pipe.write_waker.register(cx.waker());
         let mut buf = self.pipe.buf.lock();
         if buf.len() < self.pipe.cap() {
@@ -1757,10 +1840,6 @@ impl Future for PipeWriteByte {
             drop(buf);
             self.pipe.read_waker.wake_all();
             return Poll::Ready(true);
-        }
-        // No readers left? Writers should fail rather than block.
-        if self.pipe.readers.load(Ordering::Acquire) == 0 {
-            return Poll::Ready(false);
         }
         Poll::Pending
     }
@@ -1850,6 +1929,187 @@ impl Future for PipeReadByte {
         }
         Poll::Pending
     }
+}
+
+// ---------- AF_UNIX sockets -------------------------------------------------
+
+/// `socket(AF_UNIX, SOCK_STREAM, 0)` — anything else is unsupported.
+fn sys_socket(proc: &Arc<Proc>, domain: i32, typ: i32, proto: i32) -> i64 {
+    if domain != AF_UNIX || typ != SOCK_STREAM || proto != 0 {
+        return -1;
+    }
+    let sock = Arc::new(File::Socket(Arc::new(Socket {
+        state: crate::sync::SpinLock::new(SockState::Fresh),
+    })));
+    proc.alloc_fd(sock).map(|f| f as i64).unwrap_or(-1)
+}
+
+/// `bind(fd, path)` — path-based rather than sockaddr_un-based; the
+/// libc glue translates. Creates a T_SOCK fs node (visible to ls,
+/// removable with unlink) and registers the listener under its inum.
+/// An existing path fails (EADDRINUSE-ish).
+async fn sys_bind(proc: &Arc<Proc>, fd: i32, path_va: usize) -> i64 {
+    let Some(path) = read_user_cstring(proc, path_va, 128) else {
+        return -1;
+    };
+    let Some(file) = proc.get_file(fd) else {
+        return -1;
+    };
+    let File::Socket(sock) = &*file else {
+        return -1;
+    };
+    if !matches!(&*sock.state.lock(), SockState::Fresh) {
+        return -1;
+    }
+    let Some(ip) =
+        create_at_path(proc, &path, xv6_fs_layout::T_SOCK, 0, 0).await
+    else {
+        return -1;
+    };
+    let inum = ip.inum.load(Ordering::Acquire);
+    let listener = Arc::new(crate::file::Listener {
+        inum,
+        backlog: crate::sync::SpinLock::new(alloc::collections::VecDeque::new()),
+        accept_waker: crate::wait::WakerList::new(),
+    });
+    crate::file::sock_register(inum, &listener);
+    let mut st = sock.state.lock();
+    if !matches!(&*st, SockState::Fresh) {
+        return -1; // raced with another bind/connect on a shared fd
+    }
+    *st = SockState::Listening(listener);
+    0
+}
+
+/// `listen(fd, backlog)` — bind already armed the queue; this just
+/// validates state (the backlog depth is fixed at SOCK_BACKLOG_CAP).
+fn sys_listen(proc: &Arc<Proc>, fd: i32, _backlog: i32) -> i64 {
+    let Some(file) = proc.get_file(fd) else {
+        return -1;
+    };
+    let File::Socket(sock) = &*file else {
+        return -1;
+    };
+    if matches!(&*sock.state.lock(), SockState::Listening(_)) {
+        0
+    } else {
+        -1
+    }
+}
+
+struct AcceptWait<'a> {
+    listener: &'a Arc<crate::file::Listener>,
+}
+
+impl Future for AcceptWait<'_> {
+    type Output = Option<SockEnd>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<SockEnd>> {
+        if current_proc_killed() {
+            return Poll::Ready(None);
+        }
+        // Register first, then check (close the wake-loss race).
+        self.listener.accept_waker.register(cx.waker());
+        if let Some(end) = self.listener.backlog.lock().pop_front() {
+            return Poll::Ready(Some(end));
+        }
+        Poll::Pending
+    }
+}
+
+/// `accept(fd)` — blocks for a queued connection, returns a new
+/// connected fd. (No peer-address out-params in the path-based API.)
+async fn sys_accept(proc: &Arc<Proc>, fd: i32) -> i64 {
+    let Some(file) = proc.get_file(fd) else {
+        return -1;
+    };
+    let File::Socket(sock) = &*file else {
+        return -1;
+    };
+    let listener = match &*sock.state.lock() {
+        SockState::Listening(l) => Arc::clone(l),
+        _ => return -1,
+    };
+    let Some(end) = (AcceptWait { listener: &listener }).await else {
+        return -1; // killed
+    };
+    let conn = Arc::new(File::Socket(Arc::new(Socket {
+        state: crate::sync::SpinLock::new(SockState::Connected(Arc::new(end))),
+    })));
+    proc.alloc_fd(conn).map(|f| f as i64).unwrap_or(-1)
+}
+
+/// `connect(fd, path)` — resolves the T_SOCK node, queues the server
+/// end on the listener's backlog and completes immediately (data
+/// written before accept is buffered, like real AF_UNIX).
+async fn sys_connect(proc: &Arc<Proc>, fd: i32, path_va: usize) -> i64 {
+    let Some(path) = read_user_cstring(proc, path_va, 128) else {
+        return -1;
+    };
+    let Some(file) = proc.get_file(fd) else {
+        return -1;
+    };
+    let File::Socket(sock) = &*file else {
+        return -1;
+    };
+    if !matches!(&*sock.state.lock(), SockState::Fresh) {
+        return -1;
+    }
+    let Some(ip) = resolve_path(proc, &path).await else {
+        return -1;
+    };
+    let inum = {
+        let li = fs::inode::ilock(&ip).await;
+        if li.state().typ != xv6_fs_layout::T_SOCK {
+            return -1;
+        }
+        li.inum()
+    };
+    let Some(listener) = crate::file::sock_lookup(inum) else {
+        return -1; // bound node exists but nobody is listening (ECONNREFUSED)
+    };
+    let (client, server) = crate::file::socket_conn_pair();
+    {
+        let mut bl = listener.backlog.lock();
+        if bl.len() >= crate::file::SOCK_BACKLOG_CAP {
+            return -1; // queue full; SockEnds drop -> no leaks
+        }
+        bl.push_back(server);
+    }
+    listener.accept_waker.wake_all();
+    let mut st = sock.state.lock();
+    if !matches!(&*st, SockState::Fresh) {
+        return -1;
+    }
+    *st = SockState::Connected(Arc::new(client));
+    0
+}
+
+/// `socketpair(sv)` — a pre-connected pair, no fs node involved.
+fn sys_socketpair(proc: &Arc<Proc>, sv_va: usize) -> i64 {
+    let (a, b) = crate::file::socket_conn_pair();
+    let fa = Arc::new(File::Socket(Arc::new(Socket {
+        state: crate::sync::SpinLock::new(SockState::Connected(Arc::new(a))),
+    })));
+    let fb = Arc::new(File::Socket(Arc::new(Socket {
+        state: crate::sync::SpinLock::new(SockState::Connected(Arc::new(b))),
+    })));
+    let Some(fd0) = proc.alloc_fd(fa) else {
+        return -1;
+    };
+    let Some(fd1) = proc.alloc_fd(fb) else {
+        proc.close_fd(fd0);
+        return -1;
+    };
+    for (i, fdv) in [fd0, fd1].iter().enumerate() {
+        let va = sv_va + i * 4;
+        let Some(kva) = proc.translate_user_write(va) else {
+            proc.close_fd(fd0);
+            proc.close_fd(fd1);
+            return -1;
+        };
+        unsafe { *(kva as *mut i32) = *fdv };
+    }
+    0
 }
 
 // ---------- sys_open / sys_fstat -------------------------------------------
@@ -2278,7 +2538,11 @@ async fn sys_chown(proc: &Arc<Proc>, path_va: usize, uid: u16, gid: u16) -> i64 
 /// bumps the size and leaves a sparse hole. Requires `fd` to have
 /// been opened with write access.
 async fn sys_ftruncate(proc: &Arc<Proc>, fd: i32, length: i64) -> i64 {
-    if length < 0 || length > u32::MAX as i64 {
+    if length < 0
+        || length as u64
+            > xv6_fs_layout::MAXFILE as u64 * xv6_fs_layout::BSIZE as u64
+    {
+        // Negative or past the inode's addressable maximum (EFBIG).
         return -1;
     }
     let Some(file) = proc.get_file(fd) else {
@@ -2611,7 +2875,11 @@ async fn unlink_dirent_inside_op(
 }
 
 async fn sys_truncate(proc: &Arc<Proc>, path_va: usize, length: i64) -> i64 {
-    if length < 0 || length > u32::MAX as i64 {
+    if length < 0
+        || length as u64
+            > xv6_fs_layout::MAXFILE as u64 * xv6_fs_layout::BSIZE as u64
+    {
+        // Negative or past the inode's addressable maximum (EFBIG).
         return -1;
     }
     let Some(path) = read_user_cstring(proc, path_va, 128) else {
@@ -2714,6 +2982,11 @@ async fn sys_poll(
         Ok(())
     };
 
+    // Resolve the fds to Files once — registration targets. (A racing
+    // close/dup2 mid-poll sees POSIX-undefined behaviour anyway.)
+    let resolved: alloc::vec::Vec<Option<Arc<File>>> =
+        entries.iter().map(|pf| proc.get_file(pf.fd)).collect();
+
     loop {
         let ready = poll_fill_revents(proc, &mut entries);
         if ready > 0 {
@@ -2738,9 +3011,64 @@ async fn sys_poll(
             }
             return 0;
         }
-        // Cooperative polling: sleep up to 10ms or until deadline.
-        let next_wake = deadline.min(now + ticks_per_ms * 10);
-        Sleep { deadline: next_wake }.await;
+        // Park on every polled file's waker (and the deadline timer)
+        // instead of duty-cycling a 10 ms sleep — readiness now has
+        // interrupt-grade latency. Spurious wakes just re-run the
+        // revents sweep above.
+        PollWait {
+            files: &resolved,
+            deadline: if deadline == u64::MAX { None } else { Some(deadline) },
+            armed: false,
+        }
+        .await;
+    }
+}
+
+/// Two-phase parking future for `sys_poll`: the first `poll` registers
+/// the task on every polled file's waker (+ an optional deadline
+/// timer) and returns Pending; ANY wake re-polls it, which returns
+/// Ready so the caller's loop re-evaluates revents. Extra wakes are
+/// harmless re-sweeps.
+struct PollWait<'a> {
+    files: &'a [Option<Arc<File>>],
+    deadline: Option<u64>,
+    armed: bool,
+}
+
+impl Future for PollWait<'_> {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if current_proc_killed() {
+            return Poll::Ready(());
+        }
+        if self.armed {
+            return Poll::Ready(());
+        }
+        self.armed = true;
+        for f in self.files.iter().flatten() {
+            match &**f {
+                File::Console => crate::console_in::register_waker(cx.waker()),
+                File::PipeRead(p) => p.read_waker.register(cx.waker()),
+                File::PipeWrite(p) => p.write_waker.register(cx.waker()),
+                File::Socket(sock) => match &*sock.state.lock() {
+                    SockState::Connected(end) => {
+                        end.rx.read_waker.register(cx.waker());
+                        end.tx.write_waker.register(cx.waker());
+                    }
+                    SockState::Listening(l) => {
+                        l.accept_waker.register(cx.waker());
+                    }
+                    SockState::Fresh => {}
+                },
+                // Inode-backed fds are always ready — if we got here
+                // the caller asked for no events on them.
+                File::Inode { .. } => {}
+            }
+        }
+        if let Some(d) = self.deadline {
+            crate::time::add_timer(d, cx.waker().clone());
+        }
+        Poll::Pending
     }
 }
 
@@ -2799,6 +3127,30 @@ fn file_revents(file: &File, requested: i16) -> i16 {
             if readers == 0 {
                 r |= POLLERR;
             }
+        }
+        File::Socket(sock) => match &*sock.state.lock() {
+            SockState::Connected(end) => {
+                if (requested & POLLIN) != 0 && !end.rx.buf.lock().is_empty() {
+                    r |= POLLIN;
+                }
+                if end.rx.writers.load(Ordering::Acquire) == 0 {
+                    r |= POLLHUP;
+                }
+                if (requested & POLLOUT) != 0
+                    && end.tx.buf.lock().len() < end.tx.cap()
+                {
+                    r |= POLLOUT;
+                }
+                if end.tx.readers.load(Ordering::Acquire) == 0 {
+                    r |= POLLERR;
+                }
+            }
+            SockState::Listening(l) => {
+                if (requested & POLLIN) != 0 && !l.backlog.lock().is_empty() {
+                    r |= POLLIN;
+                }
+            }
+            SockState::Fresh => {}
         }
         File::Inode { .. } => {
             // Regular files are always ready (no blocking I/O).
@@ -2960,7 +3312,7 @@ async fn sys_readlink(
     let cwd = proc.cwd.lock().clone();
     let ip = match cwd {
         Some(c) => fs::path::namei_nofollow(c, &path).await,
-        None => fs::path::namei_nofollow(fs::inode::iget(0, 1), &path).await,
+        None => fs::path::namei_nofollow(fs::inode::iget_wait(0, 1).await, &path).await,
     };
     let Some(ip) = ip else { return -1 };
     let (typ, size) = {
@@ -2997,7 +3349,7 @@ async fn sys_lstat(proc: &Arc<Proc>, path_va: usize, stat_va: usize) -> i64 {
     let cwd = proc.cwd.lock().clone();
     let ip = match cwd {
         Some(c) => fs::path::namei_nofollow(c, &path).await,
-        None => fs::path::namei_nofollow(fs::inode::iget(0, 1), &path).await,
+        None => fs::path::namei_nofollow(fs::inode::iget_wait(0, 1).await, &path).await,
     };
     let Some(ip) = ip else { return -1 };
     stat_inode_into_user(proc, &ip, stat_va).await

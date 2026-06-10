@@ -63,6 +63,16 @@ pub const SYS_READLINK: usize = 59;
 pub const SYS_LSTAT: usize = 60;
 pub const SYS_IOCTL: usize = 61;
 pub const SYS_POLL: usize = 62;
+pub const SYS_SOCKET: usize = 63;
+pub const SYS_BIND: usize = 64;
+pub const SYS_LISTEN: usize = 65;
+pub const SYS_ACCEPT: usize = 66;
+pub const SYS_CONNECT: usize = 67;
+pub const SYS_SOCKETPAIR: usize = 68;
+
+/// Socket domain / type constants — AF_UNIX stream sockets only.
+pub const AF_UNIX: i32 = 1;
+pub const SOCK_STREAM: i32 = 1;
 
 // poll() event bits.
 pub const POLLIN:   i16 = 0x0001;

@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 
 use xv6_fs_layout::{Dirent, DIRSIZ, T_DIR};
 
-use crate::fs::inode::{iget, readi, writei, Inode, LockedInode};
+use crate::fs::inode::{iget_wait, readi, writei, Inode, LockedInode};
 
 /// Reverse lookup: find the name of the entry in `dir` that points
 /// to `child_inum`. Used by `getcwd` to walk a leaf-up path. Caller
@@ -73,7 +73,7 @@ pub async fn dirlookup(dir: &LockedInode<'_>, name: &str) -> Option<Arc<Inode>> 
             break;
         }
         if entry.inum != 0 && dirent_name_matches(&entry, name) {
-            return Some(iget(dir.dev(), entry.inum as u32));
+            return Some(iget_wait(dir.dev(), entry.inum as u32).await);
         }
         off += entry_size;
     }
@@ -182,7 +182,7 @@ pub async fn dirlookup_full(
             break;
         }
         if entry.inum != 0 && dirent_name_matches(&entry, name) {
-            return Some((iget(dir.dev(), entry.inum as u32), off));
+            return Some((iget_wait(dir.dev(), entry.inum as u32).await, off));
         }
         off += entry_size;
     }

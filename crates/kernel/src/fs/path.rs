@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 
 use crate::fs::dir::dirlookup;
-use crate::fs::inode::{iget, ilock, Inode};
+use crate::fs::inode::{iget_wait, ilock, Inode};
 
 /// Resolve `path` against `start`. If the path is absolute (starts
 /// with `/`), `start` is ignored and the walk begins at inode 1.
@@ -16,7 +16,7 @@ pub async fn namei_from(start: Arc<Inode>, path: &str) -> Option<Arc<Inode>> {
 
 /// Resolve `path` against root.
 pub async fn namei(path: &str) -> Option<Arc<Inode>> {
-    namei_from(iget(0, 1), path).await
+    namei_from(iget_wait(0, 1).await, path).await
 }
 
 /// Like `namei_from` but returns the symlink itself if the final
@@ -37,7 +37,7 @@ pub async fn nameiparent_from(
 }
 
 pub async fn nameiparent(path: &str) -> Option<(Arc<Inode>, String)> {
-    nameiparent_from(iget(0, 1), path).await
+    nameiparent_from(iget_wait(0, 1).await, path).await
 }
 
 /// Symlink-resolution hop limit. POSIX recommends 40; we match.
@@ -50,7 +50,7 @@ async fn namex(
     follow_last: bool,
 ) -> Option<(Arc<Inode>, Option<String>)> {
     let mut ip = if path.starts_with('/') {
-        iget(0, 1)
+        iget_wait(0, 1).await
     } else {
         start
     };
@@ -110,7 +110,7 @@ async fn namex(
                 s
             };
             if path_buf.starts_with('/') {
-                ip = iget(0, 1);
+                ip = iget_wait(0, 1).await;
             }
             // ip stays — the symlink is relative to the directory
             // that contained it (which is the current `ip` AFTER

@@ -10,7 +10,8 @@
 //! EOF / EPIPE.
 
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::fs::inode::Inode;
@@ -80,10 +81,93 @@ impl Clone for FdEntry {
     }
 }
 
+// ---------- AF_UNIX stream sockets ----------------------------------------
+//
+// A connected socket is just two pipes, one per direction; all the
+// blocking, waker, EOF and EPIPE machinery is PipeInner's, verbatim.
+// Each endpoint is the READER of `rx` and the WRITER of `tx`, so the
+// per-direction reader/writer counts start at PipeInner::new()'s 1/1
+// and the endpoint's Drop releases exactly its own side.
+
+pub struct SockEnd {
+    pub rx: Arc<PipeInner>,
+    pub tx: Arc<PipeInner>,
+}
+
+impl Drop for SockEnd {
+    fn drop(&mut self) {
+        self.rx.readers.fetch_sub(1, Ordering::AcqRel);
+        self.rx.write_waker.wake_all();
+        self.tx.writers.fetch_sub(1, Ordering::AcqRel);
+        self.tx.read_waker.wake_all();
+    }
+}
+
+/// Build a connected pair of endpoints (the guts of socketpair /
+/// connect+accept).
+pub fn socket_conn_pair() -> (SockEnd, SockEnd) {
+    let ab = Arc::new(PipeInner::new());
+    let ba = Arc::new(PipeInner::new());
+    (
+        SockEnd { rx: Arc::clone(&ba), tx: Arc::clone(&ab) },
+        SockEnd { rx: ab, tx: ba },
+    )
+}
+
+pub const SOCK_BACKLOG_CAP: usize = 16;
+
+pub struct Listener {
+    /// Inum of the T_SOCK fs node this listener is bound to.
+    pub inum: u32,
+    /// Server-side endpoints queued by `connect`, waiting for accept.
+    pub backlog: SpinLock<VecDeque<SockEnd>>,
+    pub accept_waker: crate::wait::WakerList,
+}
+
+pub enum SockState {
+    /// socket() done, neither bound nor connected yet.
+    Fresh,
+    Listening(Arc<Listener>),
+    Connected(Arc<SockEnd>),
+}
+
+pub struct Socket {
+    pub state: SpinLock<SockState>,
+}
+
+/// inum → listener bindings. Weak so a closed listener vanishes;
+/// dead entries are purged on lookup.
+static SOCK_REGISTRY: SpinLock<Vec<(u32, Weak<Listener>)>> =
+    SpinLock::new(Vec::new());
+
+pub fn sock_register(inum: u32, l: &Arc<Listener>) {
+    SOCK_REGISTRY.lock().push((inum, Arc::downgrade(l)));
+}
+
+pub fn sock_lookup(inum: u32) -> Option<Arc<Listener>> {
+    let mut reg = SOCK_REGISTRY.lock();
+    let mut found = None;
+    reg.retain(|(i, w)| match w.upgrade() {
+        Some(l) => {
+            if *i == inum && found.is_none() {
+                found = Some(l);
+            }
+            true
+        }
+        None => false,
+    });
+    found
+}
+
 pub enum File {
     Console,
     PipeRead(Arc<PipeInner>),
     PipeWrite(Arc<PipeInner>),
+    /// AF_UNIX stream socket (any state). Teardown is fully automatic:
+    /// dropping the last Arc<Socket> drops the state — a Connected
+    /// endpoint's SockEnd::Drop signals the peer; a dropped Listener
+    /// drops its backlog, EOF-ing every un-accepted client.
+    Socket(Arc<Socket>),
     /// On-disk file. The offset belongs to the open file description
     /// (this `File`) and is shared by every fd that fork/dup produced
     /// from the same `open`. Offset reads/updates happen inside the
@@ -126,7 +210,7 @@ impl Drop for File {
                 // log transaction. False positives are fine.
                 crate::fs::inode::iput_deferred(Arc::clone(ip));
             }
-            File::Console => {}
+            File::Console | File::Socket(_) => {}
         }
     }
 }

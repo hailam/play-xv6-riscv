@@ -22,6 +22,16 @@ pub fn _print(args: fmt::Arguments) {
     let _ = LockedWriter.write_fmt(args);
 }
 
+/// Write a byte slice under the console lock — used by user
+/// `write(1, ...)` so user output can't interleave mid-line with
+/// kernel `println!` output.
+pub fn write_bytes(bytes: &[u8]) {
+    let _guard = CONSOLE.lock();
+    for &b in bytes {
+        Arch::console_putc(b);
+    }
+}
+
 /// Bypasses the lock — for panic paths where we'd otherwise deadlock.
 pub fn _print_unlocked(args: fmt::Arguments) {
     let _ = LockedWriter.write_fmt(args);

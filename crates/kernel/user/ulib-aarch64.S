@@ -98,6 +98,12 @@ DEFINE_SYSCALL readlink,      59
 DEFINE_SYSCALL lstat,         60
 DEFINE_SYSCALL ioctl,         61
 DEFINE_SYSCALL poll,          62
+DEFINE_SYSCALL socket,        63
+DEFINE_SYSCALL bind,          64
+DEFINE_SYSCALL listen,        65
+DEFINE_SYSCALL accept,        66
+DEFINE_SYSCALL connect,       67
+DEFINE_SYSCALL socketpair,    68
 
 // _sigret — POSIX signal restorer trampoline. Same role as the
 // riscv version: linked into every C user binary, used as the

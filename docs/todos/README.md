@@ -10,21 +10,16 @@ directory contains a `README.md` with the plan/summary, plus optional
 
 | Bucket | Count | What's in it |
 |---|---|---|
-| `done/` | 34 | Through SMP hardening (cross-hart IPIs + pid registry) — **full suite passes on riscv64 `-smp 3` AND aarch64 `-smp 4`** (and `-smp 1`) |
-| `pending/` | 3 | fs/console robustness + POSIX sockets + phase-2 GUI |
+| `done/` | 35 | Through fs/console robustness — sparse files, demand-mapped lazy I/O, console line discipline (^D/erase/echo), waker-driven poll; **full suite (74 tests) green at smp1 + smp3/4, both arches** |
+| `pending/` | 2 | POSIX sockets + phase-2 GUI |
 | `revisit/` | 3 | Decisions to potentially revisit later |
 
 ## Pending — priority order
 
-1. [20-fs-console-robustness](pending/20-fs-console-robustness/) —
-   sparse-hole reads (user-reachable bmap asserts / boot-block reads
-   via ftruncate), iget cache-full wait, lazy demand-map in
-   copyin/copyout, console line discipline (^D/erase/echo),
-   console_write chunking, poll waker registration.
-2. [16-posix-compat](pending/16-posix-compat/) — re-scoped: picolibc +
+1. [16-posix-compat](pending/16-posix-compat/) — re-scoped: picolibc +
    bc/dc/lua already run in-tree; what remains is sockets (AF_UNIX,
    then TCP/IP via smoltcp + virtio-net).
-3. [12-phase2-gui](pending/12-phase2-gui/) — minimal
+2. [12-phase2-gui](pending/12-phase2-gui/) — minimal
    framebuffer-backed display.
 
 ## Done — chronological
@@ -65,6 +60,7 @@ directory contains a `README.md` with the plan/summary, plus optional
 | 31 | [correctness-audit](done/17-correctness-audit/) | +750/−287 — kernel-wide audit; lost-wakeup waker class, begin_op livelock, free-list heap allocator, fd description sharing, fault-type checks, OOM leak fixes |
 | 32 | [proc-lifecycle](done/18-proc-lifecycle/) | ~+330 — real init (pid 1) + orphan reparenting, deferred-iput inode reaper, executor slot reuse; +2 regression tests |
 | 33 | [smp-hardening](done/19-smp-hardening/) | ~+150 — riscv M-mode CLINT-MSIP→SSIP IPI trampoline, aarch64 SGI wiring, wake-IPIs, pid registry; **full suite green at -smp 3/4** |
+| 34 | [fs-console-robustness](done/20-fs-console-robustness/) | ~+300 — sparse-hole reads, ftruncate clamp, iget-wait, lazy demand-map in copyin/copyout, console line discipline (^D/erase/echo), fair console_write, waker-driven poll; +2 tests |
 
 (Rows 30/31 live in `done/15-xv6-compat` and `done/17-correctness-audit`
 — their numeric directory prefixes collide with older done entries; the

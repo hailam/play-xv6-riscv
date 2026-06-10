@@ -2890,6 +2890,152 @@ unlinkedfree(char *s)
   }
 }
 
+// Sparse files: ftruncate-grow leaves holes at every level of the
+// block tree; reads must see zeros (they used to panic the kernel on
+// bmap asserts, or read the BOOT BLOCK as data in the direct range).
+void
+sparsefile(char *s)
+{
+  enum { HOLEBLKS = 60 };  // spans direct (12) into single-indirect
+  unlink("sparse");
+  int fd = open("sparse", O_CREATE | O_RDWR);
+  if(fd < 0){ printf("%s: create failed\n", s); exit(1); }
+  if(ftruncate(fd, HOLEBLKS*BSIZE) < 0){
+    printf("%s: ftruncate failed\n", s); exit(1);
+  }
+  char b[32];
+  if(pread(fd, b, sizeof(b), 5*BSIZE) != sizeof(b)){
+    printf("%s: pread direct-hole failed\n", s); exit(1);
+  }
+  for(int i = 0; i < (int)sizeof(b); i++)
+    if(b[i]){ printf("%s: direct hole not zero\n", s); exit(1); }
+  if(pread(fd, b, sizeof(b), 40*BSIZE+7) != sizeof(b)){
+    printf("%s: pread indirect-hole failed\n", s); exit(1);
+  }
+  for(int i = 0; i < (int)sizeof(b); i++)
+    if(b[i]){ printf("%s: indirect hole not zero\n", s); exit(1); }
+  // Write into the middle of the hole; neighbours stay zero.
+  if(pwrite(fd, "xyz", 3, 30*BSIZE+1) != 3){
+    printf("%s: pwrite into hole failed\n", s); exit(1);
+  }
+  if(pread(fd, b, 5, 30*BSIZE) != 5){
+    printf("%s: pread back failed\n", s); exit(1);
+  }
+  if(b[0] != 0 || b[1] != 'x' || b[2] != 'y' || b[3] != 'z' || b[4] != 0){
+    printf("%s: hole-write readback wrong\n", s); exit(1);
+  }
+  // EOF exactly at size.
+  if(pread(fd, b, 8, HOLEBLKS*BSIZE) != 0){
+    printf("%s: read at EOF should be 0\n", s); exit(1);
+  }
+  // Past the inode's addressable max: EFBIG-style failure.
+  if(ftruncate(fd, 16*1024*1024) >= 0){
+    printf("%s: ftruncate past MAXFILE succeeded\n", s); exit(1);
+  }
+  close(fd);
+  unlink("sparse");
+}
+
+// Syscalls into never-faulted lazy-sbrk pages must demand-map (xv6's
+// copyin/copyout allocate on demand) — both the copy-out (read) and
+// copy-in (write) directions.
+void
+lazyio(char *s)
+{
+  char *p = sbrklazy(8*PGSIZE);
+  if(p == SBRK_ERROR){ printf("%s: sbrklazy failed\n", s); exit(1); }
+  int fd = open("README", 0);
+  if(fd < 0){ printf("%s: open README failed\n", s); exit(1); }
+  char *dst = p + 3*PGSIZE;       // untouched lazy page
+  int n = read(fd, dst, 64);
+  if(n != 64){
+    printf("%s: read into lazy buf returned %d\n", s, n); exit(1);
+  }
+  int wfd = open("lazyio.tmp", O_CREATE | O_RDWR);
+  if(wfd < 0){ printf("%s: create failed\n", s); exit(1); }
+  char *src = p + 6*PGSIZE;       // different untouched lazy page
+  if(write(wfd, src, 32) != 32){
+    printf("%s: write from lazy buf failed\n", s); exit(1);
+  }
+  close(fd);
+  close(wfd);
+  unlink("lazyio.tmp");
+  sbrk(-(8*PGSIZE));
+}
+
+// AF_UNIX stream sockets: socketpair both directions + EOF on peer
+// close, then the full bind/listen/connect/accept echo flow across
+// fork (server child, client parent) with an fs-visible socket node.
+void
+unixsock(char *s)
+{
+  int sv[2];
+  char b[16];
+  if(socketpair(sv) < 0){ printf("%s: socketpair failed\n", s); exit(1); }
+  if(write(sv[0], "ab", 2) != 2){ printf("%s: sp write failed\n", s); exit(1); }
+  if(read(sv[1], b, 2) != 2 || b[0] != 'a' || b[1] != 'b'){
+    printf("%s: sp read mismatch\n", s); exit(1);
+  }
+  if(write(sv[1], "z", 1) != 1 || read(sv[0], b, 1) != 1 || b[0] != 'z'){
+    printf("%s: sp reverse direction failed\n", s); exit(1);
+  }
+  close(sv[0]);
+  if(read(sv[1], b, 4) != 0){
+    printf("%s: no EOF after peer close\n", s); exit(1);
+  }
+  if(write(sv[1], "x", 1) >= 0){
+    printf("%s: write to closed peer should fail\n", s); exit(1);
+  }
+  close(sv[1]);
+
+  unlink("usock");
+  int srv = socket(1, 1, 0);
+  if(srv < 0 || bind(srv, "usock") < 0 || listen(srv, 8) < 0){
+    printf("%s: server setup failed\n", s); exit(1);
+  }
+  // Re-binding the same path must fail (EADDRINUSE).
+  int dup_srv = socket(1, 1, 0);
+  if(bind(dup_srv, "usock") >= 0){
+    printf("%s: double bind succeeded\n", s); exit(1);
+  }
+  close(dup_srv);
+  int pid = fork();
+  if(pid == 0){
+    int c = accept(srv);
+    if(c < 0) exit(1);
+    char m[16];
+    int n = read(c, m, sizeof(m));
+    if(n <= 0) exit(1);
+    if(write(c, m, n) != n) exit(1);
+    close(c);
+    exit(0);
+  }
+  int cl = socket(1, 1, 0);
+  if(cl < 0 || connect(cl, "usock") < 0){
+    printf("%s: connect failed\n", s); exit(1);
+  }
+  if(write(cl, "ping!", 5) != 5){ printf("%s: send failed\n", s); exit(1); }
+  int n = read(cl, b, sizeof(b));
+  if(n != 5 || memcmp(b, "ping!", 5) != 0){
+    printf("%s: echo mismatch (n=%d)\n", s, n); exit(1);
+  }
+  close(cl);
+  int st;
+  wait(&st);
+  if(st != 0){ printf("%s: server exited %d\n", s, st); exit(1); }
+  close(srv);
+  // The binding is an fs node: visible + unlinkable.
+  if(unlink("usock") < 0){
+    printf("%s: unlink of socket node failed\n", s); exit(1);
+  }
+  // Connecting to a vanished listener fails cleanly.
+  int cl2 = socket(1, 1, 0);
+  if(connect(cl2, "usock") >= 0){
+    printf("%s: connect to unlinked socket succeeded\n", s); exit(1);
+  }
+  close(cl2);
+}
+
 struct test {
   void (*f)(char *);
   char *s;
@@ -2923,6 +3069,9 @@ struct test {
   {reparent2, "reparent2"},
   {orphanppid, "orphanppid"},
   {unlinkedfree, "unlinkedfree"},
+  {sparsefile, "sparsefile"},
+  {lazyio, "lazyio"},
+  {unixsock, "unixsock"},
   {mem, "mem"},
   {sharedfd, "sharedfd"},
   {fourfiles, "fourfiles"},

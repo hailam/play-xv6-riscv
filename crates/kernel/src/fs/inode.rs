@@ -173,6 +173,25 @@ pub fn init_cache() {
 /// which manifested as `usertests::copyin`'s `open(copyin1)` failing
 /// on the second iteration of its open/unlink loop.
 pub fn iget(dev: u32, inum: u32) -> Arc<Inode> {
+    // Sync variant for boot-time callers (cache can't be full yet).
+    try_iget(dev, inum).expect("inode cache full at boot")
+}
+
+/// Async iget: when every cache slot is held, yield and retry —
+/// holders release their `Arc`s at await points, so one trip around
+/// the ready queue makes progress (same recipe as `bread`'s
+/// cache-full path). Replaces a user-reachable "inode cache full"
+/// panic (NPROC procs × NOFILE distinct files exceeds the 50 slots).
+pub async fn iget_wait(dev: u32, inum: u32) -> Arc<Inode> {
+    loop {
+        if let Some(ip) = try_iget(dev, inum) {
+            return ip;
+        }
+        crate::wait::yield_now().await;
+    }
+}
+
+fn try_iget(dev: u32, inum: u32) -> Option<Arc<Inode>> {
     let cache = CACHE.lock();
     // Live entry — someone other than the cache holds it.
     for ip in cache.bufs.iter() {
@@ -180,7 +199,7 @@ pub fn iget(dev: u32, inum: u32) -> Arc<Inode> {
             && ip.inum.load(Ordering::Acquire) == inum
             && ip.dev.load(Ordering::Acquire) == dev
         {
-            return ip.clone();
+            return Some(ip.clone());
         }
     }
     // No live holder. Reuse the first idle slot — re-stamping
@@ -190,10 +209,10 @@ pub fn iget(dev: u32, inum: u32) -> Arc<Inode> {
             ip.dev.store(dev, Ordering::Release);
             ip.inum.store(inum, Ordering::Release);
             ip.valid.store(false, Ordering::Release);
-            return ip.clone();
+            return Some(ip.clone());
         }
     }
-    panic!("inode cache full");
+    None
 }
 
 pub async fn ilock<'a>(ip: &'a Arc<Inode>) -> LockedInode<'a> {
@@ -284,16 +303,28 @@ pub async fn readi(li: &LockedInode<'_>, dst: &mut [u8], off: u32) -> usize {
     let mut cur_off = off;
     while tot < limit {
         let blkno = bmap(li, cur_off / BSIZE as u32).await;
-        let buf = bio::bread(blkno).await;
         let block_off = (cur_off as usize) % BSIZE;
         let chunk = (BSIZE - block_off).min(limit - tot);
-        dst[tot..tot + chunk].copy_from_slice(&buf.data()[block_off..block_off + chunk]);
+        if blkno == 0 {
+            // Sparse hole — reads as zeros.
+            dst[tot..tot + chunk].fill(0);
+        } else {
+            let buf = bio::bread(blkno).await;
+            dst[tot..tot + chunk]
+                .copy_from_slice(&buf.data()[block_off..block_off + chunk]);
+        }
         tot += chunk;
         cur_off += chunk as u32;
     }
     tot
 }
 
+/// Map file block index `bn` to a disk block, or 0 for a HOLE —
+/// `ftruncate` can grow a file without allocating, so any level of
+/// the tree may legitimately be missing. Readers must render holes
+/// as zeros (POSIX); they were previously asserts, which made a
+/// sparse read a user-triggerable kernel panic (or, for the direct
+/// range, silently `bread(0)` — the boot block — as file content).
 async fn bmap(li: &LockedInode<'_>, bn: u32) -> u32 {
     let state_addrs = li.state().addrs;
     if (bn as usize) < NDIRECT {
@@ -303,24 +334,32 @@ async fn bmap(li: &LockedInode<'_>, bn: u32) -> u32 {
     if (bn as usize) < NDIRECT + NINDIRECT {
         let idx = (bn as usize) - NDIRECT;
         let ind_blkno = state_addrs[NDIRECT];
-        assert!(ind_blkno != 0, "bmap: missing indirect block for bn={}", bn);
+        if ind_blkno == 0 {
+            return 0;
+        }
         let ind_buf = bio::bread(ind_blkno).await;
         let o = idx * 4;
         return u32::from_le_bytes(ind_buf.data()[o..o + 4].try_into().unwrap());
     }
     // Double-indirect range: NDIRECT+NINDIRECT .. MAXFILE. Walk
     // root → leaf-indirect → data block.
-    assert!(bn < MAXFILE, "bmap: file too big (bn={})", bn);
+    if bn >= MAXFILE {
+        return 0;
+    }
     let off = (bn as usize) - NDIRECT - NINDIRECT;
     let outer = off / NINDIRECT;
     let inner = off % NINDIRECT;
     let root_blkno = state_addrs[NDOUBLE_SLOT];
-    assert!(root_blkno != 0, "bmap: missing double-indirect root bn={}", bn);
+    if root_blkno == 0 {
+        return 0;
+    }
     let root_buf = bio::bread(root_blkno).await;
     let leaf_blkno = u32::from_le_bytes(
         root_buf.data()[outer * 4..outer * 4 + 4].try_into().unwrap(),
     );
-    assert!(leaf_blkno != 0, "bmap: missing double-indirect leaf bn={}", bn);
+    if leaf_blkno == 0 {
+        return 0;
+    }
     let leaf_buf = bio::bread(leaf_blkno).await;
     let o = inner * 4;
     u32::from_le_bytes(leaf_buf.data()[o..o + 4].try_into().unwrap())
@@ -779,7 +818,7 @@ pub async fn ialloc(dev: u32, typ: u16, mode: u16) -> Option<Arc<Inode>> {
                 buf.data_mut()[off..off + bytes.len()].copy_from_slice(bytes);
             }
             crate::fs::log::log_write(&buf);
-            return Some(iget(dev, inum));
+            return Some(iget_wait(dev, inum).await);
         }
     }
     None

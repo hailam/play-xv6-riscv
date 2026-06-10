@@ -362,15 +362,61 @@ impl Proc {
     fn translate_user_perm(&self, va: usize, write: bool) -> Option<usize> {
         let page = va & !(PGSIZE - 1);
         let off = va & (PGSIZE - 1);
-        let pt = self.pagetable.lock();
-        let (pa, perm) = pt.translate(page)?;
-        if perm.0 & PtePerm::USER == 0 {
-            return None;
+        loop {
+            {
+                let pt = self.pagetable.lock();
+                if let Some((pa, perm)) = pt.translate(page) {
+                    if perm.0 & PtePerm::USER == 0 {
+                        return None;
+                    }
+                    if write && perm.0 & PtePerm::WRITE == 0 {
+                        return None;
+                    }
+                    return Some(pa + off);
+                }
+            }
+            // Unmapped: demand-map lazy-sbrk heap and anonymous-VMA
+            // pages, exactly like the fault path would — without this,
+            // read(fd, fresh_sbrklazy_buf, n) fails where real
+            // hardware would just fault the page in (xv6's copyout
+            // allocates on demand in its lazy labs). File-backed VMAs
+            // need an async inode read and stay fault-path-only.
+            if !self.demand_map_zero_page(page) {
+                return None;
+            }
         }
-        if write && perm.0 & PtePerm::WRITE == 0 {
-            return None;
+    }
+
+    /// Synchronously map a zero page at `page` if it falls in the
+    /// lazy heap (`< size`) or an anonymous VMA. Returns false if the
+    /// address is in neither (or on OOM / file-backed VMA).
+    fn demand_map_zero_page(&self, page: usize) -> bool {
+        let perm = if page < self.size.load(Ordering::Acquire) {
+            PtePerm::URW
+        } else {
+            let vmas = self.vmas.lock();
+            let Some(v) = vmas
+                .iter()
+                .find(|v| page >= v.start && page < v.end && v.file.is_none())
+            else {
+                return false;
+            };
+            crate::syscall::vma_prot_to_pteperm(v.prot)
+        };
+        let Some(pa) = KFRAMES.alloc_zeroed() else {
+            return false;
+        };
+        let mut pt = self.pagetable.lock();
+        if pt.translate(page).is_some() {
+            // Raced with the fault path on another hart — fine.
+            unsafe { KFRAMES.free(pa) };
+            return true;
         }
-        Some(pa + off)
+        if pt.map(page, pa, PGSIZE, perm, &KFRAMES).is_err() {
+            unsafe { KFRAMES.free(pa) };
+            return false;
+        }
+        true
     }
 
     pub fn replace_image(&self, new_pt: <Arch as Hal>::PageTable, new_size: usize) {

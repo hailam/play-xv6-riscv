@@ -23,6 +23,8 @@ pub const T_DIR: u16 = 1;
 pub const T_FILE: u16 = 2;
 pub const T_DEVICE: u16 = 3;
 pub const T_SYMLINK: u16 = 4;
+/// AF_UNIX socket binding — a namespace entry only; no data blocks.
+pub const T_SOCK: u16 = 5;
 
 /// On-disk filesystem superblock; lives at block 1.
 #[repr(C)]

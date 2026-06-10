@@ -228,6 +228,15 @@ int   getcwd(char* buf, unsigned int len);
 int   rename(const char* old_path, const char* new_path);
 int   waitpid(int pid, int* status, int options);
 int   pause(void);
+
+// AF_UNIX stream sockets (path-based API; sockaddr translation is
+// the libc glue's job). domain=1 (AF_UNIX), type=1 (SOCK_STREAM).
+int   socket(int domain, int type, int protocol);
+int   bind(int fd, const char *path);
+int   listen(int fd, int backlog);
+int   accept(int fd);
+int   connect(int fd, const char *path);
+int   socketpair(int sv[2]);
 unsigned int alarm(unsigned int seconds);
 
 #define WNOHANG 1
