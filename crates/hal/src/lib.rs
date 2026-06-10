@@ -99,6 +99,10 @@ pub trait Hal: 'static {
     /// OpenSBI on riscv). aarch64 overrides to issue PSCI CPU_ON.
     unsafe fn start_secondary_harts(_ncpus: usize) {}
 
+    /// Extra identity-mapped MMIO ranges the kernel pagetable needs
+    /// beyond UART/INTC/VIRTIO (e.g. the riscv CLINT for IPIs).
+    const EXTRA_MMIO: &'static [(usize, usize)] = &[];
+
     unsafe fn intr_off();
     unsafe fn intr_on();
     fn intr_get() -> bool;

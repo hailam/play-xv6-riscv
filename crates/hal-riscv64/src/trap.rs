@@ -7,6 +7,7 @@ extern "C" {
 }
 
 const SCAUSE_INTERRUPT: usize = 1usize << 63;
+const SCAUSE_SOFT: usize = 1;
 const SCAUSE_TIMER: usize = 5;
 const SCAUSE_EXTERNAL: usize = 9;
 
@@ -47,6 +48,13 @@ fn decode_and_handle(scause: usize) -> bool {
     }
     let code = scause & !SCAUSE_INTERRUPT;
     match code {
+        SCAUSE_SOFT => {
+            // Cross-hart IPI kick: clearing SSIP is all there is to
+            // do — the interrupted wfi/run-loop re-checks its ready
+            // queue right after.
+            unsafe { csr::write_sip(csr::read_sip() & !2) };
+            true
+        }
         SCAUSE_TIMER => {
             unsafe { csr::write_stimecmp(usize::MAX) };
             crate::trap_hook::on_timer();

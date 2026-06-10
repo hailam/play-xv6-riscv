@@ -32,6 +32,12 @@ pub fn init_and_install() {
         .expect("map VIRTIO0");
     pt.map(INTC_BASE, INTC_BASE, INTC_SIZE, PtePerm::RW, &KFRAMES)
         .expect("map interrupt controller");
+    // Arch-specific extras (riscv: the CLINT page, so S-mode can ring
+    // MSIP doorbells for cross-hart IPIs).
+    for &(base, size) in <Arch as Hal>::EXTRA_MMIO {
+        pt.map(base, base, size, PtePerm::RW, &KFRAMES)
+            .expect("map extra MMIO");
+    }
 
     // Kernel text RX (includes trampoline page since it's inside .text),
     // kernel data + free physmem RW.

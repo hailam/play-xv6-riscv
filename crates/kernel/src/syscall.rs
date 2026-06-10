@@ -829,8 +829,6 @@ async fn sys_fork(parent: &Arc<Proc>) -> i64 {
     let child_arc = Arc::new(child);
     *child_arc.parent.lock() = Some(Arc::downgrade(parent));
     parent.children.lock().push(child_arc.clone());
-    // Pipe reader/writer counts are bumped inside `Proc::fork_from`'s
-    // file table clone via `File::Clone`.
     crate::proc::spawn_proc_main(child_arc);
     child_pid
 }

@@ -552,7 +552,29 @@ fn next_pid() -> usize {
     NEXT.fetch_add(1, Ordering::Relaxed) as usize
 }
 
+/// All live procs, by weak ref — the authoritative pid lookup table
+/// (kill / alarm / waitpid). Registered at spawn; dead weaks are
+/// purged opportunistically on lookup.
+static PROC_REGISTRY: SpinLock<Vec<alloc::sync::Weak<Proc>>> =
+    SpinLock::new(Vec::new());
+
+pub fn find_by_pid(pid: usize) -> Option<Arc<Proc>> {
+    let mut reg = PROC_REGISTRY.lock();
+    let mut found = None;
+    reg.retain(|w| match w.upgrade() {
+        Some(p) => {
+            if p.pid == pid && found.is_none() {
+                found = Some(p);
+            }
+            true
+        }
+        None => false,
+    });
+    found
+}
+
 pub fn spawn_proc_main(proc: Arc<Proc>) -> executor::TaskId {
+    PROC_REGISTRY.lock().push(Arc::downgrade(&proc));
     executor::spawn(proc, |p| Box::pin(proc_main(p)))
 }
 

@@ -98,7 +98,27 @@ impl Hal for Riscv64 {
     unsafe fn wfi() {
         csr::wfi();
     }
-    unsafe fn send_ipi(_hart_mask: u64) {}
+    unsafe fn send_ipi(hart_mask: u64) {
+        // Ring each target's CLINT MSIP doorbell. The M-mode
+        // trampoline (start.rs m_ipivec) turns it into an SSIP kick
+        // that breaks the target out of `wfi` or user mode.
+        let mut mask = hart_mask;
+        while mask != 0 {
+            let hart = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            unsafe {
+                core::ptr::write_volatile(
+                    (memlayout::CLINT + 4 * hart) as *mut u32,
+                    1,
+                );
+            }
+        }
+    }
+
+    /// CLINT page — S-mode `send_ipi` writes MSIP doorbells through
+    /// the kernel pagetable, so the page must be mapped.
+    const EXTRA_MMIO: &'static [(usize, usize)] =
+        &[(memlayout::CLINT, memlayout::PGSIZE)];
 
     fn console_putc(c: u8) {
         uart::putc(c);
@@ -156,9 +176,19 @@ impl Hal for Riscv64 {
         }
         if scause & SCAUSE_INTERRUPT != 0 {
             let code = scause & !SCAUSE_INTERRUPT;
+            const SCAUSE_SOFT: usize = 1;
             return match code {
                 SCAUSE_TIMER => UserTrapCause::Timer,
                 SCAUSE_EXTERNAL => UserTrapCause::Devintr,
+                SCAUSE_SOFT => {
+                    // Cross-hart IPI kick (MSIP -> SSIP via the M-mode
+                    // trampoline). Clear it; landing in the kernel was
+                    // the entire point. Devintr is a harmless no-op
+                    // event for proc_main (riscv handle_external
+                    // tolerates a zero claim).
+                    unsafe { csr::write_sip(csr::read_sip() & !2) };
+                    UserTrapCause::Devintr
+                }
                 _ => UserTrapCause::Unknown { code: scause, va: 0 },
             };
         }

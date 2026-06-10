@@ -4,6 +4,41 @@
 use core::arch::asm;
 
 use crate::csr;
+use crate::memlayout::CLINT;
+
+const MIE_MSIE: usize = 1 << 3; // machine software interrupt enable
+
+/// Per-hart M-mode scratch for the IPI trampoline:
+///   [0] saved a1, [1] unused, [2] this hart's CLINT MSIP address.
+#[repr(C, align(16))]
+struct MScratch([u64; 4]);
+static mut MSCRATCH: [MScratch; 8] = [const { MScratch([0; 4]) }; 8];
+
+// M-mode trap vector. The ONLY machine interrupt we leave enabled is
+// MSIP (the cross-hart IPI doorbell): clear it, convert it into a
+// supervisor software interrupt (SSIP — delegated to S-mode), mret.
+// S-mode sees scause=1 and treats it as a pure wakeup kick.
+core::arch::global_asm!(
+    r#"
+.section .text
+.balign 4
+.global m_ipivec
+m_ipivec:
+        csrrw   a0, mscratch, a0
+        sd      a1, 0(a0)
+        ld      a1, 16(a0)        # this hart's CLINT MSIP address
+        sw      zero, 0(a1)       # clear the doorbell
+        li      a1, 2
+        csrs    mip, a1           # raise SSIP for S-mode
+        ld      a1, 0(a0)
+        csrrw   a0, mscratch, a0
+        mret
+"#
+);
+
+extern "C" {
+    fn m_ipivec();
+}
 
 extern "C" {
     fn kmain() -> !;
@@ -36,6 +71,15 @@ pub unsafe extern "C" fn mstart() -> ! {
     csr::write_pmpcfg0(0xf);
 
     csr::write_tp(csr::read_mhartid());
+
+    // Cross-hart IPI doorbell: another hart writes our CLINT MSIP;
+    // the M-mode trampoline above converts it to an SSIP kick.
+    let hart = csr::read_mhartid();
+    let sc = core::ptr::addr_of_mut!(MSCRATCH[hart]) as *mut u64;
+    unsafe { *sc.add(2) = (CLINT + 4 * hart) as u64 };
+    csr::write_mscratch(sc as usize);
+    csr::write_mtvec(m_ipivec as *const () as usize);
+    csr::write_mie(csr::read_mie() | MIE_MSIE);
 
     csr::write_mepc(kmain as *const () as usize);
     asm!("mret", options(noreturn));

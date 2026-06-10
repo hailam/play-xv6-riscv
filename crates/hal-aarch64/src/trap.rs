@@ -61,7 +61,9 @@ pub fn handle_external_irq() {
         return;
     }
     let src = intid as u32;
-    if (intid as usize) == VIRT_TIMER_PPI {
+    if intid < 16 {
+        // SGI — cross-hart IPI kick; claim+complete is the whole job.
+    } else if (intid as usize) == VIRT_TIMER_PPI {
         // Shouldn't happen via this entry (timer handled inside
         // rust_kerneltrap_irq), but be defensive.
         TIMER_TICKS.fetch_add(1, Ordering::Relaxed);

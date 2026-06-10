@@ -65,6 +65,7 @@ read_csr!(read_mstatus, mstatus);
 write_csr!(write_mstatus, mstatus);
 write_csr!(write_mepc, mepc);
 write_csr!(write_mtvec, mtvec);
+write_csr!(write_mscratch, mscratch);
 read_csr!(read_mie, mie);
 write_csr!(write_mie, mie);
 read_csr!(read_satp, satp);

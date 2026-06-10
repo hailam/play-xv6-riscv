@@ -10,10 +10,9 @@
 //!     drains the local ready queue, polls each task, and after each
 //!     poll checks `cpu::take_user_target()` — if set, transfers
 //!     control to user mode (noreturn) on this hart.
-//!   * Cross-CPU wake: `wake(id)` decodes the home CPU and pushes
-//!     to that CPU's ready queue. If the home is a remote hart, the
-//!     remote hart picks it up on its next timer tick. (Proper IPI
-//!     plumbing is a follow-on — see [[ipi-plumbing]].)
+//!   * Cross-CPU wake: `wake(id)` decodes the home CPU, pushes to
+//!     that CPU's ready queue, and IPIs the hart so it notices
+//!     immediately (CLINT MSIP doorbell on riscv, GIC SGI on arm).
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -168,24 +167,22 @@ fn insert_task(home: usize, task: Task) -> TaskId {
 }
 
 pub fn wake(id: TaskId) {
-    EXECUTORS[tid_cpu(id)].ready.lock().push_back(id);
-    // No cross-hart IPI yet — a remote hart picks it up on its
-    // next timer tick. [[ipi-plumbing]]
+    let home = tid_cpu(id);
+    EXECUTORS[home].ready.lock().push_back(id);
+    if home != Arch::hartid() {
+        // Kick the remote hart out of wfi / user mode NOW. Without
+        // the IPI a cross-hart wake waits for the target's next timer
+        // tick (100 ms!) — multi-proc fs tests crawl by ~1000x.
+        unsafe { Arch::send_ipi(1u64 << home) };
+    }
 }
 
-/// Linear scan over all per-CPU task tables for a proc with `pid`.
+/// Find a live proc by pid. Delegates to the proc registry — the
+/// per-CPU task tables are unreliable for this (a task being polled is
+/// `take()`n out of its table, so a cross-hart `kill` or an expiring
+/// alarm would intermittently miss a perfectly live proc).
 pub fn find_proc_by_pid(pid: usize) -> Option<Arc<Proc>> {
-    for c in 0..MAX_CPUS {
-        let tasks = EXECUTORS[c].tasks.lock();
-        for t in tasks.iter().flatten() {
-            if let Some(p) = t.proc.as_ref() {
-                if p.pid == pid {
-                    return Some(Arc::clone(p));
-                }
-            }
-        }
-    }
-    None
+    crate::proc::find_by_pid(pid)
 }
 
 pub fn run() -> ! {
