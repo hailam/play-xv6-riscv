@@ -6,10 +6,29 @@ toolchain is already integrated in-tree (`third_party/`, `picohello`/
 `picotest` user programs) and real ported software runs on it: `bc`,
 `dc`, and **lua** are built into fs.img on both arches. The remaining
 scope of this todo is effectively **sockets**:
-  * Tier 6 remainder — AF_UNIX domain sockets (pthread_* stays
-    out-of-scope by design: cooperative one-task-per-proc model).
+  * Tier 6 remainder — AF_UNIX domain sockets: **DONE (2026-06-11)**.
+    `socket/bind/listen/accept/connect/socketpair` (syscalls 63-68),
+    path-based API (sockaddr_un translation is the libc glue's job).
+    Design: a connected socket is two `PipeInner`s (one per
+    direction) so all blocking/waker/EOF machinery is the pipe code
+    verbatim; endpoints decrement their direction counts in Drop.
+    Bindings are real fs nodes (`T_SOCK = 5` — ls-visible,
+    unlink-able) with an inum→`Weak<Listener>` registry; connect
+    completes immediately (data buffered until accept, backlog cap
+    16). poll() integrates (POLLIN/POLLOUT/POLLHUP/POLLERR +
+    listener-readable). Found+fixed along the way: writes to a
+    fully-closed read side now fail immediately (EPIPE-first in
+    PipeWriteByte — previously they "succeeded" until the buffer
+    filled; affected plain pipes too). No SIGPIPE raise (return -1
+    only — documented divergence). `unixsock` usertest covers
+    socketpair both directions, EOF, EPIPE, double-bind EADDRINUSE,
+    fork'd echo server, unlink + stale-connect. Suite (75 tests)
+    green at smp1 both arches + riscv smp3.
+    (pthread_* stays out-of-scope by design: cooperative
+    one-task-per-proc model.)
   * Tier 7 — TCP/IP + AF_INET (virtio-net behind the HAL + smoltcp;
-    this is the point where the "no external crates" rule gets lifted).
+    this is the point where the "no external crates" rule gets
+    lifted). **This is now the only remaining scope.**
 Also note: fd semantics were corrected by
 [17-correctness-audit](../../done/17-correctness-audit/) — fork/dup/dup2
 now share one open file description (shared offset) per POSIX.

@@ -16,9 +16,10 @@ directory contains a `README.md` with the plan/summary, plus optional
 
 ## Pending — priority order
 
-1. [16-posix-compat](pending/16-posix-compat/) — re-scoped: picolibc +
-   bc/dc/lua already run in-tree; what remains is sockets (AF_UNIX,
-   then TCP/IP via smoltcp + virtio-net).
+1. [16-posix-compat](pending/16-posix-compat/) — AF_UNIX sockets
+   landed 2026-06-11 (syscalls 63-68, fs-visible bindings, poll
+   integration, EPIPE fix); the only remaining scope is TCP/IP
+   (virtio-net + smoltcp — lifts the no-crates rule).
 2. [12-phase2-gui](pending/12-phase2-gui/) — minimal
    framebuffer-backed display.
 
