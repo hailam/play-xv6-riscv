@@ -46,6 +46,7 @@ pub fn init() {
         // Likewise virtio at source 1.
         write_volatile((PLIC + 4 * crate::memlayout::VIRTIO0_IRQ) as *mut u32, 1);
         write_volatile((PLIC + 4 * crate::memlayout::VIRTIO1_IRQ) as *mut u32, 1);
+        write_volatile((PLIC + 4 * crate::memlayout::VIRTIO2_IRQ) as *mut u32, 1);
     }
 }
 
@@ -55,7 +56,8 @@ pub fn init_for_hart() {
     let hartid = csr::read_tp();
     let enable_mask: u32 = (1 << crate::memlayout::UART0_IRQ)
         | (1 << crate::memlayout::VIRTIO0_IRQ)
-        | (1 << crate::memlayout::VIRTIO1_IRQ);
+        | (1 << crate::memlayout::VIRTIO1_IRQ)
+        | (1 << crate::memlayout::VIRTIO2_IRQ);
     unsafe {
         write_volatile(enable_ptr(hartid), enable_mask);
         write_volatile(threshold_ptr(hartid), 0);

@@ -128,12 +128,27 @@ pub use crate::memlayout::{UART0_IRQ as KUART0_IRQ, VIRTIO0_IRQ as KVIRTIO0_IRQ}
 
 /// Convenience init the Hal calls expose.
 pub unsafe fn init_intc_global() {
-    unsafe { gic::init(UART0_IRQ, VIRTIO0_IRQ, crate::memlayout::VIRTIO1_IRQ) }
+    unsafe {
+        gic::init(&[
+            UART0_IRQ,
+            VIRTIO0_IRQ,
+            crate::memlayout::VIRTIO1_IRQ,
+            crate::memlayout::VIRTIO2_IRQ,
+        ])
+    }
 }
 
 pub unsafe fn init_intc_per_hart() {
     unsafe {
-        gic::init_for_hart(UART0_IRQ, VIRTIO0_IRQ, crate::memlayout::VIRTIO1_IRQ, VIRT_TIMER_PPI);
+        gic::init_for_hart(
+            &[
+                UART0_IRQ,
+                VIRTIO0_IRQ,
+                crate::memlayout::VIRTIO1_IRQ,
+                crate::memlayout::VIRTIO2_IRQ,
+            ],
+            VIRT_TIMER_PPI,
+        );
         enable_fp_simd_for_el0_and_el1();
     }
 }

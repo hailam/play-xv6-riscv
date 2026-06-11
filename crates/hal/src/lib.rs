@@ -86,6 +86,11 @@ pub trait Hal: 'static {
     const VIRTIO1: usize;
     const VIRTIO1_SIZE: usize;
     const VIRTIO1_IRQ: usize;
+    /// Third virtio-mmio slot (virtio-input keyboard); same
+    /// probe-and-disable contract.
+    const VIRTIO2: usize;
+    const VIRTIO2_SIZE: usize;
+    const VIRTIO2_IRQ: usize;
 
     /// QEMU fw_cfg MMIO base (used by the ramfb framebuffer driver).
     /// The driver probes the signature and disables itself if absent.

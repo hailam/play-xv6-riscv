@@ -72,6 +72,9 @@ impl Hal for AArch64 {
     const VIRTIO1: usize = memlayout::VIRTIO1;
     const VIRTIO1_SIZE: usize = memlayout::VIRTIO1_SIZE;
     const VIRTIO1_IRQ: usize = memlayout::VIRTIO1_IRQ;
+    const VIRTIO2: usize = memlayout::VIRTIO2;
+    const VIRTIO2_SIZE: usize = memlayout::VIRTIO2_SIZE;
+    const VIRTIO2_IRQ: usize = memlayout::VIRTIO2_IRQ;
     const FWCFG: usize = memlayout::FWCFG;
     /// fw_cfg page — the ramfb driver writes its config blob here.
     const EXTRA_MMIO: &'static [(usize, usize)] =

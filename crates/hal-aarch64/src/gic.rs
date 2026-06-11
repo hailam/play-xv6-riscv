@@ -27,14 +27,15 @@ const GICC_EOIR: usize = GICC_BASE + 0x010;
 
 const SPURIOUS_INTID: u32 = 1023;
 
-/// Global init — hart 0 only.
-pub unsafe fn init(uart_irq: usize, virtio_irq: usize, net_irq: usize) {
+/// Global init — hart 0 only. `spis` = every shared peripheral
+/// interrupt the kernel uses (UART, virtio slots, ...).
+pub unsafe fn init(spis: &[usize]) {
     unsafe {
         // Disable distributor while we configure.
         write_volatile(GICD_CTLR as *mut u32, 0);
 
         // For each SPI we use, set mid priority and target hart 0.
-        for &spi in &[uart_irq, virtio_irq, net_irq] {
+        for &spi in spis {
             // Priority byte.
             write_volatile((GICD_IPRIORITYR + spi) as *mut u8, 0xA0);
             // Target CPU mask (hart 0 = bit 0). SPIs only — PPIs/SGIs
@@ -49,7 +50,7 @@ pub unsafe fn init(uart_irq: usize, virtio_irq: usize, net_irq: usize) {
 
 /// Per-hart init. Enables our PPIs and SPIs from the local CPU
 /// interface's perspective.
-pub unsafe fn init_for_hart(uart_irq: usize, virtio_irq: usize, net_irq: usize, timer_ppi: usize) {
+pub unsafe fn init_for_hart(spis: &[usize], timer_ppi: usize) {
     unsafe {
         // Priority mask wide open.
         write_volatile(GICC_PMR as *mut u32, 0xFF);
@@ -60,9 +61,9 @@ pub unsafe fn init_for_hart(uart_irq: usize, virtio_irq: usize, net_irq: usize, 
         // Enable our IRQs (write 1-to-set in ISENABLER). PPIs are
         // banked per-hart in the same register, so each hart writes
         // its own copy.
-        enable_irq(uart_irq);
-        enable_irq(virtio_irq);
-        enable_irq(net_irq);
+        for &spi in spis {
+            enable_irq(spi);
+        }
         enable_irq(timer_ppi);
         // SGI #0 is our IPI. SGIs are banked per-hart in the same
         // ISENABLER0 (low 16 bits); every hart needs to enable its

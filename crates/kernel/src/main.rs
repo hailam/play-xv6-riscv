@@ -132,6 +132,9 @@ async fn bringup_then_init() {
         driver::ramfb::draw_test_pattern();
     }
 
+    // Keyboard (virtio-input) — probe-and-disable like the NIC.
+    driver::virtio_input::init();
+
     // TCP/IP: probe the NIC, then loopback + eth interfaces and the
     // net poll task.
     driver::virtio_net::init();

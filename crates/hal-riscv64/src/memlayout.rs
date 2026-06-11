@@ -19,6 +19,11 @@ pub const VIRTIO1: usize = 0x1000_2000;
 pub const VIRTIO1_SIZE: usize = PGSIZE;
 pub const VIRTIO1_IRQ: usize = 2;
 
+/// Third virtio-mmio slot (virtio-input keyboard).
+pub const VIRTIO2: usize = 0x1000_3000;
+pub const VIRTIO2_SIZE: usize = PGSIZE;
+pub const VIRTIO2_IRQ: usize = 3;
+
 pub const FWCFG: usize = 0x1010_0000;
 pub const FWCFG_SIZE: usize = 0x18;
 

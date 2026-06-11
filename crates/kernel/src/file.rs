@@ -202,6 +202,15 @@ pub enum File {
         writable: bool,
         append: bool,
     },
+    /// The framebuffer device (`/dev/fb0`). read/write hit the live
+    /// ramfb pixel buffer at a byte offset; the offset (like an inode
+    /// fd's) belongs to this open file description. ioctl reports
+    /// geometry.
+    Fb { off: AtomicU32 },
+    /// The input event stream (`/dev/input/0`): raw 8-byte
+    /// virtio-input/evdev events. Read blocks until events arrive;
+    /// no offset (it's a stream, like the console).
+    Input,
 }
 
 // NOTE: `File` deliberately does NOT implement `Clone`. Cloning a
@@ -228,7 +237,7 @@ impl Drop for File {
                 // log transaction. False positives are fine.
                 crate::fs::inode::iput_deferred(Arc::clone(ip));
             }
-            File::Console | File::Socket(_) => {}
+            File::Console | File::Socket(_) | File::Fb { .. } | File::Input => {}
         }
     }
 }

@@ -207,6 +207,22 @@ pub fn dims() -> (usize, usize, usize) {
     (WIDTH, HEIGHT, STRIDE.load(Ordering::Acquire) as usize)
 }
 
+/// Total framebuffer size in bytes (for /dev/fb0's EOF / lseek-end).
+pub fn size_bytes() -> usize {
+    FB_BYTES
+}
+
+/// The framebuffer as a raw byte slice — for /dev/fb0 read/write at a
+/// byte offset. None if ramfb isn't up.
+pub fn bytes() -> Option<&'static mut [u8]> {
+    if !present() {
+        return None;
+    }
+    Some(unsafe {
+        core::slice::from_raw_parts_mut(addr_of_mut!(FRAMEBUF) as *mut u8, FB_BYTES)
+    })
+}
+
 /// Raw framebuffer as a mutable u32 slice (one XRGB8888 pixel each).
 /// Returns None if ramfb didn't come up. The caller owns
 /// synchronization — slice 1 only writes from a single kernel path.

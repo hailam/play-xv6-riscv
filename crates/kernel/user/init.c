@@ -11,9 +11,22 @@
 
 #include "user.h"
 
+// Device-node majors (must match crate::uapi).
+#define FB_MAJOR 1
+#define INPUT_MAJOR 2
+
 int
 main(void)
 {
+  // Populate /dev (idempotent — these may already exist on a
+  // persistent fs.img; mkdir/mknod just fail harmlessly then). The
+  // framebuffer node only works if the kernel brought ramfb up, but
+  // creating the node is cheap regardless.
+  mkdir("/dev");
+  mknod("/dev/fb0", FB_MAJOR, 0);
+  mkdir("/dev/input");
+  mknod("/dev/input/0", INPUT_MAJOR, 0);
+
   for(;;){
     int shpid = fork();
     if(shpid < 0){

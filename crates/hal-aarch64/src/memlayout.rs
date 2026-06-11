@@ -45,6 +45,12 @@ pub const VIRTIO1: usize = 0x0a00_0200;
 pub const VIRTIO1_SIZE: usize = 0x200;
 pub const VIRTIO1_IRQ: usize = 49;
 
+/// Third virtio-mmio slot (virtio-input keyboard). Same 4 KiB page as
+/// VIRTIO0 (0x200 stride). SPI 18 => GIC INTID 32+18 = 50.
+pub const VIRTIO2: usize = 0x0a00_0400;
+pub const VIRTIO2_SIZE: usize = 0x200;
+pub const VIRTIO2_IRQ: usize = 50;
+
 /// Same trampoline / trapframe arrangement as riscv64: top of user VA
 /// space, two pages reserved.
 pub const TRAMPOLINE: usize = MAXVA - PGSIZE;

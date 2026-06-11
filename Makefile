@@ -24,8 +24,9 @@ QEMUOPTS += -drive file=fs.img,if=none,format=raw,id=x0
 QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 QEMUOPTS += -netdev user,id=n0,hostfwd=tcp:127.0.0.1:17878-:7878
 QEMUOPTS += -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1
+QEMUOPTS += -device virtio-keyboard-device,bus=virtio-mmio-bus.2
 
-.PHONY: build mkfs qemu qemu-gdb test-net test-fb clean fmt
+.PHONY: build mkfs qemu qemu-gdb test-net test-fb test-input test-gui clean fmt
 
 build:
 	cargo build $(CARGO_FLAGS) -p kernel
@@ -42,6 +43,12 @@ fs.img: build $(MKFS)
 		README:crates/kernel/user/README \
 		init:$(USER_DIR)/init.elf \
 		tcpecho:$(USER_DIR)/tcpecho.elf \
+		fbtest:$(USER_DIR)/fbtest.elf \
+		kbtest:$(USER_DIR)/kbtest.elf \
+		wm:$(USER_DIR)/wm.elf \
+		hello_wm:$(USER_DIR)/hello_wm.elf \
+		clock:$(USER_DIR)/clock.elf \
+		guidemo:$(USER_DIR)/guidemo.elf \
 		echo:$(USER_DIR)/echo.elf \
 		sh:$(USER_DIR)/sh.elf \
 		cat:$(USER_DIR)/cat.elf \
@@ -98,11 +105,24 @@ qemu-gdb: build fs.img
 test-net: build fs.img
 	python3 scripts/test-net.py
 
-# ramfb framebuffer (todo 12 M1): boot with -device ramfb + a QMP
-# socket, let the kernel draw its test pattern, screendump the
-# scanout and verify the pixels. Headless (no display backend needed).
+# ramfb framebuffer (todo 12): headless screendump checks. `kernel`
+# verifies the M1 boot pattern via the fw_cfg/ramfb scanout path;
+# `user` runs /fbtest, which draws through /dev/fb0 (M2 device file).
 test-fb: build fs.img
-	python3 scripts/test-fb.py
+	python3 scripts/test-fb.py kernel
+	python3 scripts/test-fb.py user
+
+# virtio-input keyboard (todo 12 M3): boot with a virtio keyboard +
+# QMP, run /kbtest in the guest, inject a key via QMP send-key and
+# verify the evdev events reach userspace through /dev/input/0.
+test-input: build fs.img
+	python3 scripts/test-input.py
+
+# Display server (todo 12 M4): boot with ramfb + keyboard + QMP, run
+# guidemo (wm + hello_wm + clock), screendump to verify both windows
+# composite, inject a key and verify it routes to the focused client.
+test-gui: build fs.img
+	python3 scripts/test-gui.py
 
 # ---- aarch64 ----
 AARCH64_TARGET   = aarch64-unknown-none-softfloat
@@ -116,6 +136,7 @@ AARCH64_QEMUOPTS += -drive file=fs-aarch64.img,if=none,format=raw,id=x0
 AARCH64_QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 AARCH64_QEMUOPTS += -netdev user,id=n0,hostfwd=tcp:127.0.0.1:17879-:7878
 AARCH64_QEMUOPTS += -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1
+AARCH64_QEMUOPTS += -device virtio-keyboard-device,bus=virtio-mmio-bus.2
 
 build-aarch64:
 	cargo build $(CARGO_FLAGS) -p kernel --target $(AARCH64_TARGET)
@@ -125,6 +146,12 @@ fs-aarch64.img: build-aarch64 $(MKFS)
 		README:crates/kernel/user/README \
 		init:$(AARCH64_USER_DIR)/init.elf \
 		tcpecho:$(AARCH64_USER_DIR)/tcpecho.elf \
+		fbtest:$(AARCH64_USER_DIR)/fbtest.elf \
+		kbtest:$(AARCH64_USER_DIR)/kbtest.elf \
+		wm:$(AARCH64_USER_DIR)/wm.elf \
+		hello_wm:$(AARCH64_USER_DIR)/hello_wm.elf \
+		clock:$(AARCH64_USER_DIR)/clock.elf \
+		guidemo:$(AARCH64_USER_DIR)/guidemo.elf \
 		echo:$(AARCH64_USER_DIR)/echo.elf \
 		sh:$(AARCH64_USER_DIR)/sh.elf \
 		cat:$(AARCH64_USER_DIR)/cat.elf \

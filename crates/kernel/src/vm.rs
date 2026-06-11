@@ -15,6 +15,8 @@ use crate::arch::{
 
 const VIRTIO1: usize = <Arch as Hal>::VIRTIO1;
 const VIRTIO1_SIZE: usize = <Arch as Hal>::VIRTIO1_SIZE;
+const VIRTIO2: usize = <Arch as Hal>::VIRTIO2;
+const VIRTIO2_SIZE: usize = <Arch as Hal>::VIRTIO2_SIZE;
 
 extern "C" {
     static _etext: u8;
@@ -44,6 +46,19 @@ pub fn init_and_install() {
             &KFRAMES,
         )
         .expect("map VIRTIO1");
+    }
+    // virtio-input slot — same dedup rule (on aarch64 all three slots
+    // share VIRTIO0's page).
+    let v2_page = VIRTIO2 & !(PGSIZE - 1);
+    if v2_page != VIRTIO0 & !(PGSIZE - 1) && v2_page != VIRTIO1 & !(PGSIZE - 1) {
+        pt.map(
+            v2_page,
+            v2_page,
+            (VIRTIO2_SIZE + PGSIZE - 1) & !(PGSIZE - 1),
+            PtePerm::RW,
+            &KFRAMES,
+        )
+        .expect("map VIRTIO2");
     }
     pt.map(INTC_BASE, INTC_BASE, INTC_SIZE, PtePerm::RW, &KFRAMES)
         .expect("map interrupt controller");

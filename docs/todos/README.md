@@ -10,17 +10,13 @@ directory contains a `README.md` with the plan/summary, plus optional
 
 | Bucket | Count | What's in it |
 |---|---|---|
-| `done/` | 36 | Through POSIX sockets + TCP/IP — AF_UNIX + smoltcp (loopback + virtio-net, real host↔guest echo via `make test-net`); **suite (74 tests) green smp1 both arches + smp3** |
-| `pending/` | 1 | phase-2 GUI (M1 framebuffer done; M2-M4 ahead) |
+| `done/` | 37 | Through the phase-2 GUI — ramfb framebuffer, /dev/fb0, virtio-input, and a userspace display server with window protocol + demo clients; **suite (74 tests) green smp1 both arches + smp3**; test-net/test-fb/test-input/test-gui all gated |
+| `pending/` | 0 | — the original plan (phases 1 + 2) is complete |
 | `revisit/` | 3 | Decisions to potentially revisit later |
 
 ## Pending — priority order
 
-1. [12-phase2-gui](pending/12-phase2-gui/) — minimal
-   framebuffer-backed display. **M1 done**: ramfb driver via fw_cfg,
-   640×480 XRGB8888, boot test pattern verified by `make test-fb`
-   (headless screendump). Next: M2 `/dev/fb0`, M3 input, M4 display
-   server + windows (IPC prereq — AF_UNIX — already exists, todo 16).
+*(empty — every planned todo is done. New work starts here.)*
 
 ## Done — chronological
 
@@ -62,6 +58,7 @@ directory contains a `README.md` with the plan/summary, plus optional
 | 33 | [smp-hardening](done/19-smp-hardening/) | ~+150 — riscv M-mode CLINT-MSIP→SSIP IPI trampoline, aarch64 SGI wiring, wake-IPIs, pid registry; **full suite green at -smp 3/4** |
 | 34 | [fs-console-robustness](done/20-fs-console-robustness/) | ~+300 — sparse-hole reads, ftruncate clamp, iget-wait, lazy demand-map in copyin/copyout, console line discipline (^D/erase/echo), fair console_write, waker-driven poll; +2 tests |
 | 35 | [posix-compat (sockets+TCP/IP)](done/16-posix-compat/) | AF_UNIX (syscalls 63-68, fs-visible bindings) + TCP/IP via smoltcp 0.12 (loopback + virtio-net, per-interface SocketSets); first external crate; `tcploop`+`unixsock` usertests + `make test-net` host↔guest echo |
+| 36 | [phase2-gui](done/12-phase2-gui/) | ~+1400 — ramfb via fw_cfg DMA (640×480 XRGB8888), /dev/fb0 + /dev/input/0 device files (first device-major dispatch), virtio-input keyboard, userspace display server (wm) + window protocol over AF_UNIX + hello_wm/clock clients; gated by test-fb / test-input / test-gui (headless QMP screendump + send-key) |
 
 (Rows 30/31 live in `done/15-xv6-compat` and `done/17-correctness-audit`
 — their numeric directory prefixes collide with older done entries; the

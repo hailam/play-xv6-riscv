@@ -107,6 +107,28 @@ pub struct Winsize {
     pub ws_ypixel: u16,
 }
 
+/// Device major for the framebuffer (`/dev/fb0`). The `mknod` major
+/// number routes `sys_open` of a T_DEVICE inode to `File::Fb`.
+pub const FB_MAJOR: u16 = 1;
+
+/// Device major for the input event stream (`/dev/input/0`) — raw
+/// 8-byte evdev-style events from the virtio-input keyboard.
+pub const INPUT_MAJOR: u16 = 2;
+
+/// `ioctl(fd, FBIOGET_DIMS, &FbDims)` — report framebuffer geometry.
+pub const FBIOGET_DIMS: i32 = 0x4600;
+
+/// Framebuffer geometry returned by FBIOGET_DIMS. All pixels are
+/// XRGB8888 (`bpp == 32`); a row is `stride` bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FbDims {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub bpp: u32,
+}
+
 /// Minimal POSIX-ish termios. Matches the leading 4 u32s + c_cc[19]
 /// layout from Linux/glibc enough for libc's tcgetattr/tcsetattr
 /// round-trip — we don't actually enforce any of the bits since

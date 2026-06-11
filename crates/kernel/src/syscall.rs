@@ -14,7 +14,6 @@ use crate::arch::Arch;
 use crate::cpu;
 use crate::executor;
 use crate::file::{File, PipeInner, SockEnd, SockState, Socket, TcpConn};
-use smoltcp::socket::tcp;
 use crate::fs;
 use crate::kalloc::KFRAMES;
 use crate::proc::{Proc, ProcState};
@@ -1293,7 +1292,34 @@ async fn sys_write(proc: &Arc<Proc>, fd: i32, buf_va: usize, len: usize) -> i64 
             }
             inode_write(proc, ip.clone(), off, buf_va, len, *append).await
         }
+        File::Fb { off } => fb_write(proc, off, buf_va, len),
+        File::Input => -1,
     }
+}
+
+/// Copy `len` user bytes into the framebuffer at the fd's current
+/// byte offset (clamped to the buffer); advances the offset. Writing
+/// raw XRGB8888 pixels here makes them appear on screen immediately
+/// (ramfb scans the buffer continuously).
+fn fb_write(proc: &Arc<Proc>, off: &AtomicU32, buf_va: usize, len: usize) -> i64 {
+    let Some(fb) = crate::driver::ramfb::bytes() else {
+        return -1;
+    };
+    let cur = off.load(Ordering::Acquire) as usize;
+    if cur >= fb.len() {
+        return 0;
+    }
+    let n = len.min(fb.len() - cur);
+    for i in 0..n {
+        let Some(kva) = proc.translate_user(buf_va + i) else {
+            // Partial write up to the bad page (like a short write).
+            off.store((cur + i) as u32, Ordering::Release);
+            return if i == 0 { -1 } else { i as i64 };
+        };
+        fb[cur + i] = unsafe { *(kva as *const u8) };
+    }
+    off.store((cur + n) as u32, Ordering::Release);
+    n as i64
 }
 
 /// Largest byte count one log transaction may write: xv6 filewrite's
@@ -1438,7 +1464,85 @@ async fn sys_read(proc: &Arc<Proc>, fd: i32, buf_va: usize, len: usize) -> i64 {
             }
             inode_read(proc, ip.clone(), off, buf_va, len).await
         }
+        File::Fb { off } => fb_read(proc, off, buf_va, len),
+        File::Input => input_read(proc, buf_va, len, nonblock).await,
     }
+}
+
+/// Read raw 8-byte input events. Blocks until at least one event is
+/// pending (unless O_NONBLOCK: empty → -1), then returns as many
+/// whole pending bytes as fit. Readers should use len % 8 == 0 to
+/// stay event-aligned.
+async fn input_read(
+    proc: &Arc<Proc>,
+    buf_va: usize,
+    len: usize,
+    nonblock: bool,
+) -> i64 {
+    loop {
+        if proc.killed.load(Ordering::Acquire) {
+            return -1;
+        }
+        let mut tmp = [0u8; 64];
+        let want = len.min(tmp.len());
+        let n = crate::driver::virtio_input::read_nonblock(&mut tmp[..want]);
+        if n > 0 {
+            for (i, b) in tmp[..n].iter().enumerate() {
+                let Some(kva) = proc.translate_user_write(buf_va + i) else {
+                    return -1;
+                };
+                unsafe { *(kva as *mut u8) = *b };
+            }
+            return n as i64;
+        }
+        if nonblock {
+            return -1; // EAGAIN
+        }
+        InputWait { armed: false }.await;
+    }
+}
+
+/// Two-phase parking future: first poll registers on the input
+/// readers list and parks; any wake re-polls Ready and the read loop
+/// above re-checks the queue (multi-waiter safe — losers re-park).
+struct InputWait {
+    armed: bool,
+}
+
+impl Future for InputWait {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.armed || crate::driver::virtio_input::pending() > 0 {
+            return Poll::Ready(());
+        }
+        if current_proc_killed() {
+            return Poll::Ready(());
+        }
+        self.armed = true;
+        crate::driver::virtio_input::register_waker(cx.waker());
+        Poll::Pending
+    }
+}
+
+/// Read framebuffer bytes at the fd's offset into the user buffer
+/// (so a program can read back what's on screen). Advances the offset.
+fn fb_read(proc: &Arc<Proc>, off: &AtomicU32, buf_va: usize, len: usize) -> i64 {
+    let Some(fb) = crate::driver::ramfb::bytes() else {
+        return -1;
+    };
+    let cur = off.load(Ordering::Acquire) as usize;
+    if cur >= fb.len() {
+        return 0;
+    }
+    let n = len.min(fb.len() - cur);
+    for i in 0..n {
+        let Some(kva) = proc.translate_user_write(buf_va + i) else {
+            return if i == 0 { -1 } else { i as i64 };
+        };
+        unsafe { *(kva as *mut u8) = fb[cur + i] };
+    }
+    off.store((cur + n) as u32, Ordering::Release);
+    n as i64
 }
 
 async fn inode_read(
@@ -1710,14 +1814,21 @@ async fn sys_lseek(proc: &Arc<Proc>, fd: i32, offset: i64, whence: i32) -> i64 {
     let Some(file) = proc.get_file(fd) else {
         return -1;
     };
-    let File::Inode { ip, off, .. } = &*file else {
-        return -1;
+    let (off, end) = match &*file {
+        File::Inode { ip, off, .. } => {
+            let end = {
+                let li = fs::inode::ilock(ip).await;
+                li.state().size as i64
+            };
+            (off, end)
+        }
+        // The framebuffer seeks within its fixed byte size — `lseek` is
+        // the natural way to address a pixel: seek to (y*stride + x*4),
+        // then write 4 bytes.
+        File::Fb { off } => (off, crate::driver::ramfb::size_bytes() as i64),
+        _ => return -1,
     };
     let cur = off.load(Ordering::Acquire) as i64;
-    let end = {
-        let li = fs::inode::ilock(ip).await;
-        li.state().size as i64
-    };
     let new = match whence {
         x if x == SEEK_SET => offset,
         x if x == SEEK_CUR => cur + offset,
@@ -2482,9 +2593,11 @@ async fn sys_open(proc: &Arc<Proc>, path_va: usize, flags: u32) -> i64 {
     let append = (flags & O_APPEND) != 0;
 
     let typ;
+    let major;
     {
         let mut li = fs::inode::ilock(&ip).await;
         typ = li.state().typ;
+        major = li.state().major;
         if typ == 0 {
             return -1;
         }
@@ -2508,13 +2621,29 @@ async fn sys_open(proc: &Arc<Proc>, path_va: usize, flags: u32) -> i64 {
             fs::log::end_op().await;
         }
     }
-    let f = Arc::new(File::Inode {
-        ip,
-        off: AtomicU32::new(0),
-        readable,
-        writable,
-        append,
-    });
+    // Device dispatch: a T_DEVICE inode opens a device object rather
+    // than the on-disk inode. Only the framebuffer for now (xv6's
+    // devsw[major] model); unknown majors fall through to plain inode
+    // I/O, which reads/writes the (empty) device inode harmlessly.
+    let f = if typ == xv6_fs_layout::T_DEVICE && major == crate::uapi::FB_MAJOR {
+        if !crate::driver::ramfb::present() {
+            return -1; // no framebuffer on this machine
+        }
+        Arc::new(File::Fb { off: AtomicU32::new(0) })
+    } else if typ == xv6_fs_layout::T_DEVICE && major == crate::uapi::INPUT_MAJOR {
+        if !crate::driver::virtio_input::present() {
+            return -1; // no keyboard on this machine
+        }
+        Arc::new(File::Input)
+    } else {
+        Arc::new(File::Inode {
+            ip,
+            off: AtomicU32::new(0),
+            readable,
+            writable,
+            append,
+        })
+    };
     let entry = crate::file::FdEntry {
         file: f,
         cloexec: (flags & O_CLOEXEC) != 0,
@@ -3414,9 +3543,12 @@ impl Future for PollWait<'_> {
                     }
                     SockState::Fresh(_) => {}
                 },
-                // Inode-backed fds are always ready — if we got here
-                // the caller asked for no events on them.
-                File::Inode { .. } => {}
+                File::Input => {
+                    crate::driver::virtio_input::register_waker(cx.waker())
+                }
+                // Inode and framebuffer fds are always ready — if we
+                // got here the caller asked for no events on them.
+                File::Inode { .. } | File::Fb { .. } => {}
             }
         }
         if let Some(d) = self.deadline {
@@ -3527,8 +3659,16 @@ fn file_revents(file: &File, requested: i16) -> i16 {
             }
             SockState::Fresh(_) => {}
         }
-        File::Inode { .. } => {
-            // Regular files are always ready (no blocking I/O).
+        File::Input => {
+            if (requested & POLLIN) != 0
+                && crate::driver::virtio_input::pending() > 0
+            {
+                r |= POLLIN;
+            }
+        }
+        File::Inode { .. } | File::Fb { .. } => {
+            // Regular files and the framebuffer are always ready
+            // (no blocking I/O).
             if (requested & POLLIN) != 0 {
                 r |= POLLIN;
             }
@@ -3567,6 +3707,28 @@ fn sys_ioctl(proc: &Arc<Proc>, fd: i32, cmd: i32, arg: usize) -> i64 {
     };
 
     match cmd {
+        x if x == crate::uapi::FBIOGET_DIMS => {
+            if !matches!(&*file, File::Fb { .. }) {
+                return -1;
+            }
+            let (w, h, stride) = crate::driver::ramfb::dims();
+            let d = crate::uapi::FbDims {
+                width: w as u32,
+                height: h as u32,
+                stride: stride as u32,
+                bpp: 32,
+            };
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &d as *const _ as *const u8,
+                    core::mem::size_of::<crate::uapi::FbDims>(),
+                )
+            };
+            if !write_struct(arg, bytes) {
+                return -1;
+            }
+            0
+        }
         x if x == TIOCGWINSZ => {
             if !is_console {
                 return -1;
