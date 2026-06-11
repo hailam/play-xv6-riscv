@@ -3036,6 +3036,53 @@ unixsock(char *s)
   close(cl2);
 }
 
+// AF_INET stream sockets over the kernel's smoltcp loopback
+// interface: full TCP handshake, bidirectional data, FIN/EOF — no
+// NIC required, so this gates every run.
+void
+tcploop(char *s)
+{
+  int srv = socket(2, 1, 0);
+  if(srv < 0 || bind(srv, "127.0.0.1:7777") < 0 || listen(srv, 1) < 0){
+    printf("%s: server setup failed\n", s); exit(1);
+  }
+  int pid = fork();
+  if(pid == 0){
+    int c = accept(srv);
+    if(c < 0) exit(1);
+    char m[32];
+    int n = read(c, m, sizeof(m));
+    if(n <= 0) exit(1);
+    if(write(c, m, n) != n) exit(1);
+    // Read until EOF so the client's close completes the teardown.
+    char d[8];
+    if(read(c, d, sizeof(d)) != 0) exit(1);
+    close(c);
+    exit(0);
+  }
+  int cl = socket(2, 1, 0);
+  if(cl < 0 || connect(cl, "127.0.0.1:7777") < 0){
+    printf("%s: connect failed\n", s); exit(1);
+  }
+  if(write(cl, "tcp-ping", 8) != 8){ printf("%s: send failed\n", s); exit(1); }
+  char b[32];
+  int n = read(cl, b, sizeof(b));
+  if(n != 8 || memcmp(b, "tcp-ping", 8) != 0){
+    printf("%s: echo mismatch (n=%d)\n", s, n); exit(1);
+  }
+  close(cl);
+  int st;
+  wait(&st);
+  if(st != 0){ printf("%s: server exited %d\n", s, st); exit(1); }
+  close(srv);
+  // Connecting to a dead port must fail (RST), not hang.
+  int cl2 = socket(2, 1, 0);
+  if(connect(cl2, "127.0.0.1:7999") >= 0){
+    printf("%s: connect to dead port succeeded\n", s); exit(1);
+  }
+  close(cl2);
+}
+
 struct test {
   void (*f)(char *);
   char *s;
@@ -3072,6 +3119,7 @@ struct test {
   {sparsefile, "sparsefile"},
   {lazyio, "lazyio"},
   {unixsock, "unixsock"},
+  {tcploop, "tcploop"},
   {mem, "mem"},
   {sharedfd, "sharedfd"},
   {fourfiles, "fourfiles"},

@@ -81,6 +81,11 @@ pub trait Hal: 'static {
     /// claimed them.
     const UART0_IRQ: usize;
     const VIRTIO0_IRQ: usize;
+    /// Second virtio-mmio slot (virtio-net). The driver probes and
+    /// quietly disables itself if qemu wasn't given the device.
+    const VIRTIO1: usize;
+    const VIRTIO1_SIZE: usize;
+    const VIRTIO1_IRQ: usize;
 
     // ----- arch helpers tied to constants -----
     fn trampoline_pa() -> usize;

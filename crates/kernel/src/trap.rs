@@ -29,6 +29,8 @@ pub extern "C" fn kernel_on_external(src: u32) {
         }
     } else if src == <Arch as Hal>::VIRTIO0_IRQ {
         crate::driver::virtio_blk::on_irq();
+    } else if src == <Arch as Hal>::VIRTIO1_IRQ {
+        crate::driver::virtio_net::on_irq();
     } else {
         crate::println!("external IRQ {} (no handler)", src);
     }

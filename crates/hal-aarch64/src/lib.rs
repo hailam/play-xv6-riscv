@@ -69,6 +69,9 @@ impl Hal for AArch64 {
     const INTC_SIZE: usize = memlayout::INTC_RANGE_SIZE;
     const UART0_IRQ: usize = memlayout::UART0_IRQ;
     const VIRTIO0_IRQ: usize = memlayout::VIRTIO0_IRQ;
+    const VIRTIO1: usize = memlayout::VIRTIO1;
+    const VIRTIO1_SIZE: usize = memlayout::VIRTIO1_SIZE;
+    const VIRTIO1_IRQ: usize = memlayout::VIRTIO1_IRQ;
     /// Skeleton placeholder — real value comes from the ARM generic
     /// timer counter frequency once the boot path is wired.
     const TIMER_INTERVAL: u64 = 1_000_000;

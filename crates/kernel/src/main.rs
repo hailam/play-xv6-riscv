@@ -14,6 +14,7 @@ mod executor;
 mod file;
 mod fs;
 mod heap;
+mod net;
 mod kalloc;
 mod proc;
 mod sync;
@@ -123,6 +124,12 @@ async fn bringup_then_init() {
     executor::spawn_kernel_on(0, || {
         alloc::boxed::Box::pin(fs::inode::inode_reaper())
     });
+
+    // TCP/IP: probe the NIC, then loopback + eth interfaces and the
+    // net poll task.
+    driver::virtio_net::init();
+    net::init();
+    executor::spawn_kernel_on(0, || alloc::boxed::Box::pin(net::net_task()));
 
     println!("spawning init proc ({} bytes)", embed::INITCODE.len());
     let init = Arc::new(Proc::new_initcode(embed::INITCODE));

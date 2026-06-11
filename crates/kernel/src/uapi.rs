@@ -70,8 +70,9 @@ pub const SYS_ACCEPT: usize = 66;
 pub const SYS_CONNECT: usize = 67;
 pub const SYS_SOCKETPAIR: usize = 68;
 
-/// Socket domain / type constants — AF_UNIX stream sockets only.
+/// Socket domain / type constants.
 pub const AF_UNIX: i32 = 1;
+pub const AF_INET: i32 = 2;
 pub const SOCK_STREAM: i32 = 1;
 
 // poll() event bits.

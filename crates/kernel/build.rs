@@ -166,6 +166,7 @@ fn main() {
     // libc.a.
     let programs: &[(&str, &str, Lang, bool, &[Arch], Runtime)] = &[
         ("init", "INIT_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
+        ("tcpecho", "TCPECHO_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
         ("echo", "ECHO_BIN_PATH", Lang::C, true, &[Arch::Riscv64, Arch::Aarch64], Runtime::Ulib),
         ("hello", "HELLO_BIN_PATH", Lang::Asm, false, &[Arch::Riscv64], Runtime::Ulib),
         ("pipetest", "PIPETEST_BIN_PATH", Lang::Asm, false, &[Arch::Riscv64], Runtime::Ulib),

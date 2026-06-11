@@ -14,6 +14,10 @@ pub const UART0_IRQ: usize = 10;
 pub const VIRTIO0: usize = 0x1000_1000;
 pub const VIRTIO0_SIZE: usize = PGSIZE;
 pub const VIRTIO0_IRQ: usize = 1;
+// Second virtio-mmio slot (qemu: bus=virtio-mmio-bus.1) — virtio-net.
+pub const VIRTIO1: usize = 0x1000_2000;
+pub const VIRTIO1_SIZE: usize = PGSIZE;
+pub const VIRTIO1_IRQ: usize = 2;
 
 pub const PLIC: usize = 0x0c00_0000;
 pub const PLIC_SIZE: usize = 0x40_0000;

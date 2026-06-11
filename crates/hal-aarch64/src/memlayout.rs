@@ -36,6 +36,11 @@ pub const INTC_RANGE_SIZE: usize = 0x20000;
 pub const VIRTIO0: usize = 0x0a00_0000;
 pub const VIRTIO0_SIZE: usize = PGSIZE;
 pub const VIRTIO0_IRQ: usize = 48;
+// Second virtio-mmio slot — qemu aarch64 virt strides slots by 0x200
+// (same page as slot 0; vm.rs skips the duplicate mapping).
+pub const VIRTIO1: usize = 0x0a00_0200;
+pub const VIRTIO1_SIZE: usize = 0x200;
+pub const VIRTIO1_IRQ: usize = 49;
 
 /// Same trampoline / trapframe arrangement as riscv64: top of user VA
 /// space, two pages reserved.

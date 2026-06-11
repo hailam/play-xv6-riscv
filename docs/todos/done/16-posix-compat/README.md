@@ -26,9 +26,58 @@ scope of this todo is effectively **sockets**:
     green at smp1 both arches + riscv smp3.
     (pthread_* stays out-of-scope by design: cooperative
     one-task-per-proc model.)
-  * Tier 7 — TCP/IP + AF_INET (virtio-net behind the HAL + smoltcp;
-    this is the point where the "no external crates" rule gets
-    lifted). **This is now the only remaining scope.**
+  * Tier 7 — TCP/IP + AF_INET. **DONE (2026-06-11): loopback M1 +
+    virtio-net M2 both working.**
+    The "no external crates" rule is now lifted: **smoltcp 0.12**
+    (no_std, features medium-ethernet/medium-ip/proto-ipv4/socket-tcp/
+    alloc/async) is the stack. Architecture: one global `NetStack`
+    (loopback iface + optional eth iface + `SocketSet`) behind a
+    SpinLock; a kernel `net_task` owns the poll loop (re-polls on a
+    `kick()` waker or smoltcp's `poll_delay` deadline); blocking
+    syscalls park on smoltcp's per-socket send/recv `Waker`s — which
+    are exactly the executor's wakers (this is why an async kernel
+    pays off here). AF_INET reuses the Tier-6 socket syscalls
+    (`socket(2,1,0)` etc.) with `"a.b.c.d:port"` string addresses
+    (sockaddr_in translation deferred to libc glue). `File::Socket`
+    gained `Tcp`/`TcpListening` states; smoltcp has no backlog so a
+    listener socket *becomes* the connection on SYN and accept()
+    re-arms a fresh one.
+      * **M1 (loopback, 127.0.0.1): DONE + gated.** Full TCP
+        handshake / bidirectional data / FIN-EOF / connection-refused,
+        no NIC needed. The `tcploop` usertest covers it and runs in
+        every suite pass (74 tests green, both arches, smp1 + smp3).
+        Found+fixed: writes to a fully-closed peer now fail
+        immediately (EPIPE-first in PipeWriteByte — also fixed plain
+        pipes/unix sockets).
+      * **M2 (virtio-net, real host↔guest): DONE (2026-06-11).**
+        Driver `crates/kernel/src/driver/virtio_net.rs` (second
+        virtio-mmio slot, modern/v2, negotiates VIRTIO_F_VERSION_1 +
+        VIRTIO_NET_F_MAC, 8 RX/8 TX bufs, 12-byte zero net-hdr) +
+        smoltcp `Device` impl; eth iface 10.0.2.15/24 gw 10.0.2.2
+        (qemu SLIRP); Makefile wires `-netdev user,hostfwd` +
+        `virtio-net-device` on bus .1, both arches. Verified by
+        `make test-net` (`scripts/test-net.py`): the guest runs
+        `/tcpecho` on :7878 and the host connects through the
+        forwarded port and gets a real round-trip echo (pcap shows
+        the guest's `[P.] seq 1:13 length 12` data segment + clean
+        FIN).
+          THE BUG (root-caused via smoltcp source): a SINGLE
+        `SocketSet` was shared across the loopback + eth interfaces.
+        smoltcp's `socket_egress` walks every socket in the set it's
+        given with no route filter, and the loopback (`Medium::Ip`)
+        does NO route lookup in `dispatch_ip` — so the loopback poll
+        "successfully" emitted the eth socket's data segment into the
+        loopback void, and because `tcp::dispatch` commits
+        `remote_last_seq` only *after* a successful emit, the seq
+        advanced and the eth interface then sent only a bare ACK.
+        Handshake survived (SYN/ACK retransmit). FIX: one `SocketSet`
+        per interface + a `NetHandle { eth: bool, handle }` so a
+        socket is only ever dispatched by the interface that routes
+        it. `net.rs` `NetStack` now owns `lo_sockets` +
+        `eth: Option<(dev, iface, SocketSet)>` and exposes
+        `listen`/`relisten`/`connect`/`sock`/`remove` over handles.
+      * M3 (deferred): aarch64 NIC (PCIe vs mmio on virt), DNS/UDP,
+        sockaddr structs in the kernel, UDP sockets.
 Also note: fd semantics were corrected by
 [17-correctness-audit](../../done/17-correctness-audit/) — fork/dup/dup2
 now share one open file description (shared offset) per POSIX.

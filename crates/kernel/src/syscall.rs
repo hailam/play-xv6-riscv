@@ -13,7 +13,8 @@ use hal::{FrameAllocator, Hal, PageTableOps, PtePerm, TrapFrameAccess};
 use crate::arch::Arch;
 use crate::cpu;
 use crate::executor;
-use crate::file::{File, PipeInner, SockEnd, SockState, Socket};
+use crate::file::{File, PipeInner, SockEnd, SockState, Socket, TcpConn};
+use smoltcp::socket::tcp;
 use crate::fs;
 use crate::kalloc::KFRAMES;
 use crate::proc::{Proc, ProcState};
@@ -42,7 +43,7 @@ use crate::uapi::{
     Winsize, Termios,
     SYS_POLL, POLLIN, POLLOUT, POLLERR, POLLHUP, POLLNVAL, PollFd,
     SYS_SOCKET, SYS_BIND, SYS_LISTEN, SYS_ACCEPT, SYS_CONNECT,
-    SYS_SOCKETPAIR, AF_UNIX, SOCK_STREAM,
+    SYS_SOCKETPAIR, AF_UNIX, AF_INET, SOCK_STREAM,
 };
 
 use crate::arch::{PGSIZE, TIMER_INTERVAL};
@@ -1263,11 +1264,22 @@ async fn sys_write(proc: &Arc<Proc>, fd: i32, buf_va: usize, len: usize) -> i64 
         File::PipeWrite(p) => pipe_write(p.clone(), proc, buf_va, len, nonblock).await,
         File::PipeRead(_) => -1,
         File::Socket(sock) => {
-            let end = match &*sock.state.lock() {
-                SockState::Connected(e) => Arc::clone(e),
+            enum W {
+                Unix(Arc<SockEnd>),
+                Tcp(Arc<TcpConn>),
+            }
+            let which = match &*sock.state.lock() {
+                SockState::Connected(e) => W::Unix(Arc::clone(e)),
+                SockState::Tcp(c) => W::Tcp(Arc::clone(c)),
                 _ => return -1,
             };
-            pipe_write(Arc::clone(&end.tx), proc, buf_va, len, nonblock).await
+            match which {
+                W::Unix(end) => {
+                    pipe_write(Arc::clone(&end.tx), proc, buf_va, len, nonblock)
+                        .await
+                }
+                W::Tcp(conn) => tcp_write(proc, &conn, buf_va, len, nonblock).await,
+            }
         }
         File::Inode {
             ip,
@@ -1397,13 +1409,22 @@ async fn sys_read(proc: &Arc<Proc>, fd: i32, buf_va: usize, len: usize) -> i64 {
         File::PipeRead(p) => pipe_read(p.clone(), proc, buf_va, len, nonblock).await,
         File::PipeWrite(_) => -1,
         File::Socket(sock) => {
-            // A connected socket reads from its rx pipe — identical
-            // blocking/EOF semantics to a pipe read.
-            let end = match &*sock.state.lock() {
-                SockState::Connected(e) => Arc::clone(e),
+            enum R {
+                Unix(Arc<SockEnd>),
+                Tcp(Arc<TcpConn>),
+            }
+            let which = match &*sock.state.lock() {
+                SockState::Connected(e) => R::Unix(Arc::clone(e)),
+                SockState::Tcp(c) => R::Tcp(Arc::clone(c)),
                 _ => return -1,
             };
-            pipe_read(Arc::clone(&end.rx), proc, buf_va, len, nonblock).await
+            match which {
+                R::Unix(end) => {
+                    pipe_read(Arc::clone(&end.rx), proc, buf_va, len, nonblock)
+                        .await
+                }
+                R::Tcp(conn) => tcp_read(proc, &conn, buf_va, len, nonblock).await,
+            }
         }
         File::Inode {
             ip,
@@ -1933,13 +1954,13 @@ impl Future for PipeReadByte {
 
 // ---------- AF_UNIX sockets -------------------------------------------------
 
-/// `socket(AF_UNIX, SOCK_STREAM, 0)` — anything else is unsupported.
+/// `socket(domain, SOCK_STREAM, 0)` — AF_UNIX and AF_INET streams.
 fn sys_socket(proc: &Arc<Proc>, domain: i32, typ: i32, proto: i32) -> i64 {
-    if domain != AF_UNIX || typ != SOCK_STREAM || proto != 0 {
+    if (domain != AF_UNIX && domain != AF_INET) || typ != SOCK_STREAM || proto != 0 {
         return -1;
     }
     let sock = Arc::new(File::Socket(Arc::new(Socket {
-        state: crate::sync::SpinLock::new(SockState::Fresh),
+        state: crate::sync::SpinLock::new(SockState::Fresh(domain)),
     })));
     proc.alloc_fd(sock).map(|f| f as i64).unwrap_or(-1)
 }
@@ -1958,8 +1979,28 @@ async fn sys_bind(proc: &Arc<Proc>, fd: i32, path_va: usize) -> i64 {
     let File::Socket(sock) = &*file else {
         return -1;
     };
-    if !matches!(&*sock.state.lock(), SockState::Fresh) {
-        return -1;
+    let domain = match &*sock.state.lock() {
+        SockState::Fresh(d) => *d,
+        _ => return -1,
+    };
+    if domain == AF_INET {
+        // "a.b.c.d:port" / ":port" — arm a listening socket on the
+        // interface that owns the bind address (loopback for 127.x,
+        // eth for 0.0.0.0 / explicit 10.x).
+        let Some((addr, port)) = crate::net::parse_endpoint(&path) else {
+            return -1;
+        };
+        let Some(handle) = crate::net::with(|stack| stack.listen(addr, port))
+        else {
+            return -1;
+        };
+        crate::net::kick();
+        let mut st = sock.state.lock();
+        if !matches!(&*st, SockState::Fresh(_)) {
+            return -1;
+        }
+        *st = SockState::TcpListening { port, handle };
+        return 0;
     }
     let Some(ip) =
         create_at_path(proc, &path, xv6_fs_layout::T_SOCK, 0, 0).await
@@ -1974,7 +2015,7 @@ async fn sys_bind(proc: &Arc<Proc>, fd: i32, path_va: usize) -> i64 {
     });
     crate::file::sock_register(inum, &listener);
     let mut st = sock.state.lock();
-    if !matches!(&*st, SockState::Fresh) {
+    if !matches!(&*st, SockState::Fresh(_)) {
         return -1; // raced with another bind/connect on a shared fd
     }
     *st = SockState::Listening(listener);
@@ -1990,7 +2031,10 @@ fn sys_listen(proc: &Arc<Proc>, fd: i32, _backlog: i32) -> i64 {
     let File::Socket(sock) = &*file else {
         return -1;
     };
-    if matches!(&*sock.state.lock(), SockState::Listening(_)) {
+    if matches!(
+        &*sock.state.lock(),
+        SockState::Listening(_) | SockState::TcpListening { .. }
+    ) {
         0
     } else {
         -1
@@ -2025,17 +2069,89 @@ async fn sys_accept(proc: &Arc<Proc>, fd: i32) -> i64 {
     let File::Socket(sock) = &*file else {
         return -1;
     };
-    let listener = match &*sock.state.lock() {
-        SockState::Listening(l) => Arc::clone(l),
+    enum Kind {
+        Unix(Arc<crate::file::Listener>),
+        Tcp { port: u16, handle: crate::net::NetHandle },
+    }
+    let kind = match &*sock.state.lock() {
+        SockState::Listening(l) => Kind::Unix(Arc::clone(l)),
+        SockState::TcpListening { port, handle } => {
+            Kind::Tcp { port: *port, handle: *handle }
+        }
         _ => return -1,
     };
-    let Some(end) = (AcceptWait { listener: &listener }).await else {
-        return -1; // killed
-    };
-    let conn = Arc::new(File::Socket(Arc::new(Socket {
-        state: crate::sync::SpinLock::new(SockState::Connected(Arc::new(end))),
-    })));
-    proc.alloc_fd(conn).map(|f| f as i64).unwrap_or(-1)
+    match kind {
+        Kind::Unix(listener) => {
+            let Some(end) = (AcceptWait { listener: &listener }).await else {
+                return -1; // killed
+            };
+            let conn = Arc::new(File::Socket(Arc::new(Socket {
+                state: crate::sync::SpinLock::new(SockState::Connected(
+                    Arc::new(end),
+                )),
+            })));
+            proc.alloc_fd(conn).map(|f| f as i64).unwrap_or(-1)
+        }
+        Kind::Tcp { port, handle } => {
+            // smoltcp has no backlog: the listening socket BECOMES the
+            // connection when a SYN completes. Wait for that, then
+            // hand the handle out as the connection and re-arm a
+            // fresh listener on the same interface + port.
+            if !(TcpAcceptWait { handle }).await {
+                return -1; // killed
+            }
+            let new_handle =
+                crate::net::with(|stack| stack.relisten(handle, port));
+            crate::net::kick();
+            {
+                let mut st = sock.state.lock();
+                if let (
+                    SockState::TcpListening { handle: h, .. },
+                    Some(nh),
+                ) = (&mut *st, new_handle)
+                {
+                    *h = nh;
+                }
+            }
+            let conn = Arc::new(File::Socket(Arc::new(Socket {
+                state: crate::sync::SpinLock::new(SockState::Tcp(Arc::new(
+                    TcpConn { handle },
+                ))),
+            })));
+            proc.alloc_fd(conn).map(|f| f as i64).unwrap_or(-1)
+        }
+    }
+}
+
+/// Wait until the armed listening socket has a live peer (Established
+/// or beyond). Returns false if killed.
+struct TcpAcceptWait {
+    handle: crate::net::NetHandle,
+}
+
+impl Future for TcpAcceptWait {
+    type Output = bool;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
+        if current_proc_killed() {
+            return Poll::Ready(false);
+        }
+        let ready = crate::net::with(|stack| {
+            let s = stack.sock(self.handle);
+            if s.is_active() && (s.may_send() || s.may_recv()) {
+                true
+            } else {
+                // Both wakers: connection progress fires either.
+                s.register_recv_waker(cx.waker());
+                s.register_send_waker(cx.waker());
+                false
+            }
+        });
+        if ready {
+            Poll::Ready(true)
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
 /// `connect(fd, path)` — resolves the T_SOCK node, queues the server
@@ -2051,8 +2167,33 @@ async fn sys_connect(proc: &Arc<Proc>, fd: i32, path_va: usize) -> i64 {
     let File::Socket(sock) = &*file else {
         return -1;
     };
-    if !matches!(&*sock.state.lock(), SockState::Fresh) {
-        return -1;
+    let domain = match &*sock.state.lock() {
+        SockState::Fresh(d) => *d,
+        _ => return -1,
+    };
+    if domain == AF_INET {
+        let Some((addr, port)) = crate::net::parse_endpoint(&path) else {
+            return -1;
+        };
+        let local = crate::net::ephemeral_port();
+        let Some(handle) =
+            crate::net::with(|stack| stack.connect(addr, port, local))
+        else {
+            return -1; // non-loopback dest and no NIC, or connect rejected
+        };
+        crate::net::kick();
+        let conn = Arc::new(TcpConn { handle });
+        // Block until Established (or refused/reset).
+        if !(TcpConnectWait { handle }).await {
+            // TcpConn drop (below) queues the handle for GC.
+            return -1;
+        }
+        let mut st = sock.state.lock();
+        if !matches!(&*st, SockState::Fresh(_)) {
+            return -1;
+        }
+        *st = SockState::Tcp(conn);
+        return 0;
     }
     let Some(ip) = resolve_path(proc, &path).await else {
         return -1;
@@ -2077,11 +2218,42 @@ async fn sys_connect(proc: &Arc<Proc>, fd: i32, path_va: usize) -> i64 {
     }
     listener.accept_waker.wake_all();
     let mut st = sock.state.lock();
-    if !matches!(&*st, SockState::Fresh) {
+    if !matches!(&*st, SockState::Fresh(_)) {
         return -1;
     }
     *st = SockState::Connected(Arc::new(client));
     0
+}
+
+/// Block a connecting TCP socket until Established; false on
+/// refusal/reset/kill.
+struct TcpConnectWait {
+    handle: crate::net::NetHandle,
+}
+
+impl Future for TcpConnectWait {
+    type Output = bool;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
+        if current_proc_killed() {
+            return Poll::Ready(false);
+        }
+        let st = crate::net::with(|stack| {
+            let s = stack.sock(self.handle);
+            if s.may_send() {
+                Some(true)
+            } else if !s.is_open() {
+                Some(false) // refused / reset
+            } else {
+                s.register_send_waker(cx.waker());
+                s.register_recv_waker(cx.waker());
+                None
+            }
+        });
+        match st {
+            Some(v) => Poll::Ready(v),
+            None => Poll::Pending,
+        }
+    }
 }
 
 /// `socketpair(sv)` — a pre-connected pair, no fs node involved.
@@ -2110,6 +2282,175 @@ fn sys_socketpair(proc: &Arc<Proc>, sv_va: usize) -> i64 {
         unsafe { *(kva as *mut i32) = *fdv };
     }
     0
+}
+
+// ---------- TCP read/write -------------------------------------------------
+
+const TCP_IO_CHUNK: usize = 4096;
+
+struct TcpRecvWait<'a> {
+    conn: &'a TcpConn,
+    buf: &'a mut [u8],
+}
+
+impl Future for TcpRecvWait<'_> {
+    /// Ok(n) bytes (0 = EOF), Err(()) = killed / connection error.
+    type Output = Result<usize, ()>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if current_proc_killed() {
+            return Poll::Ready(Err(()));
+        }
+        let handle = self.conn.handle;
+        let me = &mut *self;
+        let r = crate::net::with(|stack| {
+            let s = stack.sock(handle);
+            if s.can_recv() {
+                match s.recv_slice(me.buf) {
+                    Ok(n) => Some(Ok(n)),
+                    Err(_) => Some(Err(())),
+                }
+            } else if !s.may_recv() {
+                Some(Ok(0)) // peer sent FIN / closed: EOF
+            } else {
+                s.register_recv_waker(cx.waker());
+                None
+            }
+        });
+        match r {
+            Some(v) => {
+                crate::net::kick(); // recv freed window space — ACK it
+                Poll::Ready(v)
+            }
+            None => Poll::Pending,
+        }
+    }
+}
+
+async fn tcp_read(
+    proc: &Arc<Proc>,
+    conn: &Arc<TcpConn>,
+    buf_va: usize,
+    len: usize,
+    nonblock: bool,
+) -> i64 {
+    let want = len.min(TCP_IO_CHUNK);
+    let mut tmp = [0u8; TCP_IO_CHUNK];
+    if nonblock {
+        let r = crate::net::with(|stack| {
+            let s = stack.sock(conn.handle);
+            if s.can_recv() {
+                s.recv_slice(&mut tmp[..want]).map_err(|_| ())
+            } else if !s.may_recv() {
+                Ok(0)
+            } else {
+                Err(())
+            }
+        });
+        let Ok(n) = r else { return -1 };
+        crate::net::kick();
+        for i in 0..n {
+            let Some(kva) = proc.translate_user_write(buf_va + i) else {
+                return -1;
+            };
+            unsafe { *(kva as *mut u8) = tmp[i] };
+        }
+        return n as i64;
+    }
+    let r = (TcpRecvWait { conn, buf: &mut tmp[..want] }).await;
+    let Ok(n) = r else { return -1 };
+    for i in 0..n {
+        let Some(kva) = proc.translate_user_write(buf_va + i) else {
+            return -1;
+        };
+        unsafe { *(kva as *mut u8) = tmp[i] };
+    }
+    n as i64
+}
+
+struct TcpSendWait<'a> {
+    conn: &'a TcpConn,
+    buf: &'a [u8],
+}
+
+impl Future for TcpSendWait<'_> {
+    /// Ok(n) bytes queued, Err(()) = killed / peer closed.
+    type Output = Result<usize, ()>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if current_proc_killed() {
+            return Poll::Ready(Err(()));
+        }
+        let r = crate::net::with(|stack| {
+            let s = stack.sock(self.conn.handle);
+            if !s.may_send() {
+                Some(Err(())) // EPIPE-ish
+            } else if s.can_send() {
+                match s.send_slice(self.buf) {
+                    Ok(n) => Some(Ok(n)),
+                    Err(_) => Some(Err(())),
+                }
+            } else {
+                s.register_send_waker(cx.waker());
+                None
+            }
+        });
+        match r {
+            Some(v) => {
+                crate::net::kick(); // data queued — transmit now
+                Poll::Ready(v)
+            }
+            None => Poll::Pending,
+        }
+    }
+}
+
+async fn tcp_write(
+    proc: &Arc<Proc>,
+    conn: &Arc<TcpConn>,
+    buf_va: usize,
+    len: usize,
+    nonblock: bool,
+) -> i64 {
+    let mut tmp = [0u8; TCP_IO_CHUNK];
+    let mut written = 0usize;
+    while written < len {
+        let chunk = (len - written).min(TCP_IO_CHUNK);
+        for i in 0..chunk {
+            let Some(kva) = proc.translate_user(buf_va + written + i) else {
+                return if written == 0 { -1 } else { written as i64 };
+            };
+            tmp[i] = unsafe { *(kva as *const u8) };
+        }
+        if nonblock {
+            let r = crate::net::with(|stack| {
+                let s = stack.sock(conn.handle);
+                if !s.may_send() {
+                    Err(())
+                } else if s.can_send() {
+                    s.send_slice(&tmp[..chunk]).map_err(|_| ())
+                } else {
+                    Ok(0)
+                }
+            });
+            crate::net::kick();
+            match r {
+                Err(()) => {
+                    return if written == 0 { -1 } else { written as i64 };
+                }
+                Ok(0) => {
+                    return if written == 0 { -1 } else { written as i64 };
+                }
+                Ok(n) => written += n,
+            }
+            continue;
+        }
+        match (TcpSendWait { conn, buf: &tmp[..chunk] }).await {
+            Ok(n) => written += n,
+            Err(()) => {
+                return if written == 0 { -1 } else { written as i64 };
+            }
+        }
+    }
+    written as i64
 }
 
 // ---------- sys_open / sys_fstat -------------------------------------------
@@ -3058,7 +3399,20 @@ impl Future for PollWait<'_> {
                     SockState::Listening(l) => {
                         l.accept_waker.register(cx.waker());
                     }
-                    SockState::Fresh => {}
+                    SockState::Tcp(conn) => crate::net::with(|stack| {
+                        let s = stack.sock(conn.handle);
+                        s.register_recv_waker(cx.waker());
+                        s.register_send_waker(cx.waker());
+                    }),
+                    SockState::TcpListening { handle, .. } => {
+                        crate::net::with(|stack| {
+                            let s =
+                                stack.sock(*handle);
+                            s.register_recv_waker(cx.waker());
+                            s.register_send_waker(cx.waker());
+                        })
+                    }
+                    SockState::Fresh(_) => {}
                 },
                 // Inode-backed fds are always ready — if we got here
                 // the caller asked for no events on them.
@@ -3150,7 +3504,28 @@ fn file_revents(file: &File, requested: i16) -> i16 {
                     r |= POLLIN;
                 }
             }
-            SockState::Fresh => {}
+            SockState::Tcp(conn) => crate::net::with(|stack| {
+                let s = stack.sock(conn.handle);
+                if (requested & POLLIN) != 0 && s.can_recv() {
+                    r |= POLLIN;
+                }
+                if !s.may_recv() {
+                    r |= POLLHUP;
+                }
+                if (requested & POLLOUT) != 0 && s.can_send() {
+                    r |= POLLOUT;
+                }
+            }),
+            SockState::TcpListening { handle, .. } => {
+                let ready = crate::net::with(|stack| {
+                    let s = stack.sock(*handle);
+                    s.is_active() && (s.may_send() || s.may_recv())
+                });
+                if (requested & POLLIN) != 0 && ready {
+                    r |= POLLIN;
+                }
+            }
+            SockState::Fresh(_) => {}
         }
         File::Inode { .. } => {
             // Regular files are always ready (no blocking I/O).

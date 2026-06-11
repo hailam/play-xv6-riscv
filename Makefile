@@ -22,8 +22,10 @@ QEMUOPTS += -m 128M -smp $(CPUS) -nographic
 QEMUOPTS += -global virtio-mmio.force-legacy=false
 QEMUOPTS += -drive file=fs.img,if=none,format=raw,id=x0
 QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+QEMUOPTS += -netdev user,id=n0,hostfwd=tcp:127.0.0.1:17878-:7878
+QEMUOPTS += -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1
 
-.PHONY: build mkfs qemu qemu-gdb clean fmt
+.PHONY: build mkfs qemu qemu-gdb test-net clean fmt
 
 build:
 	cargo build $(CARGO_FLAGS) -p kernel
@@ -39,6 +41,7 @@ fs.img: build $(MKFS)
 	$(MKFS) $@ \
 		README:crates/kernel/user/README \
 		init:$(USER_DIR)/init.elf \
+		tcpecho:$(USER_DIR)/tcpecho.elf \
 		echo:$(USER_DIR)/echo.elf \
 		sh:$(USER_DIR)/sh.elf \
 		cat:$(USER_DIR)/cat.elf \
@@ -89,6 +92,12 @@ qemu: build fs.img
 qemu-gdb: build fs.img
 	$(QEMU) $(QEMUOPTS) -S -s
 
+# Host<->guest TCP echo over virtio-net (todo 16 Tier 7 M2). Loopback
+# TCP is gated in-guest by the `tcploop` usertest; this covers the
+# real-NIC path qemu's SLIRP provides.
+test-net: build fs.img
+	python3 scripts/test-net.py
+
 # ---- aarch64 ----
 AARCH64_TARGET   = aarch64-unknown-none-softfloat
 AARCH64_KERNEL   = target/$(AARCH64_TARGET)/$(TARGET_SUBDIR)/kernel
@@ -99,6 +108,8 @@ AARCH64_QEMUOPTS += -m 128M -smp $(CPUS) -nographic
 AARCH64_QEMUOPTS += -global virtio-mmio.force-legacy=false
 AARCH64_QEMUOPTS += -drive file=fs-aarch64.img,if=none,format=raw,id=x0
 AARCH64_QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+AARCH64_QEMUOPTS += -netdev user,id=n0,hostfwd=tcp:127.0.0.1:17879-:7878
+AARCH64_QEMUOPTS += -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1
 
 build-aarch64:
 	cargo build $(CARGO_FLAGS) -p kernel --target $(AARCH64_TARGET)
@@ -107,6 +118,7 @@ fs-aarch64.img: build-aarch64 $(MKFS)
 	$(MKFS) $@ \
 		README:crates/kernel/user/README \
 		init:$(AARCH64_USER_DIR)/init.elf \
+		tcpecho:$(AARCH64_USER_DIR)/tcpecho.elf \
 		echo:$(AARCH64_USER_DIR)/echo.elf \
 		sh:$(AARCH64_USER_DIR)/sh.elf \
 		cat:$(AARCH64_USER_DIR)/cat.elf \

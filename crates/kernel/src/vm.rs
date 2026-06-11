@@ -13,6 +13,9 @@ use crate::arch::{
     UART0_SIZE, VIRTIO0, VIRTIO0_SIZE,
 };
 
+const VIRTIO1: usize = <Arch as Hal>::VIRTIO1;
+const VIRTIO1_SIZE: usize = <Arch as Hal>::VIRTIO1_SIZE;
+
 extern "C" {
     static _etext: u8;
 }
@@ -30,6 +33,18 @@ pub fn init_and_install() {
         .expect("map UART0");
     pt.map(VIRTIO0, VIRTIO0, VIRTIO0_SIZE, PtePerm::RW, &KFRAMES)
         .expect("map VIRTIO0");
+    // virtio-net slot — on aarch64 it shares VIRTIO0's page (0x200
+    // stride), so skip the duplicate mapping there.
+    if VIRTIO1 & !(PGSIZE - 1) != VIRTIO0 & !(PGSIZE - 1) {
+        pt.map(
+            VIRTIO1 & !(PGSIZE - 1),
+            VIRTIO1 & !(PGSIZE - 1),
+            (VIRTIO1_SIZE + PGSIZE - 1) & !(PGSIZE - 1),
+            PtePerm::RW,
+            &KFRAMES,
+        )
+        .expect("map VIRTIO1");
+    }
     pt.map(INTC_BASE, INTC_BASE, INTC_SIZE, PtePerm::RW, &KFRAMES)
         .expect("map interrupt controller");
     // Arch-specific extras (riscv: the CLINT page, so S-mode can ring

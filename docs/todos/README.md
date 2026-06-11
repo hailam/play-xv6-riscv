@@ -10,18 +10,15 @@ directory contains a `README.md` with the plan/summary, plus optional
 
 | Bucket | Count | What's in it |
 |---|---|---|
-| `done/` | 35 | Through fs/console robustness — sparse files, demand-mapped lazy I/O, console line discipline (^D/erase/echo), waker-driven poll; **full suite (74 tests) green at smp1 + smp3/4, both arches** |
-| `pending/` | 2 | POSIX sockets + phase-2 GUI |
+| `done/` | 36 | Through POSIX sockets + TCP/IP — AF_UNIX + smoltcp (loopback + virtio-net, real host↔guest echo via `make test-net`); **suite (74 tests) green smp1 both arches + smp3** |
+| `pending/` | 1 | phase-2 GUI |
 | `revisit/` | 3 | Decisions to potentially revisit later |
 
 ## Pending — priority order
 
-1. [16-posix-compat](pending/16-posix-compat/) — AF_UNIX sockets
-   landed 2026-06-11 (syscalls 63-68, fs-visible bindings, poll
-   integration, EPIPE fix); the only remaining scope is TCP/IP
-   (virtio-net + smoltcp — lifts the no-crates rule).
-2. [12-phase2-gui](pending/12-phase2-gui/) — minimal
-   framebuffer-backed display.
+1. [12-phase2-gui](pending/12-phase2-gui/) — minimal
+   framebuffer-backed display. Its window-protocol IPC prerequisite
+   (a Unix-socket equivalent) now exists (AF_UNIX, todo 16).
 
 ## Done — chronological
 
@@ -62,6 +59,7 @@ directory contains a `README.md` with the plan/summary, plus optional
 | 32 | [proc-lifecycle](done/18-proc-lifecycle/) | ~+330 — real init (pid 1) + orphan reparenting, deferred-iput inode reaper, executor slot reuse; +2 regression tests |
 | 33 | [smp-hardening](done/19-smp-hardening/) | ~+150 — riscv M-mode CLINT-MSIP→SSIP IPI trampoline, aarch64 SGI wiring, wake-IPIs, pid registry; **full suite green at -smp 3/4** |
 | 34 | [fs-console-robustness](done/20-fs-console-robustness/) | ~+300 — sparse-hole reads, ftruncate clamp, iget-wait, lazy demand-map in copyin/copyout, console line discipline (^D/erase/echo), fair console_write, waker-driven poll; +2 tests |
+| 35 | [posix-compat (sockets+TCP/IP)](done/16-posix-compat/) | AF_UNIX (syscalls 63-68, fs-visible bindings) + TCP/IP via smoltcp 0.12 (loopback + virtio-net, per-interface SocketSets); first external crate; `tcploop`+`unixsock` usertests + `make test-net` host↔guest echo |
 
 (Rows 30/31 live in `done/15-xv6-compat` and `done/17-correctness-audit`
 — their numeric directory prefixes collide with older done entries; the

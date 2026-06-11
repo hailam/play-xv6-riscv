@@ -125,10 +125,28 @@ pub struct Listener {
 }
 
 pub enum SockState {
-    /// socket() done, neither bound nor connected yet.
-    Fresh,
+    /// socket() done, neither bound nor connected yet. Carries the
+    /// domain (AF_UNIX or AF_INET) so bind/connect route correctly.
+    Fresh(i32),
     Listening(Arc<Listener>),
     Connected(Arc<SockEnd>),
+    /// AF_INET stream connection (or connect-in-progress) — an owned
+    /// smoltcp handle (tagged with its interface); TcpConn::Drop hands
+    /// it to the net task for graceful close + removal.
+    Tcp(Arc<TcpConn>),
+    /// AF_INET listener: the armed smoltcp listening socket. accept()
+    /// hands the handle out as a connection and re-arms a fresh one.
+    TcpListening { port: u16, handle: crate::net::NetHandle },
+}
+
+pub struct TcpConn {
+    pub handle: crate::net::NetHandle,
+}
+
+impl Drop for TcpConn {
+    fn drop(&mut self) {
+        crate::net::sock_drop(self.handle);
+    }
 }
 
 pub struct Socket {
