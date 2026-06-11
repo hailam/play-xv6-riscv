@@ -87,6 +87,10 @@ pub trait Hal: 'static {
     const VIRTIO1_SIZE: usize;
     const VIRTIO1_IRQ: usize;
 
+    /// QEMU fw_cfg MMIO base (used by the ramfb framebuffer driver).
+    /// The driver probes the signature and disables itself if absent.
+    const FWCFG: usize;
+
     // ----- arch helpers tied to constants -----
     fn trampoline_pa() -> usize;
     fn uservec_offset() -> usize;

@@ -25,7 +25,7 @@ QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 QEMUOPTS += -netdev user,id=n0,hostfwd=tcp:127.0.0.1:17878-:7878
 QEMUOPTS += -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1
 
-.PHONY: build mkfs qemu qemu-gdb test-net clean fmt
+.PHONY: build mkfs qemu qemu-gdb test-net test-fb clean fmt
 
 build:
 	cargo build $(CARGO_FLAGS) -p kernel
@@ -97,6 +97,12 @@ qemu-gdb: build fs.img
 # real-NIC path qemu's SLIRP provides.
 test-net: build fs.img
 	python3 scripts/test-net.py
+
+# ramfb framebuffer (todo 12 M1): boot with -device ramfb + a QMP
+# socket, let the kernel draw its test pattern, screendump the
+# scanout and verify the pixels. Headless (no display backend needed).
+test-fb: build fs.img
+	python3 scripts/test-fb.py
 
 # ---- aarch64 ----
 AARCH64_TARGET   = aarch64-unknown-none-softfloat

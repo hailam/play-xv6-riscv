@@ -69,6 +69,7 @@ impl Hal for Riscv64 {
     const VIRTIO1: usize = memlayout::VIRTIO1;
     const VIRTIO1_SIZE: usize = memlayout::VIRTIO1_SIZE;
     const VIRTIO1_IRQ: usize = memlayout::VIRTIO1_IRQ;
+    const FWCFG: usize = memlayout::FWCFG;
 
     fn trampoline_pa() -> usize {
         trampoline_pa()
@@ -118,10 +119,12 @@ impl Hal for Riscv64 {
         }
     }
 
-    /// CLINT page — S-mode `send_ipi` writes MSIP doorbells through
-    /// the kernel pagetable, so the page must be mapped.
-    const EXTRA_MMIO: &'static [(usize, usize)] =
-        &[(memlayout::CLINT, memlayout::PGSIZE)];
+    /// CLINT (IPI doorbells) + fw_cfg (ramfb config) pages, mapped
+    /// into the kernel pagetable so S-mode can reach them.
+    const EXTRA_MMIO: &'static [(usize, usize)] = &[
+        (memlayout::CLINT, memlayout::PGSIZE),
+        (memlayout::FWCFG, memlayout::PGSIZE),
+    ];
 
     fn console_putc(c: u8) {
         uart::putc(c);

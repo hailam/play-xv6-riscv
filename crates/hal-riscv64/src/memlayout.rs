@@ -19,6 +19,9 @@ pub const VIRTIO1: usize = 0x1000_2000;
 pub const VIRTIO1_SIZE: usize = PGSIZE;
 pub const VIRTIO1_IRQ: usize = 2;
 
+pub const FWCFG: usize = 0x1010_0000;
+pub const FWCFG_SIZE: usize = 0x18;
+
 pub const PLIC: usize = 0x0c00_0000;
 pub const PLIC_SIZE: usize = 0x40_0000;
 

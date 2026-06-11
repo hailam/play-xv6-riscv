@@ -23,6 +23,9 @@ pub const UART0_IRQ: usize = 33; // GIC SPI 1 (== PPI/SPI base 32 + 1)
 /// GIC v2 distributor + CPU interface. The kernel maps both via the
 /// single `INTC_BASE..INTC_BASE+INTC_SIZE` range, so `INTC_SIZE` is
 /// large enough to cover both regions back-to-back.
+pub const FWCFG: usize = 0x0902_0000;
+pub const FWCFG_SIZE: usize = 0x18;
+
 pub const GICD: usize = 0x0800_0000;
 pub const GICD_SIZE: usize = 0x10000;
 pub const GICC: usize = 0x0801_0000;

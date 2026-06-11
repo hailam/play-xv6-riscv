@@ -1,9 +1,46 @@
 # 12: Phase 2 — minimal GUI
 
-**Status:** Pending (longest horizon)
+**Status:** In progress — **M1 (framebuffer) DONE 2026-06-11**; M2–M4 ahead.
 **Estimated:** ~1500 LoC across multiple sub-phases
 **Depends on:** Filesystem (so a display server can be a process)
 **Unblocks:** the original Phase 2 goal — "minimal GUI"
+
+## Milestones & progress
+
+- **M1 — ramfb framebuffer driver: DONE (2026-06-11).**
+  `crates/kernel/src/driver/ramfb.rs` drives QEMU's fw_cfg device over
+  its MMIO+DMA interface (probe "QEMU" signature → confirm DMA feature
+  bit → read `FW_CFG_FILE_DIR` → find the `etc/ramfb` selector key →
+  DMA-write a big-endian `RAMFBCfg` blob pointing at a 640×480
+  XRGB8888 framebuffer). The framebuffer is a page-aligned static in
+  kernel BSS (identity-mapped, so its VA == the phys addr QEMU scans
+  out, and contiguous by construction — the LIFO frame allocator can't
+  promise a 300-page contiguous run). ramfb is a "dumb" framebuffer:
+  configure once, then writes to the buffer just appear (no
+  flush/scanout command). The kernel draws a 4-quadrant test pattern
+  at boot. Both arches (only difference: fw_cfg base — riscv
+  `0x10100000`, aarch64 `0x09020000`, wired via `Hal::FWCFG` +
+  `EXTRA_MMIO`). Probe-and-disable: headless if qemu has no
+  `-device ramfb`.
+  - **Two bugs fixed during bring-up:** (1) `RAMFBCfg`/`FwCfgDmaAccess`
+    must be `#[repr(C, packed)]` — plain `repr(C)` padded RAMFBCfg to
+    32 bytes so the `size == 28` directory check rejected it (and the
+    on-wire layout would've been wrong anyway); (2) the framebuffer
+    can't come from the page-frame allocator (non-contiguous) — moved
+    to a static BSS buffer.
+  - **Gated by `make test-fb`** (`scripts/test-fb.py`): boots with
+    `-device ramfb` + a QMP socket, lets the kernel draw, `screendump`s
+    the scanout to PPM and checks the centre pixel of each quadrant —
+    red/green/blue/white all verified. Headless (no display backend).
+    Full usertests still green both arches.
+- **M2 — `/dev/fb0` device file** (next): a `File::Fb` fd variant +
+  a device inode (T_DEVICE major/minor) so a user process can mmap or
+  write the framebuffer. Reuses the existing fd/mmap machinery.
+- **M3 — input** (virtio-input or PS/2 → `/dev/input/0`), async-waker
+  pattern like the UART RX path.
+- **M4 — display server + window protocol + demo clients** (user
+  side). The window-protocol IPC prerequisite — a Unix-socket
+  equivalent — already exists (AF_UNIX, todo 16).
 
 ## Why
 

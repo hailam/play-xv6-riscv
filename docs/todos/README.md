@@ -11,14 +11,16 @@ directory contains a `README.md` with the plan/summary, plus optional
 | Bucket | Count | What's in it |
 |---|---|---|
 | `done/` | 36 | Through POSIX sockets + TCP/IP — AF_UNIX + smoltcp (loopback + virtio-net, real host↔guest echo via `make test-net`); **suite (74 tests) green smp1 both arches + smp3** |
-| `pending/` | 1 | phase-2 GUI |
+| `pending/` | 1 | phase-2 GUI (M1 framebuffer done; M2-M4 ahead) |
 | `revisit/` | 3 | Decisions to potentially revisit later |
 
 ## Pending — priority order
 
 1. [12-phase2-gui](pending/12-phase2-gui/) — minimal
-   framebuffer-backed display. Its window-protocol IPC prerequisite
-   (a Unix-socket equivalent) now exists (AF_UNIX, todo 16).
+   framebuffer-backed display. **M1 done**: ramfb driver via fw_cfg,
+   640×480 XRGB8888, boot test pattern verified by `make test-fb`
+   (headless screendump). Next: M2 `/dev/fb0`, M3 input, M4 display
+   server + windows (IPC prereq — AF_UNIX — already exists, todo 16).
 
 ## Done — chronological
 

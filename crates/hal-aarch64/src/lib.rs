@@ -72,6 +72,10 @@ impl Hal for AArch64 {
     const VIRTIO1: usize = memlayout::VIRTIO1;
     const VIRTIO1_SIZE: usize = memlayout::VIRTIO1_SIZE;
     const VIRTIO1_IRQ: usize = memlayout::VIRTIO1_IRQ;
+    const FWCFG: usize = memlayout::FWCFG;
+    /// fw_cfg page — the ramfb driver writes its config blob here.
+    const EXTRA_MMIO: &'static [(usize, usize)] =
+        &[(memlayout::FWCFG, memlayout::PGSIZE)];
     /// Skeleton placeholder — real value comes from the ARM generic
     /// timer counter frequency once the boot path is wired.
     const TIMER_INTERVAL: u64 = 1_000_000;

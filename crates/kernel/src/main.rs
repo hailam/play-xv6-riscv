@@ -125,6 +125,13 @@ async fn bringup_then_init() {
         alloc::boxed::Box::pin(fs::inode::inode_reaper())
     });
 
+    // Framebuffer (ramfb via fw_cfg) — headless if qemu has no
+    // `-device ramfb`. Draw a boot test pattern so a screendump can
+    // confirm the scanout path.
+    if driver::ramfb::init() {
+        driver::ramfb::draw_test_pattern();
+    }
+
     // TCP/IP: probe the NIC, then loopback + eth interfaces and the
     // net poll task.
     driver::virtio_net::init();
