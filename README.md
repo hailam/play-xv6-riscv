@@ -198,29 +198,23 @@ tree drops right there. Result: free-frame count is flat across
 `malloctest` runs (each malloctest grows the heap to ~33 pages and
 returns it all on exit).
 
-## Status
+## Subsystems & test coverage
 
-All 37 planned todos across Phases 1 and 2 are complete (`done/`: 37,
-`pending/`: 0):
+- **Dual-arch SMP:** Both `riscv64` and `aarch64` boot multi-core
+  (`-smp 3` / `-smp 4`) with hardware wake-IPIs and pass the 74-test
+  in-guest suite (`usertests` + POSIX/xv6 regression binaries).
+- **POSIX & C userspace:** POSIX signals (`sigaction`, `sigprocmask`,
+  `sigreturn`, `alarm`), `mmap`/`munmap`, symlinks, `poll`, `ioctl`,
+  console line discipline, `AF_UNIX` sockets, `smoltcp` TCP/IP
+  networking (`loopback` + `virtio-net`), and `picolibc` programs
+  (`bc`, `dc`, `lua`).
+- **Display & input:** `ramfb` framebuffer (`fw_cfg` DMA, `/dev/fb0`),
+  `virtio-input` keyboard (`/dev/input/0`), and the userspace window
+  server (`wm`) + `AF_UNIX` window protocol + demo clients (`hello_wm`,
+  `clock`, `guidemo`), covered by headless QMP tests (`make test-fb`,
+  `make test-input`, `make test-gui`).
 
-- **Dual-arch SMP (`14-aarch64-completion`, `19-smp-hardening`)** —
-  Both `riscv64` and `aarch64` boot SMP (`-smp 3` / `-smp 4`) with
-  hardware wake-IPIs and pass the full 74-test suite (`usertests` +
-  POSIX/xv6 regression binaries).
-- **POSIX & C ecosystem (`15-xv6-compat`, `16-posix-compat`, `20-fs-console-robustness`)** —
-  POSIX signals (`sigaction`, `sigprocmask`, `sigreturn`, `alarm`),
-  `mmap`/`munmap`, symlinks, `poll`, `ioctl`, console line discipline,
-  `AF_UNIX` sockets, `smoltcp` TCP/IP networking (`loopback` +
-  `virtio-net`), and `picolibc` userspace (`bc`, `dc`, `lua`).
-- **Phase 2 GUI (`12-phase2-gui`)** — `ramfb` framebuffer (`fw_cfg`
-  DMA, `/dev/fb0`), `virtio-input` keyboard (`/dev/input/0`), and the
-  userspace window server (`wm`) + `AF_UNIX` window protocol + demo
-  clients (`hello_wm`, `clock`, `guidemo`), gated by headless QMP tests
-  (`test-fb`, `test-input`, `test-gui`).
-
-Full per-todo history is in [`docs/todos/`](docs/todos/) — see
-[`docs/todos/README.md`](docs/todos/README.md) for the index, and one
-folder per todo under `done/` with what landed + verification notes.
+Design notes and work tracking live under [`docs/todos/`](docs/todos/README.md).
 
 ## License
 
