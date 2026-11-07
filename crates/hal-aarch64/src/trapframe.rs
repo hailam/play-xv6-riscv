@@ -48,6 +48,11 @@ impl TrapFrameAccess for TrapFrame {
     }
 
     #[inline]
+    fn set_ra(&mut self, v: u64) {
+        self.x[30] = v;
+    }
+
+    #[inline]
     fn arg(&self, n: usize) -> u64 {
         if n < 8 { self.x[n] } else { 0 }
     }

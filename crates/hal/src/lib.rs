@@ -34,6 +34,8 @@ pub trait TrapFrameAccess: Default + Copy + 'static {
     fn sp(&self) -> u64;
     fn set_sp(&mut self, v: u64);
 
+    fn set_ra(&mut self, v: u64);
+
     // Syscall args / return value live in argument registers. RISC-V
     // uses a0..a7; aarch64 uses x0..x7 — same idea, same indexes.
     fn arg(&self, n: usize) -> u64;

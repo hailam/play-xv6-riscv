@@ -157,23 +157,5 @@ fn maybe_deliver_signal(proc: &Proc) {
     // handler runs on the same user stack (no separate signal stack).
     tf.set_arg(0, sig as u64);
     tf.set_epc(action.handler as u64);
-    set_return_addr(tf, action.restorer);
-}
-
-#[cfg(target_arch = "riscv64")]
-fn set_return_addr(tf: &mut <Arch as Hal>::TrapFrame, va: usize) {
-    // riscv: link register is ra (x1) — there's no
-    // `TrapFrameAccess::set_ra` so we go through the concrete type.
-    use hal_riscv64::trapframe::TrapFrame;
-    let rv_tf: &mut TrapFrame = unsafe { &mut *(tf as *mut _ as *mut TrapFrame) };
-    rv_tf.ra = va as u64;
-}
-
-#[cfg(target_arch = "aarch64")]
-fn set_return_addr(tf: &mut <Arch as Hal>::TrapFrame, va: usize) {
-    // aarch64: link register is x30. The TrapFrame stores all GPRs
-    // in a `[u64; 31]` (x0..x30), so x30 is index 30.
-    use hal_aarch64::trapframe::TrapFrame;
-    let a64_tf: &mut TrapFrame = unsafe { &mut *(tf as *mut _ as *mut TrapFrame) };
-    a64_tf.x[30] = va as u64;
+    tf.set_ra(action.restorer as u64);
 }

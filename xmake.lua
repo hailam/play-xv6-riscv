@@ -56,12 +56,11 @@ local function picolibc_setup_args(target, arch, cross_file_name, build_dir, ins
     return args
 end
 
-target("picolibc-riscv64")
-    set_kind("phony")
-    add_packages("meson", "ninja")
-    on_build(function (target)
-        local arch = "riscv64"
-        local cross_file_name = "cross-riscv64-xv6rs.txt"
+-- Closure factory for the per-arch `on_build` callback. Returning a
+-- fresh closure per target lets xmake's `setfenv` inject the
+-- script-scope `os` / `path` modules directly into the callback.
+local function picolibc_on_build(arch, cross_file_name)
+    return function (target)
         local src = path.join(os.projectdir(), "third_party", "picolibc-src")
         if not os.isdir(src) then
             print(string.format("xmake: fetching picolibc %s ...", PICOLIBC_TAG))
@@ -86,20 +85,21 @@ target("picolibc-riscv64")
         local ninja_bin = find_pkg_bin("n", "ninja")
         assert(meson_bin, "meson not found in ~/.xmake/packages")
         assert(ninja_bin, "ninja not found in ~/.xmake/packages")
-        -- clang invokes its bundled linker by looking up `ld.lld`
-        -- in PATH. Our cross file points at rustup's ld.lld for
-        -- the aarch64 build — also make sure clang's own driver
-        -- can find it.
-        local rustup_bin = path.join(
-            os.getenv("HOME"),
-            ".rustup/toolchains/nightly-aarch64-apple-darwin",
-            "lib/rustlib/aarch64-apple-darwin/bin/gcc-ld"
-        )
+        -- Query rustc for the active toolchain sysroot and host
+        -- triple so both `llvm-{ar,strip,nm,objcopy}` (`.../bin`) and
+        -- `ld.lld` (`.../bin/gcc-ld`, used by clang's driver and
+        -- cross-aarch64-xv6rs.txt) are on PATH portably across hosts.
+        local sysroot = os.iorunv("rustc", {"--print", "sysroot"}):trim()
+        local host = os.iorunv("rustc", {"-vV"}):match("host:%s*(%S+)")
+        assert(sysroot ~= "" and host, "failed to query rustc sysroot/host")
+        local rustlib_bin = path.join(sysroot, "lib", "rustlib", host, "bin")
+        local rustup_gcc_ld = path.join(rustlib_bin, "gcc-ld")
         local envs = {
             PATH = table.concat({
                 path.directory(meson_bin),
                 path.directory(ninja_bin),
-                rustup_bin,
+                rustup_gcc_ld,
+                rustlib_bin,
                 os.getenv("PATH") or "",
             }, path.envsep()),
         }
@@ -116,66 +116,15 @@ target("picolibc-riscv64")
                 {envs = envs})
         end
         os.vrunv(ninja_bin, {"-C", build_dir, "install"}, {envs = envs})
-    end)
+    end
+end
+
+target("picolibc-riscv64")
+    set_kind("phony")
+    add_packages("meson", "ninja")
+    on_build(picolibc_on_build("riscv64", "cross-riscv64-xv6rs.txt"))
 
 target("picolibc-aarch64")
     set_kind("phony")
     add_packages("meson", "ninja")
-    on_build(function (target)
-        local arch = "aarch64"
-        local cross_file_name = "cross-aarch64-xv6rs.txt"
-        local src = path.join(os.projectdir(), "third_party", "picolibc-src")
-        if not os.isdir(src) then
-            print(string.format("xmake: fetching picolibc %s ...", PICOLIBC_TAG))
-            os.vrunv("git", {
-                "clone", "--depth=1", "--branch", PICOLIBC_TAG,
-                "https://github.com/picolibc/picolibc.git", src,
-            })
-        end
-        -- Find the xmake-installed meson/ninja bin dirs. target:pkg
-        -- returns nil for phony targets in xmake 3.x, so we use
-        -- os.match (which DOES expand glob patterns) on
-        -- ~/.xmake/packages/{m,n}/{meson,ninja}/<ver>/<hash>/bin/.
-        local function find_pkg_bin(prefix, name)
-            local pattern = path.join(
-                os.getenv("HOME"), ".xmake/packages",
-                prefix, name, "*", "*", "bin", name
-            )
-            local matches = os.match(pattern)
-            return matches[#matches]
-        end
-        local meson_bin = find_pkg_bin("m", "meson")
-        local ninja_bin = find_pkg_bin("n", "ninja")
-        assert(meson_bin, "meson not found in ~/.xmake/packages")
-        assert(ninja_bin, "ninja not found in ~/.xmake/packages")
-        -- clang invokes its bundled linker by looking up `ld.lld`
-        -- in PATH. Our cross file points at rustup's ld.lld for
-        -- the aarch64 build — also make sure clang's own driver
-        -- can find it.
-        local rustup_bin = path.join(
-            os.getenv("HOME"),
-            ".rustup/toolchains/nightly-aarch64-apple-darwin",
-            "lib/rustlib/aarch64-apple-darwin/bin/gcc-ld"
-        )
-        local envs = {
-            PATH = table.concat({
-                path.directory(meson_bin),
-                path.directory(ninja_bin),
-                rustup_bin,
-                os.getenv("PATH") or "",
-            }, path.envsep()),
-        }
-        local build_dir = path.join(os.projectdir(), "build", "picolibc-" .. arch)
-        local install_dir = path.join(build_dir, "install")
-        if not os.isfile(path.join(build_dir, "build.ninja")) then
-            os.mkdir(build_dir)
-            -- Pass the absolute meson_bin path — xmake's os.vrunv
-            -- does PATH lookup in the PARENT env, not in the child's
-            -- envs, so a bare "meson" doesn't resolve even though
-            -- we set envs.PATH.
-            os.vrunv(meson_bin,
-                picolibc_setup_args(target, arch, cross_file_name, build_dir, install_dir, src),
-                {envs = envs})
-        end
-        os.vrunv(ninja_bin, {"-C", build_dir, "install"}, {envs = envs})
-    end)
+    on_build(picolibc_on_build("aarch64", "cross-aarch64-xv6rs.txt"))

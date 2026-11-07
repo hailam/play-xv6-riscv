@@ -226,9 +226,18 @@ pub fn run() -> ! {
             // Clear the raw current-proc pointer so it can't dangle,
             // and recycle the slot.
             cpu::set_current_proc(core::ptr::null_mut());
+            drop(task);
             exec.free_slots.lock().push(slot as u32);
         }
 
+        // INVARIANT: `return_to_user` (`-> !`) sets `tf.kernel_sp` to
+        // the top of this hart's kernel stack (`kernel_stack_top`). On
+        // the next trap from user mode, the CPU resets `sp` to the top
+        // of the stack and enters `rust_usertrap` -> `executor::run()`
+        // fresh, overwriting this stack frame without unwinding. Any
+        // values with nontrivial `Drop` (`task`, lock guards, etc.)
+        // MUST be dropped or moved back into `exec.tasks` before this
+        // point (`waker` has a no-op `waker_drop`).
         if let Some(target) = cpu::take_user_target() {
             // SAFETY: target points into a `Proc` owned by an `Arc` in
             // the per-CPU `tasks` table; Procs live until parent reaps.

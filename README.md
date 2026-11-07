@@ -8,30 +8,44 @@ with two unusual architectural choices:
    executor runs the async loop directly on the kernel stack — no
    per-process kernel stacks to save / restore.
 2. **HAL behind a trait.** All arch-specific code lives in
-   `hal-riscv64` (or `hal-aarch64`, skeleton); the kernel itself
-   sees only the `hal::Hal` surface. RISC-V 64 boots and runs the
-   full shell today; aarch64 is a compiling-but-not-yet-booting
-   second impl that proves the trait surface is honest.
+   `hal-riscv64` and `hal-aarch64`; the kernel itself sees only the
+   `hal::Hal` surface. Both RISC-V 64 and AArch64 boot SMP (`-smp 3` /
+   `-smp 4`), run the interactive shell and GUI window server, and pass
+   the full 74-test suite.
 
-Total kernel: **~6.5 KLoC, ~158 unsafe-ish lines (~2.4%)**, all
-confined to HAL / driver MMIO / frame allocator / trapframe glue.
+Total workspace (`crates/`): **~16.5 KLoC** (~11.5 KLoC arch-independent
+kernel + ~5 KLoC across `hal`, `hal-riscv64`, `hal-aarch64`, and
+`xv6-fs-layout`), with `unsafe` confined to HAL / driver MMIO / frame
+allocator / trapframe glue.
 
 ## What works today
 
-`make qemu` (RISC-V 64, single hart by default; `make qemu CPUS=3`
-for SMP):
+`make qemu` (RISC-V 64) or `make qemu-aarch64` (AArch64), single hart
+by default (`CPUS=3` / `CPUS=4` for SMP):
 
-- Boot to a shell prompt on top of `fs.img` (built by the host-side
-  `mkfs` tool).
+- Boot to a shell prompt on top of `fs.img` / `fs-aarch64.img` (built
+  by the host-side `mkfs` tool, with `init` at pid 1 and orphan
+  reparenting).
 - `ls /`, `cat /file`, `echo hi > /out`, `mkdir /dir`, `cd /dir`,
-  `rm /file`, `ln /file /alias` (hard link).
+  `rm /file`, `ln /file /alias` (hard link), symlinks, `pwd`, `env`,
+  `chmod`, `ftruncate`, `lseek`, `mmap`, `poll`, `ioctl`.
 - Pipelines: `/ls / | /cat`.
-- Forks, `wait`, `kill <pid>` (kill cancels sleeping / blocked
-  procs within tens of ms).
-- `malloc` / `free` in userspace on top of `sbrk`.
-- SMP: with `-smp 3`, user procs visibly run on hart 0, 1, 2.
-  Sticky `home_cpu` per task at spawn time; cross-CPU wakes pick
-  up on the next timer tick (IPI plumbing is deferred).
+- Forks, `wait`, `kill <pid>` (kill cancels sleeping / blocked procs
+  within tens of ms), and POSIX signals (`sigaction`, `sigprocmask`,
+  `sigreturn`, `alarm`).
+- `malloc` / `free` in userspace on top of `sbrk`, plus `picolibc`-linked
+  C programs including `bc`, `dc`, and `lua` (Lua 5.4).
+- Networking: `AF_UNIX` sockets (with filesystem-visible bindings) and
+  TCP/IP via `smoltcp` 0.12 (loopback + `virtio-net`, host↔guest TCP
+  echo gated by `make test-net`).
+- Display & GUI: `ramfb` framebuffer (`640×480` `XRGB8888` via `fw_cfg`
+  DMA, exposed as `/dev/fb0`), `virtio-input` keyboard (`/dev/input/0`),
+  and a userspace window server (`wm`) over `AF_UNIX` with demo clients
+  (`hello_wm`, `clock`, `guidemo`).
+- SMP: with `-smp 3` / `-smp 4`, user procs visibly run across harts.
+  Sticky `home_cpu` per task at spawn time; cross-CPU wakes send real
+  wake-IPIs (`Arch::send_ipi` via RISC-V CLINT MSIP→SSIP trampoline and
+  AArch64 GICv2 SGI).
 - Write-ahead log; every fs change goes through `begin_op` /
   `end_op` and is durable across reboot.
 - Page-table reaping: kernel free-frame count is flat across long
@@ -59,16 +73,22 @@ redirect-result
 ## Build & run
 
 Requires:
-- `rustup target add riscv64gc-unknown-none-elf` (the workspace
-  `.cargo/config.toml` defaults to this)
+- `rustup target add riscv64gc-unknown-none-elf aarch64-unknown-none-softfloat`
 - A riscv64 cross toolchain (e.g. `riscv64-elf-gcc` from Homebrew's
-  `riscv-gnu-toolchain`) for the user binaries
-- `qemu-system-riscv64`
+  `riscv-gnu-toolchain`) for RISC-V user binaries; AArch64 user
+  binaries use host `clang --target=aarch64-none-elf` + rustup's `lld`
+- `xmake` (fetches & builds `picolibc` on first build for `bc`/`dc`/`lua`)
+- `qemu-system-riscv64` and/or `qemu-system-aarch64`
 
 ```
-make fs.img     # builds the kernel, the user binaries, and the disk image
-make qemu       # boots into the shell
-make qemu CPUS=3  # SMP
+make fs.img              # builds the kernel, user binaries, and disk image (riscv64)
+make qemu                # boots riscv64 into the shell
+make qemu CPUS=3         # riscv64 SMP
+make qemu-aarch64 CPUS=4 # boots aarch64 SMP into the shell
+make test-net            # host<->guest TCP echo over virtio-net
+make test-fb             # headless ramfb + /dev/fb0 screendump checks
+make test-input          # headless virtio-input QMP send-key check
+make test-gui            # headless wm + hello_wm + clock compositing & key routing
 ```
 
 Interactive Ctrl-A x to exit QEMU; or pipe stdin with a heredoc /
@@ -79,23 +99,27 @@ Interactive Ctrl-A x to exit QEMU; or pipe stdin with a heredoc /
 ```
 crates/
   hal/                # trait surface — no arch code
-  hal-riscv64/        # `impl Hal for Riscv64` + asm + drivers
-  hal-aarch64/        # skeleton (compiles, doesn't boot yet)
+  hal-riscv64/        # `impl Hal for Riscv64` + asm + drivers (CLINT/PLIC/UART)
+  hal-aarch64/        # `impl Hal for AArch64` + asm + drivers (GICv2/PL011/PSCI)
   xv6-fs-layout/      # on-disk structs shared with mkfs
   kernel/             # the kernel binary itself
     src/
       main.rs         # kmain → executor::run on every hart
-      executor.rs     # per-CPU async runtime, sticky home_cpu
+      executor.rs     # per-CPU async runtime, sticky home_cpu + wake-IPIs
       proc.rs         # `Proc`, async `proc_main`
       syscall.rs      # async fn sys_* + dispatch
+      net.rs          # smoltcp loopback + virtio-net TCP/IP stack + AF_UNIX
       fs/             # superblock, log, bmap, inode, dir, path
-      driver/         # UART, virtio-blk, bio (block cache)
+      driver/         # virtio-blk, virtio-net, virtio-input, ramfb, bio
       sync.rs         # SpinLock, WakerCell
       vm.rs           # kernel pagetable
       user_vm.rs      # ELF loader, argv layout
       ...
-    user/             # C user binaries (sh, ls, cat, echo, ...)
-mkfs/                 # host tool: builds fs.img
+    user/             # C user binaries (sh, ls, cat, wm, usertests, ...)
+mkfs/                 # host tool: builds fs.img / fs-aarch64.img
+third_party/          # picolibc meson cross files + bc/libc glue
+scripts/              # headless QEMU/QMP integration tests (net, fb, input, gui)
+xmake.lua             # builds picolibc (libc.a + libm.a) for riscv64 & aarch64
 docs/todos/           # work tracking (see below)
 ```
 
@@ -114,8 +138,9 @@ async fn proc_main(proc: Arc<Proc>) {
         match event {
             TrapEvent::Syscall { nr } => {
                 let ret = syscall::dispatch(&proc, nr).await;
-                proc.trapframe().a0 = ret as u64;
+                proc.trapframe().set_arg(0, ret as u64);
             }
+            TrapEvent::PageFault { va, write } => { /* lazy / mmap fault */ }
             TrapEvent::Timer | TrapEvent::Devintr => {}
         }
         if proc.is_zombie() { return; }
@@ -159,7 +184,7 @@ against the same `fs.img` and observing the surviving directory.
 
 ### VM reaping
 
-`Drop for PageTable` (riscv64) walks the tree:
+`Drop for PageTable` (`riscv64` and `aarch64`) walks the tree:
 
 - Frees leaves with `PTE_U` set (user data / heap / stack).
 - Skips kernel-owned leaves (trampoline RX, trapframe RW —
@@ -175,22 +200,27 @@ returns it all on exit).
 
 ## Status
 
-Original 12-phase plan: through phase 8 (modest perf gains:
-per-CPU bcache shards, async virtio batching) is essentially
-done. Two stretch items remain:
+All 37 planned todos across Phases 1 and 2 are complete (`done/`: 37,
+`pending/`: 0):
 
-- **`14-aarch64-completion`** — fill in the aarch64 skeleton:
-  scrub the kernel's direct `use hal_riscv64::*` (currently 6
-  files), write trap vectors + EL2→EL1 drop + GIC v2 driver + real
-  pagetable populate. Untouched in this environment because no
-  `aarch64-elf-gcc` is installed.
-- **`12-phase2-gui`** — the original Phase 2 stretch goal. A
-  ramfb driver + `/dev/fb0` + a userspace display server. Tracked
-  as ~5 sub-todos when started.
+- **Dual-arch SMP (`14-aarch64-completion`, `19-smp-hardening`)** —
+  Both `riscv64` and `aarch64` boot SMP (`-smp 3` / `-smp 4`) with
+  hardware wake-IPIs and pass the full 74-test suite (`usertests` +
+  POSIX/xv6 regression binaries).
+- **POSIX & C ecosystem (`15-xv6-compat`, `16-posix-compat`, `20-fs-console-robustness`)** —
+  POSIX signals (`sigaction`, `sigprocmask`, `sigreturn`, `alarm`),
+  `mmap`/`munmap`, symlinks, `poll`, `ioctl`, console line discipline,
+  `AF_UNIX` sockets, `smoltcp` TCP/IP networking (`loopback` +
+  `virtio-net`), and `picolibc` userspace (`bc`, `dc`, `lua`).
+- **Phase 2 GUI (`12-phase2-gui`)** — `ramfb` framebuffer (`fw_cfg`
+  DMA, `/dev/fb0`), `virtio-input` keyboard (`/dev/input/0`), and the
+  userspace window server (`wm`) + `AF_UNIX` window protocol + demo
+  clients (`hello_wm`, `clock`, `guidemo`), gated by headless QMP tests
+  (`test-fb`, `test-input`, `test-gui`).
 
 Full per-todo history is in [`docs/todos/`](docs/todos/) — see
-`docs/todos/README.md` for the index, and one folder per todo
-under `done/` with what landed + verification notes.
+[`docs/todos/README.md`](docs/todos/README.md) for the index, and one
+folder per todo under `done/` with what landed + verification notes.
 
 ## License
 

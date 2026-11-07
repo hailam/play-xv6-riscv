@@ -69,6 +69,11 @@ impl TrapFrameAccess for TrapFrame {
     }
 
     #[inline]
+    fn set_ra(&mut self, v: u64) {
+        self.ra = v;
+    }
+
+    #[inline]
     fn arg(&self, n: usize) -> u64 {
         match n {
             0 => self.a0,
